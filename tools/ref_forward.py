@@ -210,7 +210,36 @@ class Model:
         return matvec(self.out, h, mode)
 
 
+def ppl_main(argv):
+    """ref_forward.py --ppl MODEL.gguf IDS --mode q8|float [--first F]: the
+    perplexity of the token ids in IDS (commas or white space), scoring the
+    next-token probability at each position >= F (as ie-run --ppl)."""
+    ap = argparse.ArgumentParser()
+    ap.add_argument("model")
+    ap.add_argument("ids")
+    ap.add_argument("--mode", choices=["q8", "float"], default="float")
+    ap.add_argument("--first", type=int, default=0)
+    ap.add_argument("--chunk", type=int, default=0, help="split the ids into independent chunks of this size")
+    a = ap.parse_args(argv)
+    ids = [int(t) for t in open(a.ids).read().replace(",", " ").split()]
+    chunks = [ids[i:i + a.chunk] for i in range(0, len(ids), a.chunk)] if a.chunk else [ids]
+    m = Model(a.model)
+    nll, n = 0.0, 0
+    for ch in chunks:
+        m.kc = [[] for _ in range(m.n_layer)]
+        m.vc = [[] for _ in range(m.n_layer)]
+        for pos in range(len(ch) - 1):
+            ref = m.step(ch[pos], pos, a.mode)
+            if pos >= a.first:
+                mx = ref.max()
+                nll += mx + np.log(np.exp(ref - mx).sum()) - ref[ch[pos + 1]]
+                n += 1
+    print("ppl: %d tokens scored, mean nll %.6f, perplexity %.4f (reference, mode=%s)" % (n, nll / n, np.exp(nll / n), a.mode))
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--ppl":
+        return ppl_main(sys.argv[2:])
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
     ap.add_argument("dump")

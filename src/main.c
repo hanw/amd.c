@@ -2,6 +2,7 @@
  *   ie-run MODEL.gguf [--backend cpu|gpu] [--tokens 1,2,3] [--n 32]
  *          [--ctx N] [--dump-logits FILE] [--hsaco FILE] [--info]
  * --dump-logits writes one line per step: "pos token l0 l1 ... l(vocab-1)". */
+#include <math.h>
 #include <string.h>
 
 #include "backend.h"
@@ -12,13 +13,15 @@
 static void usage(void) {
   fprintf(stderr,
           "usage: ie-run MODEL.gguf [--backend cpu|gpu] [--tokens 1,2,3] [--n 32] [--ctx N]\n"
-          "              [--dump-logits FILE] [--hsaco build/ie_kernels.hsaco] [--info]\n");
+          "              [--dump-logits FILE] [--hsaco build/ie_kernels.hsaco] [--info]\n"
+          "              [--tokens-file FILE] [--ppl [--ppl-first N]]\n");
   exit(2);
 }
 
 int main(int argc, char **argv) {
-  const char *path = NULL, *be = "cpu", *toks = "1", *dump = NULL, *hsaco = "build/ie_kernels.hsaco";
-  int n_gen = 32, info = 0;
+  const char *path = NULL, *be = "cpu", *toks = "1", *dump = NULL, *hsaco = "build/ie_kernels.hsaco", *tfile = NULL;
+  int n_gen = 32, info = 0, ppl = 0;
+  uint32_t ppl_first = 0;
   uint32_t n_ctx = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--backend") && i + 1 < argc) be = argv[++i];
@@ -28,10 +31,34 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump = argv[++i];
     else if (!strcmp(argv[i], "--hsaco") && i + 1 < argc) hsaco = argv[++i];
     else if (!strcmp(argv[i], "--info")) info = 1;
+    else if (!strcmp(argv[i], "--tokens-file") && i + 1 < argc) tfile = argv[++i];
+    else if (!strcmp(argv[i], "--ppl")) ppl = 1;
+    else if (!strcmp(argv[i], "--ppl-first") && i + 1 < argc) ppl_first = (uint32_t)atoi(argv[++i]);
     else if (argv[i][0] != '-' && !path) path = argv[i];
     else usage();
   }
   if (!path || n_gen < 0) usage();
+
+  /* --tokens-file: token ids separated by commas or white space */
+  char *tbuf = NULL;
+  if (tfile) {
+    FILE *tf = fopen(tfile, "rb");
+    if (!tf) ie_die("cannot read %s", tfile);
+    fseek(tf, 0, SEEK_END);
+    long tn = ftell(tf);
+    fseek(tf, 0, SEEK_SET);
+    tbuf = malloc((size_t)tn + 1);
+    if (fread(tbuf, 1, (size_t)tn, tf) != (size_t)tn) ie_die("cannot read %s", tfile);
+    tbuf[tn] = 0;
+    fclose(tf);
+    for (char *c = tbuf; *c; c++)
+      if (*c == ' ' || *c == '\n' || *c == '\t' || *c == '\r') *c = ',';
+    while (tn > 0 && tbuf[tn - 1] == ',') tbuf[--tn] = 0;
+    toks = tbuf;
+  }
+  /* --ppl: the prompt only (no generation); score the next-token
+   * probability at each position >= ppl_first */
+  if (ppl) n_gen = 0;
 
   /* prompt token ids */
   uint32_t n_prompt = 0, cap = 16, *prompt = malloc(cap * 4);
@@ -70,13 +97,21 @@ int main(int argc, char **argv) {
   if (dump && !df) ie_die("cannot write %s", dump);
   float *logits = malloc(m.vocab * 4);
   uint32_t total = n_prompt + (uint32_t)n_gen, tok = prompt[0], *out = malloc(total * 4);
-  double ms_sum = 0, ms_gen = 0;
+  double ms_sum = 0, ms_gen = 0, nll = 0;
+  uint32_t n_nll = 0;
   uint32_t n_timed = 0;
   for (uint32_t pos = 0; pos < total; pos++) {
     double ms = 0;
     out[pos] = tok;
     if (pos + 1 == total) break; /* the last token needs no step */
-    uint32_t next = b->step(b, tok, pos, df ? logits : NULL, &ms);
+    uint32_t next = b->step(b, tok, pos, (df || ppl) ? logits : NULL, &ms);
+    if (ppl && pos >= ppl_first && pos + 1 < n_prompt) { /* -log p(prompt[pos + 1]) */
+      double mx = logits[0], z = 0;
+      for (uint32_t i = 1; i < m.vocab; i++) mx = logits[i] > mx ? logits[i] : mx;
+      for (uint32_t i = 0; i < m.vocab; i++) z += exp((double)logits[i] - mx);
+      nll += mx + log(z) - logits[prompt[pos + 1]];
+      n_nll++;
+    }
     ms_sum += ms;
     if (pos >= 1) ms_gen += ms, n_timed++; /* skip the first (warm-up) step */
     if (df) {
@@ -103,7 +138,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "%s: %u steps, %.3f ms/token, %.1f tokens/s, weights read %.2f MB/token, %.2f GB/s\n", be,
             n_timed, per, 1e3 / per, gr.weight_bytes_per_token / 1e6, gr.weight_bytes_per_token / (per * 1e6));
   }
+  if (ppl && n_nll)
+    printf("ppl: %u tokens scored, mean nll %.6f, perplexity %.4f\n", n_nll, nll / n_nll, exp(nll / n_nll));
   (void)ms_sum;
+  free(tbuf);
   b->close(b);
   free(logits), free(out), free(prompt);
   graph_free(&gr);

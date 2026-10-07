@@ -82,6 +82,7 @@ GPU 后端只在 gfx1201 上编译。核函数需要 `v_dot4_i32_iu8` 指令和 
 | `IE_PROFILE_CSV=文件` | 与 `IE_PROFILE=1` 一起用：把每个算子的时间写进 CSV 文件 |
 | `IE_ATTN=old` | 用旧的注意力核函数 `ie_attn`（每个头一个工作组） |
 | `IE_ATTN=check` | 每层同时运行新旧两个注意力核函数，结束时打印两者输出的最大相对差 |
+| `--tokens-file 文件`、`--ppl`、`--ppl-first N`（命令行选项） | 从文件读 token；计算从第 N 个位置开始的困惑度 |
 | `IE_NORM_FUSE=1` | 把 RMSNorm 合进前一个带残差的矩阵向量乘（最后完成的工作组做）。在 R9700 上更慢，所以默认关闭 |
 
 硬件追踪：用 `rocprofv3 --kernel-trace` 运行引擎，再用 `tools/rocprof_ops.py` 把追踪结果对应到算子（见脚本开头的说明）。
@@ -176,6 +177,20 @@ CPU 后端按完全相同的划分和顺序计算，所以两者只差浮点舍�
 
 注意：llama.cpp 这里用的是 Vulkan 后端，不是 ROCm（HIP）后端，没有测 ROCm 版本。1.5B 的输出层，llama.cpp 直接读 Q6_K，
 本引擎读重新量化后的 Q8_0（字节更多，而且是近似）。
+
+Qwen2.5-3B-Instruct Q4_0（输出层 Q6_K → Q8_0，每个 token 读 1891 MB）：生成 64 个 token 226 个/秒（llama.cpp 196 ± 8），
+生成 512 个 219 个/秒（llama.cpp 200.1 ± 0.4）；有效带宽 429 GB/s（标称值的 67%）。
+
+**输出质量（困惑度）**：wikitext-2 测试集，用 llama.cpp 的分词器分词，前 4 段，每段 512 个 token，只给每段后半的 255 个 token 计分
+（和 `llama-perplexity -c 512 --chunks 4` 相同）。本引擎用 `ie-run --tokens-file 段.txt --ppl --ppl-first 256` 逐段计算。
+
+| 模型 | llama.cpp（Vulkan） | 本引擎（GPU） | 差别 |
+|---|---|---|---|
+| Qwen2.5-0.5B Q4_0 | 15.062 | 15.125 | +0.42% |
+| Qwen2.5-1.5B Q4_0 | 10.144 | 10.146 | +0.02% |
+| Qwen2.5-3B Q4_0 | 9.069 | 9.092 | +0.25% |
+
+所以 CPU、GPU 和 numpy 参考之间约 2e-2 的 logits 相对差，没有让输出质量变得比 llama.cpp 差。
 
 - 回答 "What is the capital of France? Answer in one sentence." 时，两个模型都输出 "The capital of France is Paris."。
 - 两个小模型：GPU 与 CPU 的 logits 相对误差最大 7e-3，中位数约 1e-7 到 3e-7，贪心 token 相同。
