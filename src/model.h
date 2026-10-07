@@ -71,7 +71,15 @@ typedef struct {
   mat out;   /* output; may share the arrays of tok (tied) */
   int tied;
   vec out_norm;
-  layer *l;
+  layer *l; /* n_layer layers, then (has_mtp) the MTP layer l[n_layer] */
+  /* qwen35 multi-token prediction (MTP, "nextn") head: one full attention
+   * layer l[n_layer] (its own KV cache, kvi = n_kvl - 1) after
+   * x = eh_proj [rmsnorm(embed(token)) * enorm | rmsnorm(h) * hnorm]; then
+   * rmsnorm(.) * head_norm (this is also the h of the next draft) and the
+   * output matrix. */
+  int has_mtp;
+  mat eh;
+  vec enorm, hnorm, head_norm;
   /* tokenizer */
   int tok_gpt2; /* 1: GPT2 byte-level, 0: SentencePiece */
   uint32_t n_tokens;
@@ -79,6 +87,9 @@ typedef struct {
   uint64_t weight_bytes; /* bytes of all repacked/dequantized weights */
 } model;
 
+/* Load the MTP head (blk.N.nextn.*) from g (the model file or a separate
+ * file); returns 0 if g has none. */
+int model_load_mtp(model *m, gguf_file *g);
 /* If set, model_load gives every finished matrix to this function (for
  * example: copy it to the GPU and free the host arrays), so that the host
  * never holds all the weights at once. */
@@ -169,7 +180,8 @@ static inline uint32_t ie_att_max_split(uint32_t n_ctx) {
 #define IE_ATT_MAX_SPLIT 2048u
 typedef struct {
   const char *name;
-  uint32_t size, off, first, last;
+  /* stride: bytes per token (256-aligned); size = stride * graph.T */
+  uint32_t stride, size, off, first, last;
 } buf;
 
 typedef struct {
@@ -180,11 +192,21 @@ typedef struct {
   uint32_t arena; /* bytes */
   int x, logits, argmax; /* buffer ids that the host reads */
   uint32_t n_ctx;
+  /* T: the most tokens one run of the op list does (speculative decoding:
+   * 1 + drafts). Each buffer holds T tokens (buf.stride apart). */
+  uint32_t T;
+  /* The ops [0, n_main) are the model; [n_main, n_ops) the MTP head (if
+   * built). h_out: the final normed hidden state of the model (the MTP h
+   * input of the next position); mtp_h: the MTP h input (the host copies
+   * rows into it); mtp_g: the MTP normed output (the h of the next draft). */
+  uint32_t n_main;
+  int h_out, mtp_h, mtp_g, mtp_logits, mtp_argmax;
   float *rope_cos, *rope_sin; /* [n_ctx][n_rot/2] */
   uint64_t weight_bytes_per_token;
 } graph;
 
-void graph_build(graph *gr, const model *m, uint32_t n_ctx);
+/* T: tokens per run (1, or 1 + drafts); mtp: also build the MTP ops. */
+void graph_build(graph *gr, const model *m, uint32_t n_ctx, uint32_t T, int mtp);
 void graph_free(graph *gr);
 
 /* plan.c: give each buffer an arena offset; checks with ie_plan_check and

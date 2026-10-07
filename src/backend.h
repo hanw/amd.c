@@ -10,6 +10,14 @@ struct backend {
    * not NULL) and returns the argmax token. ms: time of the step. */
   uint32_t (*step)(backend *b, uint32_t tok, uint32_t pos, float *logits, double *ms);
   void (*close)(backend *b);
+  /* GPU only (NULL on the CPU). Run section sec of the op list (0: the
+   * model, 1: the MTP head) for T tokens toks at positions pos .. pos + T -
+   * 1; slot: the linear attention state slot to read (ie_gdn; the state
+   * after token t goes to slot (slot + t) % 3). out: the T argmax tokens. */
+  void (*run)(backend *b, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, uint32_t slot, uint32_t *out);
+  /* Copy n token rows of buffer src (from row r0) to buffer dst (from row
+   * d0); src < 0: write zeros. */
+  void (*copy_rows)(backend *b, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n);
 };
 
 /* CPU: the same algorithm and the same work split as the GPU kernels. */

@@ -321,6 +321,60 @@ KERNEL ie_gemv_q8q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y
   if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
 }
 
+/* The same GEMV for T <= 3 tokens (speculative decoding: verify several
+ * tokens in one pass). Each weight block is loaded once and used for every
+ * token. For each token the arithmetic and its order are those of
+ * ie_gemv_q8q8, so token t's result is bitwise the result of a one-token
+ * launch. xs: bytes between the Q8 activations of two tokens; ys: floats
+ * between the outputs (and the residuals) of two tokens. */
+#define GEMV_T 3u
+KERNEL ie_gemv_q8q8_t(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                      const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
+  const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
+  if (r >= rows) return;
+  float acc[GEMV_T] = {0.0f, 0.0f, 0.0f};
+  for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
+    u32x4 w0[GEMV_U], w1[GEMV_U];
+    float sw[GEMV_U];
+    int ok[GEMV_U];
+    u32 bk[GEMV_U];
+    for (u32 k = 0; k < GEMV_U; k++) {
+      ok[k] = ie_lane_blk(l, t + k) < nb;
+      const u32 b = ok[k] ? ie_lane_blk(l, t + k) : ie_lane_blk(l, t);
+      bk[k] = b;
+      const G u32 *wp = qw + ie_q8_dst_word(r, b, 0u, nb);
+      w0[k] = *(const G u32x4 *)wp;
+      w1[k] = *(const G u32x4 *)(wp + 4u);
+      sw[k] = (float)qs[ie_q8_dst_scale(r, b, nb)];
+    }
+    for (u32 j = 0; j < GEMV_T; j++) {
+      if (j >= T) break; /* uniform */
+      const G u8 *xj = xq + j * xs;
+      const G u32 *aw = (const G u32 *)xj;
+      const G float *da = (const G float *)(xj + 32u * nb);
+      u32x4 a0[GEMV_U], a1[GEMV_U];
+      float sc[GEMV_U];
+      for (u32 k = 0; k < GEMV_U; k++) {
+        a0[k] = *(const G u32x4 *)(aw + bk[k] * 8u);
+        a1[k] = *(const G u32x4 *)(aw + bk[k] * 8u + 4u);
+        sc[k] = sw[k] * da[bk[k]];
+      }
+      for (u32 k = 0; k < GEMV_U; k++) {
+        const u32 wq[8] = {w0[k].x, w0[k].y, w0[k].z, w0[k].w, w1[k].x, w1[k].y, w1[k].z, w1[k].w};
+        const u32 av[8] = {a0[k].x, a0[k].y, a0[k].z, a0[k].w, a1[k].x, a1[k].y, a1[k].z, a1[k].w};
+        const Mem qm = {wq}, am = {av};
+        const int dot = (int)ie_q8q8_block(qm, 0u, am, 0u);
+        acc[j] += ok[k] ? sc[k] * (float)dot : 0.0f;
+      }
+    }
+  }
+  for (u32 j = 0; j < GEMV_T; j++) {
+    if (j >= T) break;
+    const float a = wave_tree_f(acc[j]);
+    if (l == 0u) y[j * ys + r] = epilogue(a, r, bias, res ? res + j * rs : res);
+  }
+}
+
 /* y = W x for an f32 matrix (F16 weights dequantized at load):
  * the same grid; lane l does the elements ie_lane_blk(l, t) < cols. */
 KERNEL ie_gemv_f32(const G float *w, const G float *x, G float *y, u32 rows, u32 cols, const G float *bias,
@@ -579,78 +633,97 @@ KERNEL ie_qkn_rope_kv(const G float *qkv, G float *qo, G float *kc, G float *vc,
   if (t < hd) (is_k ? kc + h * hd : qo + h * hd)[t] = r;
 }
 
-/* Linear attention (Gated DeltaNet) of one token; one workgroup per value
- * head h (key head kh = h % nk), state dims 128 x 128. in = [q k v (cd) | z
- * (inner) | beta (nv) | alpha (nv)], inner = nv * 128. ring: the last 4 conv
- * inputs [slot][cd] (slot = position % 4); S: [h][i][j] (i: key dim, j:
- * value dim). Thread t: value dim j = t % 128, key dims i of half t / 128.
- * The CPU backend (cpu.c, gdn) does the same arithmetic. */
+/* Linear attention (Gated DeltaNet) of T <= 3 tokens at positions pos ..
+ * pos + T - 1, one after the other; one workgroup per value head h (key
+ * head kh = h % nk), state dims 128 x 128. Token t: in + t * is = [q k v (cd)
+ * | z (inner) | beta (nv) | alpha (nv)], inner = nv * 128; output at out +
+ * t * os, its Q8 copy at oq + t * qs. ring: the conv inputs of the last 8
+ * positions [slot][cd] (slot = position % 8). S: 3 state slots [slot][h][i][j]
+ * (i: key dim, j: value dim); the state is read from slot c and the state
+ * after token t is written to slot (c + t) % 3, so that a speculative step
+ * can go back to the state after any of its tokens. Each thread reads and
+ * writes only its own state values, so slot c can be overwritten. Thread t:
+ * value dim j = t % 128, key dims i of half t / 128. The CPU backend (cpu.c,
+ * gdn) does the same arithmetic for one token (slot c = 0). */
 static LDS float gd_q[128], gd_k[128], gd_v[128], gd_p[2][128], gd_r[8];
-static inline float conv_ch(const G float *in, G float *ring, const G float *cw, u32 c, u32 pos, u32 cd, int writer) {
-  const float x = in[c];
+/* conv input of channel c at token u of this launch, or (before the launch)
+ * from the ring; 0 before position 0 */
+static inline float conv_in(const G float *in, u32 is, const G float *ring, u32 c, u32 t, u32 d, u32 pos, u32 cd) {
+  if (d <= t) return in[(t - d) * is + c];
+  const u32 p = pos + t;
+  return p >= d ? ring[((p - d) & 7u) * cd + c] : 0.0f;
+}
+static inline float conv_ch(const G float *in, u32 is, G float *ring, const G float *cw, u32 c, u32 t, u32 pos, u32 cd,
+                            int writer) {
   float acc = 0.0f;
-  for (u32 j = 0; j < 4u; j++) { /* oldest first, as ggml_ssm_conv */
-    const u32 d = 3u - j;
-    const float v = d == 0u ? x : pos >= d ? ring[((pos - d) & 3u) * cd + c] : 0.0f;
-    acc += v * cw[c * 4u + j];
-  }
-  if (writer) ring[(pos & 3u) * cd + c] = x; /* slot pos % 4: no workgroup reads it in this step */
+  for (u32 j = 0; j < 4u; j++) /* oldest first, as ggml_ssm_conv */
+    acc += conv_in(in, is, ring, c, t, 3u - j, pos, cd) * cw[c * 4u + j];
+  /* slot (pos + t) % 8: no workgroup reads it in this launch (reads of the
+   * ring are of positions < pos, at least 6 slots away) */
+  if (writer) ring[((pos + t) & 7u) * cd + c] = in[t * is + c];
   return acc / (1.0f + __builtin_expf(-acc));
 }
 KERNEL ie_gdn(const G float *in, G float *out, G u8 *oq, G float *ring, G float *S, const G float *cw, const G float *dtb,
-              const G float *sa, const G float *nw, u32 pos, u32 cd, u32 nk, u32 nv, float eps) {
-  const u32 h = wgid(), t = tid(), j = t & 127u, half = t >> 7, kh = h % nk, w = t >> 5, inner = nv * 128u;
+              const G float *sa, const G float *nw, u32 pos, u32 cd, u32 nk, u32 nv, float eps, u32 T, u32 is, u32 os,
+              u32 qs, u32 c) {
+  const u32 h = wgid(), t0 = tid(), j = t0 & 127u, half = t0 >> 7, kh = h % nk, w = t0 >> 5, inner = nv * 128u;
+  const unsigned long slot = (unsigned long)nv * 16384u, own = (unsigned long)h * 16384u + half * 64u * 128u + j;
   /* the state loads first: they do not depend on the conv, so their
    * memory latency overlaps it */
-  G float *Sh = S + (unsigned long)h * 16384u + half * 64u * 128u + j;
   float st[64];
-  for (u32 ii = 0; ii < 64u; ii++) st[ii] = pos ? Sh[ii * 128u] : 0.0f;
-  /* conv + SiLU: threads t < 128 do q (channel kh*128 + j) and v (2 nk 128 +
-   * h 128 + j); threads t >= 128 do k (nk 128 + kh 128 + j). The q and k
-   * ring slots are written by the workgroup h == kh only. */
-  const float a = conv_ch(in, ring, cw, half ? nk * 128u + kh * 128u + j : kh * 128u + j, pos, cd, h == kh);
-  const float vv = half ? 0.0f : conv_ch(in, ring, cw, 2u * nk * 128u + h * 128u + j, pos, cd, 1);
-  /* L2 norm of q (waves 0-3) and k (waves 4-7): x / sqrt(sum x^2 + eps) */
-  const float ss = wave_sum_all(a * a);
-  if (lane() == 0u) gd_r[w] = ss;
-  barrier();
-  const float n2 = half ? gd_r[4] + gd_r[5] + gd_r[6] + gd_r[7] : gd_r[0] + gd_r[1] + gd_r[2] + gd_r[3];
-  const float an = a * (1.0f / __builtin_sqrtf(n2 + eps));
-  if (half) gd_k[j] = an;
-  else gd_q[j] = an, gd_v[j] = vv;
-  const float beta = sigmoidf(in[cd + inner + h]);
-  const float al = in[cd + inner + nv + h] + dtb[h];
-  const float sp = al > 20.0f ? al : __builtin_logf(1.0f + __builtin_expf(al));
-  const float decay = __builtin_expf(sp * sa[h]);
-  barrier();
-  float pk = 0.0f;
-  for (u32 ii = 0; ii < 64u; ii++) {
-    st[ii] = st[ii] * decay;
-    pk += st[ii] * gd_k[half * 64u + ii];
+  for (u32 ii = 0; ii < 64u; ii++) st[ii] = pos ? S[c * slot + own + ii * 128u] : 0.0f;
+  for (u32 t = 0; t < T; t++) {
+    const G float *it = in + t * is;
+    /* conv + SiLU: threads < 128 do q (channel kh*128 + j) and v (2 nk 128 +
+     * h 128 + j); threads >= 128 do k (nk 128 + kh 128 + j). The q and k ring
+     * slots are written by the workgroup h == kh only. */
+    const float a = conv_ch(in, is, ring, cw, half ? nk * 128u + kh * 128u + j : kh * 128u + j, t, pos, cd, h == kh);
+    const float vv = half ? 0.0f : conv_ch(in, is, ring, cw, 2u * nk * 128u + h * 128u + j, t, pos, cd, 1);
+    /* L2 norm of q (waves 0-3) and k (waves 4-7): x / sqrt(sum x^2 + eps) */
+    const float ss = wave_sum_all(a * a);
+    if (lane() == 0u) gd_r[w] = ss;
+    barrier();
+    const float n2 = half ? gd_r[4] + gd_r[5] + gd_r[6] + gd_r[7] : gd_r[0] + gd_r[1] + gd_r[2] + gd_r[3];
+    const float an = a * (1.0f / __builtin_sqrtf(n2 + eps));
+    if (half) gd_k[j] = an;
+    else gd_q[j] = an, gd_v[j] = vv;
+    const float beta = sigmoidf(it[cd + inner + h]);
+    const float al = it[cd + inner + nv + h] + dtb[h];
+    const float sp = al > 20.0f ? al : __builtin_logf(1.0f + __builtin_expf(al));
+    const float decay = __builtin_expf(sp * sa[h]);
+    barrier();
+    float pk = 0.0f;
+    for (u32 ii = 0; ii < 64u; ii++) {
+      st[ii] = st[ii] * decay;
+      pk += st[ii] * gd_k[half * 64u + ii];
+    }
+    gd_p[half][j] = pk;
+    barrier();
+    const float delta = (gd_v[j] - (gd_p[0][j] + gd_p[1][j])) * beta;
+    barrier();
+    float po = 0.0f;
+    G float *Sw = S + ((c + t) % 3u) * slot + own;
+    for (u32 ii = 0; ii < 64u; ii++) {
+      st[ii] += gd_k[half * 64u + ii] * delta;
+      Sw[ii * 128u] = st[ii];
+      po += st[ii] * gd_q[half * 64u + ii];
+    }
+    gd_p[half][j] = po;
+    barrier();
+    const float o = (gd_p[0][j] + gd_p[1][j]) * (1.0f / __builtin_sqrtf(128.0f));
+    /* gated RMSNorm over the 128 values of the head (waves 0-3) */
+    const float s2 = wave_sum_all(o * o);
+    if (lane() == 0u) gd_r[w] = s2;
+    barrier();
+    if (!half) { /* whole waves */
+      const float n3 = gd_r[0] + gd_r[1] + gd_r[2] + gd_r[3];
+      const float z = it[cd + h * 128u + j];
+      const float y = o * (1.0f / __builtin_sqrtf(n3 / 128.0f + eps)) * nw[j] * (z / (1.0f + __builtin_expf(-z)));
+      out[t * os + h * 128u + j] = y;
+      if (oq) quant_wave(y, (h * 128u + j) >> 5, oq + t * qs, inner >> 5);
+    }
+    barrier(); /* the LDS of this token is read before the next token writes it */
   }
-  gd_p[half][j] = pk;
-  barrier();
-  const float delta = (gd_v[j] - (gd_p[0][j] + gd_p[1][j])) * beta;
-  barrier();
-  float po = 0.0f;
-  for (u32 ii = 0; ii < 64u; ii++) {
-    st[ii] += gd_k[half * 64u + ii] * delta;
-    Sh[ii * 128u] = st[ii];
-    po += st[ii] * gd_q[half * 64u + ii];
-  }
-  gd_p[half][j] = po;
-  barrier();
-  const float o = (gd_p[0][j] + gd_p[1][j]) * (1.0f / __builtin_sqrtf(128.0f));
-  /* gated RMSNorm over the 128 values of the head (waves 0-3) */
-  const float s2 = wave_sum_all(o * o);
-  if (lane() == 0u) gd_r[w] = s2;
-  barrier();
-  if (half) return; /* whole waves */
-  const float n3 = gd_r[0] + gd_r[1] + gd_r[2] + gd_r[3];
-  const float z = in[cd + h * 128u + j];
-  const float y = o * (1.0f / __builtin_sqrtf(n3 / 128.0f + eps)) * nw[j] * (z / (1.0f + __builtin_expf(-z)));
-  out[h * 128u + j] = y;
-  if (oq) quant_wave(y, (h * 128u + j) >> 5, oq, inner >> 5);
 }
 
 /* ------------------------------------------------------------------ argmax */

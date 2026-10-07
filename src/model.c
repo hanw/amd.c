@@ -342,7 +342,7 @@ void model_load(model *m, gguf_file *g) {
   load_vec(&m->out_norm, g, "output_norm.weight", m->dim, 0);
 
   uint32_t qd = m->n_head * m->hd, kvd = m->n_kv * m->hd;
-  m->l = calloc(m->n_layer, sizeof(layer));
+  m->l = calloc(m->n_layer + 1, sizeof(layer)); /* + the MTP layer */
   if (!m->l) ie_die("out of memory");
   for (uint32_t i = 0; i < m->n_layer; i++) {
     layer *L = &m->l[i];
@@ -419,7 +419,55 @@ static void free_mat(mat *w) {
   free(w->f);
 }
 
+int model_load_mtp(model *m, gguf_file *g) {
+  if (m->arch != ARCH_QWEN35) return 0;
+  int il = -1;
+  for (uint64_t i = 0; i < g->n_tensors; i++) {
+    unsigned n;
+    char tail[64];
+    if (sscanf(g->t[i].name, "blk.%u.%63s", &n, tail) == 2 && !strcmp(tail, "nextn.eh_proj.weight")) il = (int)n;
+  }
+  if (il < 0) return 0;
+  const uint32_t qd = m->n_head * m->hd, kvd = m->n_kv * m->hd;
+  layer *L = &m->l[m->n_layer];
+  memset(L, 0, sizeof *L);
+  char n[128];
+#define NAME(s) (snprintf(n, sizeof n, "blk.%d." s, il), n)
+  load_vec(&m->enorm, g, NAME("nextn.enorm.weight"), m->dim, 0);
+  load_vec(&m->hnorm, g, NAME("nextn.hnorm.weight"), m->dim, 0);
+  load_vec(&m->head_norm, g, NAME("nextn.shared_head_norm.weight"), m->dim, 1);
+  if (!m->head_norm.n) load_vec(&m->head_norm, g, "output_norm.weight", m->dim, 0);
+  uint64_t wb = 0; /* the MTP weights are not in weight_bytes (the bytes of one model step) */
+  load_mat(&m->eh, g, NAME("nextn.eh_proj.weight"), m->dim, 2 * m->dim, &wb, 1);
+  if (ie_mat_sink) ie_mat_sink(&m->eh);
+  load_vec(&L->attn_norm, g, NAME("attn_norm.weight"), m->dim, 0);
+  load_vec(&L->ffn_norm, g, NAME("post_attention_norm.weight"), m->dim, 0);
+  load_vec(&L->q_norm, g, NAME("attn_q_norm.weight"), m->hd, 0);
+  load_vec(&L->k_norm, g, NAME("attn_k_norm.weight"), m->hd, 0);
+  load_mat(&L->wq, g, NAME("attn_q.weight"), 2 * qd, m->dim, &wb, 1);
+  load_mat(&L->wk, g, NAME("attn_k.weight"), kvd, m->dim, &wb, 1);
+  load_mat(&L->wv, g, NAME("attn_v.weight"), kvd, m->dim, &wb, 1);
+  load_mat(&L->wo, g, NAME("attn_output.weight"), m->dim, qd, &wb, 1);
+  load_mat(&L->wgate, g, NAME("ffn_gate.weight"), m->ffn, m->dim, &wb, 1);
+  load_mat(&L->wup, g, NAME("ffn_up.weight"), m->ffn, m->dim, &wb, 1);
+  load_mat(&L->wdown, g, NAME("ffn_down.weight"), m->dim, m->ffn, &wb, 1);
+#undef NAME
+  mat *qkv[3] = {&L->wq, &L->wk, &L->wv};
+  concat_mats(&L->wqkv, qkv, 3);
+  mat *gu[2] = {&L->wgate, &L->wup};
+  concat_mats(&L->wgu, gu, 2);
+  sink_layer(L);
+  L->kvi = m->n_kvl++;
+  m->has_mtp = 1;
+  fprintf(stderr, "mtp: head blk.%d loaded (%.2f MB)\n", il, wb / 1e6);
+  return 1;
+}
+
 void model_free(model *m) {
+  if (m->has_mtp) {
+    m->n_layer++; /* free the MTP layer with the others */
+    free_mat(&m->eh), free(m->enorm.f), free(m->hnorm.f), free(m->head_norm.f);
+  }
   free_mat(&m->tok);
   if (!m->tied) free_mat(&m->out);
   free(m->out_norm.f);
@@ -505,7 +553,8 @@ static int new_buf(graph *g, const char *name, uint32_t bytes) {
   if (g->n_bufs >= MAX_BUFS) ie_die("too many buffers");
   buf *b = &g->bufs[g->n_bufs];
   b->name = name;
-  b->size = bytes;
+  b->stride = (bytes + 255u) & ~255u; /* each token's part 256-aligned */
+  b->size = b->stride * g->T;
   b->first = UINT32_MAX;
   b->last = 0;
   return (int)g->n_bufs++;
@@ -615,13 +664,76 @@ static int layer_in_q8(const layer *L) {
   return any_q4(&L->wq, &L->wk, &L->wv);
 }
 
-void graph_build(graph *g, const model *m, uint32_t n_ctx) {
+/* A full attention block: x + Wo attention(rmsnorm'd input xn / its Q8
+ * copy xq). Returns the new x. */
+static int attn_block(gb *B, const model *m, const layer *L, int x, int xn, int xq, uint32_t n_ctx) {
+  graph *g = B->g;
+  const uint32_t qd = m->n_head * m->hd, kvd = m->n_kv * m->hd;
+  const int q35 = m->arch == ARCH_QWEN35;
+  op *o;
+    /* q, k, v in one buffer: [q | k | v] (qwen35: q is [q | gate] per head) */
+    const uint32_t qrows = L->wq.rows;
+    int qkv;
+    if (L->wqkv.rows) {
+      qkv = matvec(B, &L->wqkv, xn, xq, "qkv", &L->bqkv, -1);
+    } else {
+      qkv = new_buf(g, "qkv", (qrows + 2 * kvd) * 4);
+      matvec_into(B, &L->wq, xn, xq, qkv, 0, "q", &L->bq, -1);
+      matvec_into(B, &L->wk, xn, xq, qkv, qrows * 4, "k", &L->bk, -1);
+      matvec_into(B, &L->wv, xn, xq, qkv, (qrows + kvd) * 4, "v", &L->bv, -1);
+    }
+    int qsrc = qkv;
+    if (q35) {
+      qsrc = new_buf(g, "q", qd * 4);
+      o = emit(B, OP_QKN_ROPE_KV, qkv, qsrc, -1), o->n = qd, o->nh = m->n_head;
+      o->v = &L->q_norm, o->nv = &L->k_norm;
+    } else {
+      o = emit(B, OP_ROPE_KV, qkv, qkv, qkv), o->n = qd, o->nh = m->n_head;
+      o->boff = qd * 4, o->coff = (qd + kvd) * 4;
+    }
+    int att = new_buf(g, "attn", qd * 4);
+    const uint32_t sc_cpu = m->n_head * n_ctx, sc_gpu = m->n_head * ie_att_max_split(n_ctx) * (m->hd + 2);
+    int sc = new_buf(g, "scores", (sc_cpu > sc_gpu ? sc_cpu : sc_gpu) * 4);
+    o = emit(B, OP_ATTN, qsrc, att, sc), o->n = qd;
+    if (q35) { /* out *= sigmoid(gate): the gate of head h is at h * 2 hd + hd */
+      o->gt = qkv, o->gtoff = m->hd * 4, o->gstride = 2 * m->hd;
+      use_last(B, qkv);
+    }
+    int aq = -1;
+    if (L->wo.kind != MAT_F32) aq = m->hd % 32 == 0 && m->hd <= 256 ? fuse_quant(B, qd, "attn_q8") : quant(B, att, qd, "attn_q8");
+    return matvec(B, &L->wo, att, aq, "x", NULL, x); /* x = x + Wo att */
+}
+
+/* The FFN block: x + Wdown (silu(Wgate h) * Wup h), h = rmsnorm(x) * ffn_norm. */
+static int ffn_block(gb *B, const model *m, const layer *L, int x) {
+  graph *g = B->g;
+  op *o;
+  int hq;
+  int hn = fuse_norm(B, &L->ffn_norm, m->dim, "ffn_in", any_q4(&L->wgate, &L->wup, NULL), "ffn_in_q8", &hq);
+  /* gate and up in one buffer: [gate | up] */
+  int gu;
+  if (L->wgu.rows) {
+    gu = matvec(B, &L->wgu, hn, hq, "gate_up", NULL, -1);
+  } else {
+    gu = new_buf(g, "gate_up", 2 * m->ffn * 4);
+    matvec_into(B, &L->wgate, hn, hq, gu, 0, "gate", NULL, -1);
+    matvec_into(B, &L->wup, hn, hq, gu, m->ffn * 4, "up", NULL, -1);
+  }
+  o = emit(B, OP_SWIGLU, gu, gu, -1); /* gate = silu(gate) * up */
+  o->n = m->ffn, o->boff = m->ffn * 4;
+  int gq = L->wdown.kind != MAT_F32 ? fuse_quant(B, m->ffn, "ffn_mid_q8") : -1;
+  return matvec(B, &L->wdown, gu, gq, "x", NULL, x); /* x = x + Wdown gate */
+}
+
+void graph_build(graph *g, const model *m, uint32_t n_ctx, uint32_t T, int mtp) {
   memset(g, 0, sizeof *g);
   g->bufs = calloc(MAX_BUFS, sizeof(buf));
   g->n_ctx = n_ctx;
+  g->T = T ? T : 1;
+  g->h_out = g->mtp_h = g->mtp_g = g->mtp_logits = g->mtp_argmax = -1;
   gb B = {g, 0, -1};
-  uint32_t dim = m->dim, qd = m->n_head * m->hd;
-  const int q35 = m->arch == ARCH_QWEN35;
+  uint32_t dim = m->dim;
+  if (mtp && !m->has_mtp) ie_die("the model has no MTP head");
 
   int x = new_buf(g, "x", dim * 4);
   emit(&B, OP_EMBED, x, -1, -1)->n = dim;
@@ -631,7 +743,6 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx) {
   op *o = emit(&B, OP_RMSNORM, x, xn, -1);
   o->n = dim, o->v = &m->l[0].attn_norm;
   int xq = layer_in_q8(&m->l[0]) ? fuse_quant(&B, dim, "attn_in_q8") : -1;
-  const uint32_t kvd = m->n_kv * m->hd;
   for (uint32_t l = 0; l < m->n_layer; l++) {
     const layer *L = &m->l[l];
     B.layer = (int)l;
@@ -653,54 +764,9 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx) {
       int gq = L->wo.kind != MAT_F32 ? fuse_quant(&B, inner, "gdn_q8") : -1;
       x = matvec(&B, &L->wo, go, gq, "x", NULL, x); /* x = x + Wout gdn */
     } else {
-    /* q, k, v in one buffer: [q | k | v] (qwen35: q is [q | gate] per head) */
-    const uint32_t qrows = L->wq.rows;
-    int qkv;
-    if (L->wqkv.rows) {
-      qkv = matvec(&B, &L->wqkv, xn, xq, "qkv", &L->bqkv, -1);
-    } else {
-      qkv = new_buf(g, "qkv", (qrows + 2 * kvd) * 4);
-      matvec_into(&B, &L->wq, xn, xq, qkv, 0, "q", &L->bq, -1);
-      matvec_into(&B, &L->wk, xn, xq, qkv, qrows * 4, "k", &L->bk, -1);
-      matvec_into(&B, &L->wv, xn, xq, qkv, (qrows + kvd) * 4, "v", &L->bv, -1);
+    x = attn_block(&B, m, L, x, xn, xq, n_ctx);
     }
-    int qsrc = qkv;
-    if (q35) {
-      qsrc = new_buf(g, "q", qd * 4);
-      o = emit(&B, OP_QKN_ROPE_KV, qkv, qsrc, -1), o->n = qd, o->nh = m->n_head;
-      o->v = &L->q_norm, o->nv = &L->k_norm;
-    } else {
-      o = emit(&B, OP_ROPE_KV, qkv, qkv, qkv), o->n = qd, o->nh = m->n_head;
-      o->boff = qd * 4, o->coff = (qd + kvd) * 4;
-    }
-    int att = new_buf(g, "attn", qd * 4);
-    const uint32_t sc_cpu = m->n_head * n_ctx, sc_gpu = m->n_head * ie_att_max_split(n_ctx) * (m->hd + 2);
-    int sc = new_buf(g, "scores", (sc_cpu > sc_gpu ? sc_cpu : sc_gpu) * 4);
-    o = emit(&B, OP_ATTN, qsrc, att, sc), o->n = qd;
-    if (q35) { /* out *= sigmoid(gate): the gate of head h is at h * 2 hd + hd */
-      o->gt = qkv, o->gtoff = m->hd * 4, o->gstride = 2 * m->hd;
-      use_last(&B, qkv);
-    }
-    int aq = -1;
-    if (L->wo.kind != MAT_F32) aq = m->hd % 32 == 0 && m->hd <= 256 ? fuse_quant(&B, qd, "attn_q8") : quant(&B, att, qd, "attn_q8");
-    x = matvec(&B, &L->wo, att, aq, "x", NULL, x); /* x = x + Wo att */
-    }
-    int hq;
-    int hn = fuse_norm(&B, &L->ffn_norm, dim, "ffn_in", any_q4(&L->wgate, &L->wup, NULL), "ffn_in_q8", &hq);
-
-    /* gate and up in one buffer: [gate | up] */
-    int gu;
-    if (L->wgu.rows) {
-      gu = matvec(&B, &L->wgu, hn, hq, "gate_up", NULL, -1);
-    } else {
-      gu = new_buf(g, "gate_up", 2 * m->ffn * 4);
-      matvec_into(&B, &L->wgate, hn, hq, gu, 0, "gate", NULL, -1);
-      matvec_into(&B, &L->wup, hn, hq, gu, m->ffn * 4, "up", NULL, -1);
-    }
-    o = emit(&B, OP_SWIGLU, gu, gu, -1); /* gate = silu(gate) * up */
-    o->n = m->ffn, o->boff = m->ffn * 4;
-    int gq = L->wdown.kind != MAT_F32 ? fuse_quant(&B, m->ffn, "ffn_mid_q8") : -1;
-    x = matvec(&B, &L->wdown, gu, gq, "x", NULL, x); /* x = x + Wdown gate */
+    x = ffn_block(&B, m, L, x);
     if (l + 1 < m->n_layer) {
       const layer *N = &m->l[l + 1];
       xn = fuse_norm(&B, &N->attn_norm, dim, "attn_in", layer_in_q8(N), "attn_in_q8", &xq);
@@ -712,13 +778,41 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx) {
   g->logits = matvec(&B, &m->out, xn, xq, "logits", NULL, -1);
   g->argmax = new_buf(g, "argmax", 4);
   emit(&B, OP_ARGMAX, g->logits, g->argmax, -1)->n = m->vocab;
-  /* The host reads the logits and the argmax after the last op. */
-  touch(g, g->logits, g->n_ops);
-  touch(g, g->argmax, g->n_ops);
+  g->h_out = xn;
+  g->n_main = g->n_ops;
+
+  if (mtp) { /* the MTP head (see model.h) */
+    const layer *L = &m->l[m->n_layer];
+    B.layer = (int)m->n_layer;
+    g->mtp_h = new_buf(g, "mtp_h", dim * 4);
+    int e = new_buf(g, "mtp_e", dim * 4);
+    emit(&B, OP_EMBED, e, -1, -1)->n = dim;
+    int cat = new_buf(g, "mtp_cat", 2 * dim * 4); /* [enorm(e) | hnorm(h)] */
+    o = emit(&B, OP_RMSNORM, e, cat, -1), o->n = dim, o->v = &m->enorm;
+    o = emit(&B, OP_RMSNORM, g->mtp_h, cat, -1), o->n = dim, o->v = &m->hnorm, o->boff = dim * 4;
+    int catq = m->eh.kind != MAT_F32 ? quant(&B, cat, 2 * dim, "mtp_cat_q8") : -1;
+    int x2 = matvec(&B, &m->eh, cat, catq, "mtp_x", NULL, -1);
+    int xn2 = new_buf(g, "mtp_attn_in", dim * 4);
+    o = emit(&B, OP_RMSNORM, x2, xn2, -1), o->n = dim, o->v = &L->attn_norm;
+    int xq2 = layer_in_q8(L) ? fuse_quant(&B, dim, "mtp_attn_in_q8") : -1;
+    x2 = attn_block(&B, m, L, x2, xn2, xq2, n_ctx);
+    x2 = ffn_block(&B, m, L, x2);
+    g->mtp_g = new_buf(g, "mtp_g", dim * 4);
+    o = emit(&B, OP_RMSNORM, x2, g->mtp_g, -1), o->n = dim, o->v = &m->head_norm;
+    int gq2 = m->out.kind != MAT_F32 ? fuse_quant(&B, dim, "mtp_g_q8") : -1;
+    B.layer = -1;
+    g->mtp_logits = matvec(&B, &m->out, g->mtp_g, gq2, "mtp_logits", NULL, -1);
+    g->mtp_argmax = new_buf(g, "mtp_argmax", 4);
+    emit(&B, OP_ARGMAX, g->mtp_logits, g->mtp_argmax, -1)->n = m->vocab;
+  }
+  /* The host reads (or copies) these buffers between runs: they live
+   * through the whole op list. */
+  const int keep[] = {g->logits, g->argmax, g->h_out, g->mtp_h, g->mtp_g, g->mtp_logits, g->mtp_argmax};
+  for (unsigned k = 0; k < sizeof keep / sizeof keep[0]; k++) touch(g, keep[k], 0), touch(g, keep[k], g->n_ops);
 
   /* bytes of weights read per token (GEMV + one embedding row) */
   uint64_t wb = 0;
-  for (uint32_t i = 0; i < g->n_ops; i++) {
+  for (uint32_t i = 0; i < g->n_main; i++) {
     const op *p = &g->ops[i];
     if (p->kind == OP_GEMV_Q4) wb += (uint64_t)p->w->rows * p->w->nb * 18;
     if (p->kind == OP_GEMV_F32) wb += (uint64_t)p->w->rows * p->w->cols * 4;
