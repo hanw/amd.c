@@ -1,0 +1,5 @@
+build/
+proofs/.build/
+__pycache__/
+*.pyc
+.venv/
