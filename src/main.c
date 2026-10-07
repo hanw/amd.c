@@ -74,6 +74,9 @@ int main(int argc, char **argv) {
 
   gguf_file g;
   gguf_open(&g, path);
+  /* GPU: weights go to the device during the load (IE_STREAM=0: after) */
+  const char *se = getenv("IE_STREAM");
+  if (!strcmp(be, "gpu") && !(se && se[0] == '0')) gpu_stream_init();
   if (info) gguf_print(&g, stderr);
   model m;
   model_load(&m, &g);
@@ -81,7 +84,7 @@ int main(int argc, char **argv) {
   if (n_ctx == 0) n_ctx = need;
   if (n_ctx < need) ie_die("--ctx %u is smaller than prompt + n = %u", n_ctx, need);
   fprintf(stderr, "model: %s, %u layers, dim %u, ffn %u, heads %u/%u (hd %u), vocab %u, rope %s, weights %.2f MB\n",
-          m.arch == ARCH_QWEN2 ? "qwen2" : "llama", m.n_layer, m.dim, m.ffn, m.n_head, m.n_kv, m.hd, m.vocab,
+          m.arch == ARCH_QWEN35 ? "qwen35" : m.arch == ARCH_QWEN2 ? "qwen2" : "llama", m.n_layer, m.dim, m.ffn, m.n_head, m.n_kv, m.hd, m.vocab,
           m.rope == ROPE_NEOX ? "neox" : "norm", m.weight_bytes / 1e6);
 
   graph gr;

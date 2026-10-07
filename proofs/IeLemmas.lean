@@ -83,19 +83,24 @@ theorem r_nb (rows nb r : U32) (hR : rows < 262144#32) (hN : nb < 512#32) (hr : 
   exact ⟨mul_nat _ _ (by omega), this⟩
 
 
-theorem rows_nb8 (rows nb : U32) (hR : rows < 262144#32) (hN : nb < 256#32) :
+theorem rows_nb8 (rows nb : U32) (hR : rows < 262144#32) (hN : nb < 2048#32) (hP : rows * nb < 67108864#32) :
     (rows * nb).toNat = rows.toNat * nb.toNat ∧ rows.toNat * nb.toNat < 2^26 := by
   have hR' : rows.toNat < 2^18 := by bv_omega
-  have hN' : nb.toNat < 2^8 := by bv_omega
-  have : rows.toNat * nb.toNat < 2^26 :=
-    calc rows.toNat * nb.toNat ≤ rows.toNat * 2^8 := Nat.mul_le_mul_left _ (Nat.le_of_lt hN')
-      _ < 2^18 * 2^8 := Nat.mul_lt_mul_of_pos_right hR' (by decide)
-      _ = 2^26 := by decide
-  exact ⟨mul_nat _ _ (by omega), this⟩
+  have hN' : nb.toNat < 2^11 := by bv_omega
+  have h29 : rows.toNat * nb.toNat < 2^29 :=
+    calc rows.toNat * nb.toNat ≤ rows.toNat * 2^11 := Nat.mul_le_mul_left _ (Nat.le_of_lt hN')
+      _ < 2^18 * 2^11 := Nat.mul_lt_mul_of_pos_right hR' (by decide)
+      _ = 2^29 := by decide
+  have e := mul_nat rows nb (by omega)
+  refine ⟨e, ?_⟩
+  have := BitVec.lt_def.mp hP
+  rw [e] at this
+  simpa using this
 
-theorem r_nb8 (rows nb r : U32) (hR : rows < 262144#32) (hN : nb < 256#32) (hr : r < rows) :
+theorem r_nb8 (rows nb r : U32) (hR : rows < 262144#32) (hN : nb < 2048#32) (hP : rows * nb < 67108864#32)
+    (hr : r < rows) :
     (r * nb).toNat = r.toNat * nb.toNat ∧ r.toNat * nb.toNat + nb.toNat ≤ rows.toNat * nb.toNat := by
-  have ⟨_, h2⟩ := rows_nb8 rows nb hR hN
+  have ⟨_, h2⟩ := rows_nb8 rows nb hR hN hP
   have hr' : r.toNat + 1 ≤ rows.toNat := by bv_omega
   have : r.toNat * nb.toNat + nb.toNat ≤ rows.toNat * nb.toNat := by
     rw [← Nat.succ_mul]; exact Nat.mul_le_mul_right _ hr'

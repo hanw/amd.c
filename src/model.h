@@ -8,7 +8,7 @@
 
 #include "gguf.h"
 
-enum { ARCH_LLAMA = 0, ARCH_QWEN2 = 1 };
+enum { ARCH_LLAMA = 0, ARCH_QWEN2 = 1, ARCH_QWEN35 = 2 };
 enum { ROPE_NORM = 0, ROPE_NEOX = 1 }; /* NORM: pairs (2i, 2i+1); NEOX: (i, i + hd/2) */
 
 /* A weight matrix: rows x cols, y = W x. */
@@ -24,6 +24,9 @@ typedef struct {
    * rows*nb*8 int8 words in qw and rows*nb f16 scales in qs. */
   /* MAT_F32: rows*cols floats (dequantized from F32/F16, or Q8_0 for the embedding). */
   float *f;
+  /* Streaming load (ie_mat_sink set): the device copies of qw and qs (or
+   * f in d0); the host arrays are then freed (NULL). */
+  void *d0, *d1;
 } mat;
 
 typedef struct {
@@ -40,12 +43,30 @@ typedef struct {
    * parts are freed (their rows stay set, their arrays are NULL). */
   mat wqkv, wgu;
   vec bqkv;
+  /* qwen35 (Qwen3.5 / 3.8): rec = 1 for a linear attention layer (Gated
+   * DeltaNet), 0 for a full attention layer. ffn_norm holds
+   * post_attention_norm. Full attention: wq has 2 * n_head * hd rows, per
+   * head [q (hd) | gate (hd)]; q_norm and k_norm are per head RMSNorm
+   * weights (hd). Linear attention: wlqkv (conv_dim rows: q | k | v), wz
+   * (inner), wbeta, walpha (n_vh rows each), merged into win = [wlqkv; wz;
+   * wbeta; walpha] when they have one kind; conv = ssm_conv1d [conv_dim][4];
+   * wo = ssm_out. */
+  int rec;
+  uint32_t kvi, sti; /* index among the attention layers (KV cache) / the linear layers (state) */
+  vec q_norm, k_norm;
+  mat wlqkv, wz, wbeta, walpha, win;
+  vec conv, dt_bias, ssm_a, ssm_norm;
 } layer;
 
 typedef struct {
   int arch, rope;
   uint32_t n_layer, dim, ffn, n_head, n_kv, hd, vocab, ctx_train;
   float eps, rope_base;
+  uint32_t n_rot;        /* rotated dims per head (hd, or fewer: qwen35 partial RoPE) */
+  uint32_t n_kvl, n_rec; /* layers with a KV cache / with a linear attention state */
+  /* qwen35 linear attention: key heads, value heads, head dim (keys and
+   * values), conv window; conv_dim = 2 * n_kh * sd + n_vh * sd. */
+  uint32_t n_kh, n_vh, sd, d_conv, conv_dim;
   mat tok;   /* token_embd (Q4 repacked or F32), rows = vocab, cols = dim */
   mat out;   /* output; may share the arrays of tok (tied) */
   int tied;
@@ -58,6 +79,10 @@ typedef struct {
   uint64_t weight_bytes; /* bytes of all repacked/dequantized weights */
 } model;
 
+/* If set, model_load gives every finished matrix to this function (for
+ * example: copy it to the GPU and free the host arrays), so that the host
+ * never holds all the weights at once. */
+extern void (*ie_mat_sink)(mat *w);
 void model_load(model *m, gguf_file *g);
 void model_free(model *m);
 /* Repack GGUF Q4_0 bytes (w->rows, w->cols, w->nb set) into w->qw, w->qs. */
@@ -83,6 +108,14 @@ enum {
   OP_ATTN,    /* b = attention(q = a, the KV cache of layer), scores in c */
   OP_SWIGLU,  /* a = silu(a) * b */
   OP_ARGMAX,  /* b (u32) = argmax(a) */
+  /* qwen35 full attention: a = [q|gate per head (2 hd) x nh | k | v]; b = q
+   * (nh x hd): per head RMSNorm (v = q_norm, nv = k_norm), RoPE of the
+   * first n_rot dims (NEOX pairs), k and v into the KV cache of layer. */
+  OP_QKN_ROPE_KV,
+  /* qwen35 linear attention (Gated DeltaNet) of one token: a = [q k v
+   * (conv_dim) | z (inner) | beta (n_vh) | alpha (n_vh)], b = the output
+   * (inner, after the gated RMSNorm), Q8 copy in qo. State of layer. */
+  OP_GDN,
 };
 
 typedef struct {
@@ -107,6 +140,10 @@ typedef struct {
    *  res: GEMV only: add this f32 buffer to the result (residual). The GEMV
    *       also adds v (the bias) when v is set. */
   int qo, res;
+  /* ATTN only: if gt >= 0, out *= sigmoid(gate), gate of head h at float
+   * gtoff / 4 + h * gstride of buffer gt (qwen35). */
+  int gt;
+  uint32_t gtoff, gstride;
 } op;
 
 /* Activation buffers. Each has a size in bytes and, after planning, an
@@ -143,7 +180,7 @@ typedef struct {
   uint32_t arena; /* bytes */
   int x, logits, argmax; /* buffer ids that the host reads */
   uint32_t n_ctx;
-  float *rope_cos, *rope_sin; /* [n_ctx][hd/2] */
+  float *rope_cos, *rope_sin; /* [n_ctx][n_rot/2] */
   uint64_t weight_bytes_per_token;
 } graph;
 

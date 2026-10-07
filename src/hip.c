@@ -44,6 +44,7 @@ static struct {
   } while (0)
 
 static void hip_load(void) {
+  if (H.lib) return;
   const char *names[] = {"libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.7", "/opt/rocm/lib/libamdhip64.so"};
   for (unsigned i = 0; i < sizeof names / sizeof names[0] && !H.lib; i++) H.lib = dlopen(names[i], RTLD_NOW);
   if (!H.lib)
@@ -76,10 +77,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
-                                 "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split"};
+                                 "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn"};
 /* The argmax kernel: workgroups, and its device scratch (partial results and
  * the counter of finished workgroups). */
 enum { ARGMAX_GROUPS = 128 };
@@ -112,6 +114,7 @@ typedef struct {
   double host_ms;
   uint32_t host_n;
   float *kc, *vc, *rcos, *rsin;
+  float *ring, *st; /* qwen35 linear attention state (see cpu.c) */
   void *tok0, *tok1; /* token_embd */
   dop *d;
   /* host -> device map of uploaded arrays */
@@ -144,6 +147,10 @@ static void *upload(gpu_backend *b, const void *host, size_t bytes) {
 }
 
 static void upload_mat(gpu_backend *b, const mat *w, void **w0, void **w1) {
+  if (w->d0) { /* streamed at load */
+    *w0 = w->d0, *w1 = w->d1;
+    return;
+  }
   if (w->kind == MAT_Q4) {
     *w0 = upload(b, w->qw, (size_t)w->rows * w->nb * 16);
     *w1 = upload(b, w->qs, (size_t)w->rows * w->nb * 2);
@@ -158,6 +165,43 @@ static void upload_mat(gpu_backend *b, const mat *w, void **w0, void **w1) {
 
 static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits, double *ms);
 static void gpu_close(backend *bk);
+
+/* Streaming load: the device arrays of the streamed matrices (freed at close). */
+static void **sdev;
+static uint32_t n_sdev, cap_sdev;
+static size_t sdev_bytes;
+static void *sdev_put(void *host, size_t bytes) {
+  void *dev;
+  HIP(H.Malloc(&dev, bytes));
+  HIP(H.Memcpy(dev, host, bytes, hipMemcpyHostToDevice));
+  if (n_sdev == cap_sdev) {
+    cap_sdev = cap_sdev ? 2 * cap_sdev : 256;
+    sdev = realloc(sdev, cap_sdev * sizeof(void *));
+    if (!sdev) ie_die("out of memory");
+  }
+  sdev[n_sdev++] = dev;
+  sdev_bytes += bytes;
+  free(host);
+  return dev;
+}
+static void gpu_sink(mat *w) {
+  if (!w->rows || w->d0) return;
+  if (w->kind == MAT_F32) {
+    if (!w->f) return;
+    w->d0 = sdev_put(w->f, (size_t)w->rows * w->cols * 4), w->f = NULL;
+  } else {
+    if (!w->qw) return;
+    const size_t words = w->kind == MAT_Q4 ? 16 : 32;
+    w->d0 = sdev_put(w->qw, (size_t)w->rows * w->nb * words), w->qw = NULL;
+    w->d1 = sdev_put(w->qs, (size_t)w->rows * w->nb * 2), w->qs = NULL;
+  }
+}
+void gpu_stream_init(void) {
+  hip_load();
+  HIP(H.Init(0));
+  HIP(H.SetDevice(0));
+  ie_mat_sink = gpu_sink;
+}
 
 backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   hip_load();
@@ -202,10 +246,13 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     b->chk_a = ie_alloc(m->n_head * m->hd * 4u);
     b->chk_b = ie_alloc(m->n_head * m->hd * 4u);
   }
-  const size_t kv = (size_t)m->n_layer * g->n_ctx * m->n_kv * m->hd * 4;
+  const size_t kv = (size_t)m->n_kvl * g->n_ctx * m->n_kv * m->hd * 4 + 4;
   HIP(H.Malloc((void **)&b->kc, kv));
   HIP(H.Malloc((void **)&b->vc, kv));
-  const size_t rt = (size_t)g->n_ctx * (m->hd / 2) * 4;
+  const size_t rbytes = (size_t)m->n_rec * 4 * m->conv_dim * 4 + 4, sbytes = (size_t)m->n_rec * m->n_vh * m->sd * m->sd * 4 + 4;
+  HIP(H.Malloc((void **)&b->ring, rbytes));
+  HIP(H.Malloc((void **)&b->st, sbytes));
+  const size_t rt = (size_t)g->n_ctx * (m->n_rot / 2) * 4;
   b->rcos = upload(b, g->rope_cos, rt);
   b->rsin = upload(b, g->rope_sin, rt);
   upload_mat(b, &m->tok, &b->tok0, &b->tok1);
@@ -217,6 +264,13 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     if (o->v && o->w) b->d[i].bias = upload(b, o->v->f, o->v->n * 4); /* GEMV bias */
     else if (o->v) b->d[i].w0 = upload(b, o->v->f, o->v->n * 4);
     if (o->nv) b->d[i].nw = upload(b, o->nv->f, o->nv->n * 4);
+    if (o->kind == OP_GDN) { /* conv weights, dt bias, A, norm weight */
+      const layer *L = &m->l[o->layer];
+      b->d[i].w0 = upload(b, L->conv.f, L->conv.n * 4);
+      b->d[i].w1 = upload(b, L->dt_bias.f, L->dt_bias.n * 4);
+      b->d[i].bias = upload(b, L->ssm_a.f, L->ssm_a.n * 4);
+      b->d[i].nw = upload(b, L->ssm_norm.f, L->ssm_norm.n * 4);
+    }
   }
   HIP(H.EventCreate(&b->e0));
   HIP(H.EventCreate(&b->e1));
@@ -228,7 +282,9 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     if (!b->pev || !b->pms) ie_die("out of memory");
     for (uint32_t i = 0; i < b->g->n_ops; i++) HIP(H.EventCreate(&b->pev[i]));
   }
-  fprintf(stderr, "gpu: %u arrays uploaded, arena %u bytes, KV cache %zu bytes\n", b->nh, g->arena, 2 * kv);
+  if (n_sdev) fprintf(stderr, "gpu: %u arrays (%.2f GB) streamed at load\n", n_sdev, sdev_bytes / 1e9);
+  fprintf(stderr, "gpu: %u arrays uploaded, arena %u bytes, KV cache %zu bytes, linear state %zu bytes\n", b->nh, g->arena,
+          2 * kv, rbytes + sbytes);
   return &b->base;
 }
 
@@ -253,7 +309,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   const graph *g = b->g;
   if (tok >= m->vocab) ie_die("token %u >= vocab %u", tok, m->vocab);
   if (pos >= g->n_ctx) ie_die("position %u >= context %u", pos, g->n_ctx);
-  const u32 h2 = m->hd / 2, kvd = m->n_kv * m->hd, hd = m->hd, nhd = m->n_head, nkv = m->n_kv, nctx = g->n_ctx;
+  const u32 h2 = m->n_rot / 2, kvd = m->n_kv * m->hd, hd = m->hd, nhd = m->n_head, nkv = m->n_kv, nctx = g->n_ctx;
   HIP(H.EventRecord(b->e0, NULL));
   struct timespec h0, h1;
   clock_gettime(CLOCK_MONOTONIC, &h0);
@@ -273,10 +329,10 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
     const unsigned elem_groups = (n + 255u) / 256u;
     switch (o->kind) {
       case OP_EMBED:
-        if (m->tok.kind == MAT_Q4) {
+        if (m->tok.kind == MAT_Q4 || m->tok.kind == MAT_Q8) {
           u32 nb = m->tok.nb;
           void *args[] = {&A, &b->tok0, &b->tok1, &nb, &tok};
-          launch(b, K_EMBED_Q4, 1, args);
+          launch(b, m->tok.kind == MAT_Q4 ? K_EMBED_Q4 : K_EMBED_Q8, 1, args);
         } else {
           u32 cols = m->tok.cols;
           void *args[] = {&A, &b->tok0, &cols, &tok};
@@ -336,30 +392,51 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
       }
       case OP_ROPE_KV: {
         float *cs = b->rcos + (size_t)pos * h2, *sn = b->rsin + (size_t)pos * h2;
-        const size_t base = ((size_t)o->layer * nctx + pos) * kvd;
+        const size_t base = ((size_t)m->l[o->layer].kvi * nctx + pos) * kvd;
         float *kc = b->kc + base, *vc = b->vc + base;
         u32 nq = o->nh, neox = m->rope == ROPE_NEOX;
         void *args[] = {&A, &B, &C, &kc, &vc, &cs, &sn, &nq, (void *)&nkv, (void *)&hd, &neox};
         launch(b, K_ROPE_KV, ((nq + nkv) * h2 + kvd + 255u) / 256u, args);
         break;
       }
+      case OP_QKN_ROPE_KV: {
+        float *cs = b->rcos + (size_t)pos * h2, *sn = b->rsin + (size_t)pos * h2;
+        const size_t base = ((size_t)m->l[o->layer].kvi * nctx + pos) * kvd;
+        float *kc = b->kc + base, *vc = b->vc + base;
+        u32 nq = o->nh, nrot = m->n_rot;
+        void *args[] = {&A, &B, &kc, &vc, &w0, &NW, &cs, &sn, &nq, (void *)&nkv, (void *)&hd, &nrot, &eps};
+        launch(b, K_QKN_ROPE_KV, nq + 2u * nkv, args);
+        break;
+      }
+      case OP_GDN: {
+        const layer *L = &m->l[o->layer];
+        float *ring = b->ring + (size_t)L->sti * 4 * m->conv_dim;
+        float *st = b->st + (size_t)L->sti * m->n_vh * m->sd * m->sd;
+        void *cw = b->d[i].w0, *dtb = b->d[i].w1, *sa = b->d[i].bias, *nw = b->d[i].nw;
+        u32 cd = m->conv_dim, nk = m->n_kh, nv = m->n_vh;
+        void *args[] = {&A, &B, &Q, &ring, &st, &cw, &dtb, &sa, &nw, &pos, &cd, &nk, &nv, &eps};
+        launch(b, K_GDN, nv, args);
+        break;
+      }
       case OP_KV: {
-        const size_t base = ((size_t)o->layer * nctx + pos) * kvd;
+        const size_t base = ((size_t)m->l[o->layer].kvi * nctx + pos) * kvd;
         float *kc = b->kc + base, *vc = b->vc + base;
         void *args[] = {&A, &B, &kc, &vc, &n};
         launch(b, K_KV, elem_groups, args);
         break;
       }
       case OP_ATTN: {
-        const size_t base = (size_t)o->layer * nctx * kvd;
+        const size_t base = (size_t)m->l[o->layer].kvi * nctx * kvd;
         float *kc = b->kc + base, *vc = b->vc + base;
+        void *GT = o->gt >= 0 ? b->arena + g->bufs[o->gt].off + o->gtoff : NULL;
+        u32 gs = o->gstride;
         if (b->attn_split) {
           u32 ch = ie_att_ch(pos), nsplit = ie_att_nsplit(pos);
-          void *args[] = {&A, &kc, &vc, &C, &B, &pos, (void *)&hd, (void *)&nhd, (void *)&nkv, &nsplit, &ch, &b->at_count, &Q};
+          void *args[] = {&A, &kc, &vc, &C, &B, &pos, (void *)&hd, (void *)&nhd, (void *)&nkv, &nsplit, &ch, &b->at_count, &Q, &GT, &gs};
           launch(b, K_ATTN_SPLIT, nhd * nsplit, args);
           if (b->attn_check) {
             void *nq = NULL;
-            void *a2[] = {&A, &kc, &vc, &C, &b->chk, &pos, (void *)&nctx, (void *)&hd, (void *)&nhd, (void *)&nkv, &nq};
+            void *a2[] = {&A, &kc, &vc, &C, &b->chk, &pos, (void *)&nctx, (void *)&hd, (void *)&nhd, (void *)&nkv, &nq, &GT, &gs};
             launch(b, K_ATTN, nhd, a2);
             const size_t nb = (size_t)nhd * hd * 4u;
             HIP(H.Memcpy(b->chk_a, B, nb, hipMemcpyDeviceToHost));
@@ -374,7 +451,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
             b->chk_n++;
           }
         } else {
-          void *args[] = {&A, &kc, &vc, &C, &B, &pos, (void *)&nctx, (void *)&hd, (void *)&nhd, (void *)&nkv, &Q};
+          void *args[] = {&A, &kc, &vc, &C, &B, &pos, (void *)&nctx, (void *)&hd, (void *)&nhd, (void *)&nkv, &Q, &GT, &gs};
           launch(b, K_ATTN, nhd, args);
         }
         break;
@@ -413,7 +490,9 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
 static int op_kernel(const gpu_backend *b, const op *o) {
   const model *m = b->m;
   switch (o->kind) {
-    case OP_EMBED: return m->tok.kind == MAT_Q4 ? K_EMBED_Q4 : K_EMBED_F32;
+    case OP_EMBED: return m->tok.kind == MAT_Q4 ? K_EMBED_Q4 : m->tok.kind == MAT_Q8 ? K_EMBED_Q8 : K_EMBED_F32;
+    case OP_QKN_ROPE_KV: return K_QKN_ROPE_KV;
+    case OP_GDN: return K_GDN;
     case OP_RMSNORM: return K_RMSNORM;
     case OP_QUANT: return K_QUANT;
     case OP_GEMV_Q4: return K_GEMV_Q4;
@@ -557,7 +636,9 @@ static void gpu_close(backend *bk) {
   if (b->prof && b->psteps) prof_report(b), prof_layers(b);
   HIP(H.DeviceSynchronize());
   for (uint32_t i = 0; i < b->nh; i++) H.Free(b->hv[i]);
-  H.Free(b->arena), H.Free(b->kc), H.Free(b->vc);
+  for (uint32_t i = 0; i < n_sdev; i++) H.Free(sdev[i]);
+  free(sdev), sdev = NULL, n_sdev = cap_sdev = 0;
+  H.Free(b->arena), H.Free(b->kc), H.Free(b->vc), H.Free(b->ring), H.Free(b->st);
   H.Free(b->am_part), H.Free(b->am_count), H.Free(b->at_count), H.Free(b->gm_count);
   if (b->prof) {
     for (uint32_t i = 0; i < b->g->n_ops; i++) H.EventDestroy(b->pev[i]);

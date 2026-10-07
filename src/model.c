@@ -123,7 +123,7 @@ void repack_q4(mat *w, const uint8_t *src) {
  * each int8 weight. */
 void repack_q8(mat *w, const uint8_t *src) {
   uint32_t rows = w->rows, nb = w->nb;
-  if (!ie_q8_sizes_ok(rows, nb)) ie_die("Q8_0 matrix %ux%u: outside ie_q8_sizes_ok (rows < 2^18, blocks < 256)", rows, w->cols);
+  if (!ie_q8_sizes_ok(rows, nb)) ie_die("Q8_0 matrix %ux%u: outside ie_q8_sizes_ok (rows < 2^18, blocks < 2048, rows * blocks < 2^26)", rows, w->cols);
   w->qw = ie_alloc((size_t)rows * nb * 32);
   w->qs = ie_alloc((size_t)rows * nb * 2);
   for (u32 r = 0; r < rows; r++)
@@ -248,6 +248,26 @@ static void concat_bias(vec *dst, const vec *const *src, const uint32_t *len, in
     if (src[i]->n) memcpy(dst->f + o, src[i]->f, len[i] * 4);
 }
 
+void (*ie_mat_sink)(mat *w);
+
+/* Give the finished matrices of a layer to the sink (merged parts have no
+ * host arrays left and are skipped by the sink). */
+static void sink_layer(layer *L) {
+  if (!ie_mat_sink) return;
+  mat *all[] = {&L->wq, &L->wk, &L->wv, &L->wqkv, &L->wo, &L->wgate, &L->wup, &L->wdown, &L->wgu,
+                &L->wlqkv, &L->wz, &L->wbeta, &L->walpha, &L->win};
+  for (unsigned i = 0; i < sizeof all / sizeof all[0]; i++) ie_mat_sink(all[i]);
+}
+
+static uint32_t opt_u32(gguf_file *g, const char *arch, const char *key, uint32_t def) {
+  char k[256];
+  int64_t v;
+  snprintf(k, sizeof k, "%s.%s", arch, key);
+  if (!gguf_get_int(g, k, &v)) return def;
+  if (v < 0 || v > 0x7FFFFFFF) ie_die("bad metadata %s", k);
+  return (uint32_t)v;
+}
+
 static uint32_t need_u32(gguf_file *g, const char *arch, const char *key) {
   char k[256];
   int64_t v;
@@ -262,9 +282,14 @@ void model_load(model *m, gguf_file *g) {
   if (!arch) ie_die("missing general.architecture");
   if (strcmp(arch, "llama") == 0) m->arch = ARCH_LLAMA, m->rope = ROPE_NORM;
   else if (strcmp(arch, "qwen2") == 0) m->arch = ARCH_QWEN2, m->rope = ROPE_NEOX;
-  else ie_die("architecture %s is not supported (llama, qwen2)", arch);
+  else if (strcmp(arch, "qwen35") == 0) m->arch = ARCH_QWEN35, m->rope = ROPE_NEOX;
+  else ie_die("architecture %s is not supported (llama, qwen2, qwen35)", arch);
+  const int q35 = m->arch == ARCH_QWEN35;
 
   m->n_layer = need_u32(g, arch, "block_count");
+  /* qwen35: the last nextn_predict_layers blocks are multi-token prediction
+   * layers, not used for decoding one token at a time */
+  if (q35) m->n_layer -= opt_u32(g, arch, "nextn_predict_layers", 0);
   m->dim = need_u32(g, arch, "embedding_length");
   m->ffn = need_u32(g, arch, "feed_forward_length");
   m->n_head = need_u32(g, arch, "attention.head_count");
@@ -276,17 +301,39 @@ void model_load(model *m, gguf_file *g) {
   m->eps = gguf_get_float(g, k, &d) ? (float)d : 1e-5f;
   snprintf(k, sizeof k, "%s.rope.freq_base", arch);
   m->rope_base = gguf_get_float(g, k, &d) ? (float)d : 10000.0f;
-  if (m->dim % m->n_head || m->n_head % m->n_kv) ie_die("bad head counts");
-  m->hd = m->dim / m->n_head;
-  if (m->hd % 2) ie_die("head dim must be even");
+  if (m->n_head % m->n_kv) ie_die("bad head counts");
+  uint32_t interval = 1;
+  if (q35) {
+    m->hd = need_u32(g, arch, "attention.key_length");
+    if (opt_u32(g, arch, "attention.value_length", m->hd) != m->hd) ie_die("key and value head dims differ");
+    m->n_rot = opt_u32(g, arch, "rope.dimension_count", m->hd);
+    m->d_conv = need_u32(g, arch, "ssm.conv_kernel");
+    m->sd = need_u32(g, arch, "ssm.state_size");
+    m->n_kh = need_u32(g, arch, "ssm.group_count");
+    m->n_vh = need_u32(g, arch, "ssm.time_step_rank");
+    interval = need_u32(g, arch, "full_attention_interval");
+    if (need_u32(g, arch, "ssm.inner_size") != m->n_vh * m->sd) ie_die("ssm.inner_size != time_step_rank * state_size");
+    /* the kernels (ie_gdn) are written for these sizes */
+    if (m->d_conv != 4 || m->sd != 128 || m->n_vh % m->n_kh) ie_die("linear attention: unsupported sizes");
+    m->conv_dim = 2 * m->n_kh * m->sd + m->n_vh * m->sd;
+  } else {
+    if (m->dim % m->n_head) ie_die("bad head counts");
+    m->hd = m->dim / m->n_head;
+    m->n_rot = m->hd;
+  }
+  if (m->hd % 2 || m->n_rot % 2 || m->n_rot > m->hd) ie_die("bad head dim");
   if (m->dim % 32 || m->ffn % 32) ie_die("dims must be multiples of 32");
 
   const gguf_tensor *te = need_tensor(g, "token_embd.weight");
   m->vocab = (uint32_t)te->ne[1];
   uint64_t wb = 0;
-  load_mat(&m->tok, g, "token_embd.weight", m->vocab, m->dim, &wb, 0);
+  /* qwen35: a Q8_0 embedding stays Q8_0 (1.3 GB for the 27B model; as f32
+   * it would be 5 GB) */
+  load_mat(&m->tok, g, "token_embd.weight", m->vocab, m->dim, &wb, q35);
+  if (ie_mat_sink) ie_mat_sink(&m->tok);
   if (gguf_tensor_find(g, "output.weight")) {
     load_mat(&m->out, g, "output.weight", m->vocab, m->dim, &m->weight_bytes, 1);
+    if (ie_mat_sink) ie_mat_sink(&m->out);
   } else {
     m->out = m->tok;
     m->tied = 1;
@@ -294,7 +341,7 @@ void model_load(model *m, gguf_file *g) {
   }
   load_vec(&m->out_norm, g, "output_norm.weight", m->dim, 0);
 
-  uint32_t qd = m->dim, kvd = m->n_kv * m->hd;
+  uint32_t qd = m->n_head * m->hd, kvd = m->n_kv * m->hd;
   m->l = calloc(m->n_layer, sizeof(layer));
   if (!m->l) ie_die("out of memory");
   for (uint32_t i = 0; i < m->n_layer; i++) {
@@ -302,25 +349,49 @@ void model_load(model *m, gguf_file *g) {
     char n[128];
 #define NAME(s) (snprintf(n, sizeof n, "blk.%u." s, i), n)
     load_vec(&L->attn_norm, g, NAME("attn_norm.weight"), m->dim, 0);
-    load_vec(&L->ffn_norm, g, NAME("ffn_norm.weight"), m->dim, 0);
-    load_mat(&L->wq, g, NAME("attn_q.weight"), qd, m->dim, &m->weight_bytes, 1);
-    load_mat(&L->wk, g, NAME("attn_k.weight"), kvd, m->dim, &m->weight_bytes, 1);
-    load_mat(&L->wv, g, NAME("attn_v.weight"), kvd, m->dim, &m->weight_bytes, 1);
-    load_mat(&L->wo, g, NAME("attn_output.weight"), m->dim, qd, &m->weight_bytes, 1);
+    load_vec(&L->ffn_norm, g, q35 ? NAME("post_attention_norm.weight") : NAME("ffn_norm.weight"), m->dim, 0);
     load_mat(&L->wgate, g, NAME("ffn_gate.weight"), m->ffn, m->dim, &m->weight_bytes, 1);
     load_mat(&L->wup, g, NAME("ffn_up.weight"), m->ffn, m->dim, &m->weight_bytes, 1);
     load_mat(&L->wdown, g, NAME("ffn_down.weight"), m->dim, m->ffn, &m->weight_bytes, 1);
+    mat *gu[2] = {&L->wgate, &L->wup};
+    concat_mats(&L->wgu, gu, 2);
+    if (q35 && (i + 1) % interval != 0) { /* linear attention (Gated DeltaNet) */
+      const uint32_t inner = m->n_vh * m->sd;
+      L->rec = 1;
+      L->sti = m->n_rec++;
+      load_mat(&L->wlqkv, g, NAME("attn_qkv.weight"), m->conv_dim, m->dim, &m->weight_bytes, 1);
+      load_mat(&L->wz, g, NAME("attn_gate.weight"), inner, m->dim, &m->weight_bytes, 1);
+      load_mat(&L->wbeta, g, NAME("ssm_beta.weight"), m->n_vh, m->dim, &m->weight_bytes, 1);
+      load_mat(&L->walpha, g, NAME("ssm_alpha.weight"), m->n_vh, m->dim, &m->weight_bytes, 1);
+      mat *in4[4] = {&L->wlqkv, &L->wz, &L->wbeta, &L->walpha};
+      concat_mats(&L->win, in4, 4);
+      load_vec(&L->conv, g, NAME("ssm_conv1d.weight"), m->conv_dim * m->d_conv, 0);
+      load_vec(&L->dt_bias, g, NAME("ssm_dt.bias"), m->n_vh, 0);
+      load_vec(&L->ssm_a, g, NAME("ssm_a"), m->n_vh, 0);
+      load_vec(&L->ssm_norm, g, NAME("ssm_norm.weight"), m->sd, 0);
+      load_mat(&L->wo, g, NAME("ssm_out.weight"), m->dim, inner, &m->weight_bytes, 1);
+      sink_layer(L);
+      continue;
+    }
+    L->kvi = m->n_kvl++;
+    if (q35) {
+      load_vec(&L->q_norm, g, NAME("attn_q_norm.weight"), m->hd, 0);
+      load_vec(&L->k_norm, g, NAME("attn_k_norm.weight"), m->hd, 0);
+    }
+    load_mat(&L->wq, g, NAME("attn_q.weight"), q35 ? 2 * qd : qd, m->dim, &m->weight_bytes, 1);
+    load_mat(&L->wk, g, NAME("attn_k.weight"), kvd, m->dim, &m->weight_bytes, 1);
+    load_mat(&L->wv, g, NAME("attn_v.weight"), kvd, m->dim, &m->weight_bytes, 1);
+    load_mat(&L->wo, g, NAME("attn_output.weight"), m->dim, qd, &m->weight_bytes, 1);
     load_vec(&L->bq, g, NAME("attn_q.bias"), qd, 1);
     load_vec(&L->bk, g, NAME("attn_k.bias"), kvd, 1);
     load_vec(&L->bv, g, NAME("attn_v.bias"), kvd, 1);
     mat *qkv[3] = {&L->wq, &L->wk, &L->wv};
     if (concat_mats(&L->wqkv, qkv, 3)) {
       const vec *b3[3] = {&L->bq, &L->bk, &L->bv};
-      const uint32_t n3[3] = {qd, kvd, kvd};
+      const uint32_t n3[3] = {L->wq.rows, kvd, kvd};
       concat_bias(&L->bqkv, b3, n3, 3);
     }
-    mat *gu[2] = {&L->wgate, &L->wup};
-    concat_mats(&L->wgu, gu, 2);
+    sink_layer(L);
 #undef NAME
   }
 
@@ -358,6 +429,8 @@ void model_free(model *m) {
     free_mat(&L->wqkv), free_mat(&L->wgu);
     free_mat(&L->wq), free_mat(&L->wk), free_mat(&L->wv), free_mat(&L->wo);
     free_mat(&L->wgate), free_mat(&L->wup), free_mat(&L->wdown);
+    free_mat(&L->wlqkv), free_mat(&L->wz), free_mat(&L->wbeta), free_mat(&L->walpha), free_mat(&L->win);
+    free(L->q_norm.f), free(L->k_norm.f), free(L->conv.f), free(L->dt_bias.f), free(L->ssm_a.f), free(L->ssm_norm.f);
   }
   free(m->l);
   for (uint32_t i = 0; i < m->n_tokens; i++) free(m->tokens[i]);
@@ -455,6 +528,7 @@ static op *emit(gb *B, int kind, int a, int b, int c) {
   op *o = &g->ops[g->n_ops];
   memset(o, 0, sizeof *o);
   o->kind = kind, o->a = a, o->b = b, o->c = c, o->layer = B->layer, o->qo = -1, o->res = -1, o->nout = -1, o->nq = -1;
+  o->gt = -1;
   touch(g, a, g->n_ops), touch(g, b, g->n_ops), touch(g, c, g->n_ops);
   g->n_ops++;
   return o;
@@ -535,12 +609,19 @@ static int any_q4(const mat *a, const mat *b, const mat *c) {
   return a->kind != MAT_F32 || (b && b->kind != MAT_F32) || (c && c->kind != MAT_F32);
 }
 
+/* Does the first GEMV of layer L read a Q8 copy of its input? */
+static int layer_in_q8(const layer *L) {
+  if (L->rec) return any_q4(&L->wlqkv, &L->wz, &L->wbeta) || L->walpha.kind != MAT_F32;
+  return any_q4(&L->wq, &L->wk, &L->wv);
+}
+
 void graph_build(graph *g, const model *m, uint32_t n_ctx) {
   memset(g, 0, sizeof *g);
   g->bufs = calloc(MAX_BUFS, sizeof(buf));
   g->n_ctx = n_ctx;
   gb B = {g, 0, -1};
-  uint32_t dim = m->dim, qd = m->dim;
+  uint32_t dim = m->dim, qd = m->n_head * m->hd;
+  const int q35 = m->arch == ARCH_QWEN35;
 
   int x = new_buf(g, "x", dim * 4);
   emit(&B, OP_EMBED, x, -1, -1)->n = dim;
@@ -549,30 +630,61 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx) {
   int xn = new_buf(g, "attn_in", dim * 4);
   op *o = emit(&B, OP_RMSNORM, x, xn, -1);
   o->n = dim, o->v = &m->l[0].attn_norm;
-  int xq = any_q4(&m->l[0].wq, &m->l[0].wk, &m->l[0].wv) ? fuse_quant(&B, dim, "attn_in_q8") : -1;
+  int xq = layer_in_q8(&m->l[0]) ? fuse_quant(&B, dim, "attn_in_q8") : -1;
   const uint32_t kvd = m->n_kv * m->hd;
   for (uint32_t l = 0; l < m->n_layer; l++) {
     const layer *L = &m->l[l];
     B.layer = (int)l;
-    /* q, k, v in one buffer: [q | k | v] */
+    if (L->rec) {
+      /* linear attention: [q k v (conv_dim) | z | beta | alpha] in one buffer */
+      const uint32_t inner = m->n_vh * m->sd, cd = m->conv_dim;
+      int lin;
+      if (L->win.rows) {
+        lin = matvec(&B, &L->win, xn, xq, "lin", NULL, -1);
+      } else {
+        lin = new_buf(g, "lin", (cd + inner + 2 * m->n_vh) * 4);
+        matvec_into(&B, &L->wlqkv, xn, xq, lin, 0, "lqkv", NULL, -1);
+        matvec_into(&B, &L->wz, xn, xq, lin, cd * 4, "z", NULL, -1);
+        matvec_into(&B, &L->wbeta, xn, xq, lin, (cd + inner) * 4, "beta", NULL, -1);
+        matvec_into(&B, &L->walpha, xn, xq, lin, (cd + inner + m->n_vh) * 4, "alpha", NULL, -1);
+      }
+      int go = new_buf(g, "gdn", inner * 4);
+      o = emit(&B, OP_GDN, lin, go, -1), o->n = inner;
+      int gq = L->wo.kind != MAT_F32 ? fuse_quant(&B, inner, "gdn_q8") : -1;
+      x = matvec(&B, &L->wo, go, gq, "x", NULL, x); /* x = x + Wout gdn */
+    } else {
+    /* q, k, v in one buffer: [q | k | v] (qwen35: q is [q | gate] per head) */
+    const uint32_t qrows = L->wq.rows;
     int qkv;
     if (L->wqkv.rows) {
       qkv = matvec(&B, &L->wqkv, xn, xq, "qkv", &L->bqkv, -1);
     } else {
-      qkv = new_buf(g, "qkv", (qd + 2 * kvd) * 4);
+      qkv = new_buf(g, "qkv", (qrows + 2 * kvd) * 4);
       matvec_into(&B, &L->wq, xn, xq, qkv, 0, "q", &L->bq, -1);
-      matvec_into(&B, &L->wk, xn, xq, qkv, qd * 4, "k", &L->bk, -1);
-      matvec_into(&B, &L->wv, xn, xq, qkv, (qd + kvd) * 4, "v", &L->bv, -1);
+      matvec_into(&B, &L->wk, xn, xq, qkv, qrows * 4, "k", &L->bk, -1);
+      matvec_into(&B, &L->wv, xn, xq, qkv, (qrows + kvd) * 4, "v", &L->bv, -1);
     }
-    o = emit(&B, OP_ROPE_KV, qkv, qkv, qkv), o->n = qd, o->nh = m->n_head;
-    o->boff = qd * 4, o->coff = (qd + kvd) * 4;
+    int qsrc = qkv;
+    if (q35) {
+      qsrc = new_buf(g, "q", qd * 4);
+      o = emit(&B, OP_QKN_ROPE_KV, qkv, qsrc, -1), o->n = qd, o->nh = m->n_head;
+      o->v = &L->q_norm, o->nv = &L->k_norm;
+    } else {
+      o = emit(&B, OP_ROPE_KV, qkv, qkv, qkv), o->n = qd, o->nh = m->n_head;
+      o->boff = qd * 4, o->coff = (qd + kvd) * 4;
+    }
     int att = new_buf(g, "attn", qd * 4);
     const uint32_t sc_cpu = m->n_head * n_ctx, sc_gpu = m->n_head * ie_att_max_split(n_ctx) * (m->hd + 2);
     int sc = new_buf(g, "scores", (sc_cpu > sc_gpu ? sc_cpu : sc_gpu) * 4);
-    o = emit(&B, OP_ATTN, qkv, att, sc), o->n = qd;
+    o = emit(&B, OP_ATTN, qsrc, att, sc), o->n = qd;
+    if (q35) { /* out *= sigmoid(gate): the gate of head h is at h * 2 hd + hd */
+      o->gt = qkv, o->gtoff = m->hd * 4, o->gstride = 2 * m->hd;
+      use_last(&B, qkv);
+    }
     int aq = -1;
     if (L->wo.kind != MAT_F32) aq = m->hd % 32 == 0 && m->hd <= 256 ? fuse_quant(&B, qd, "attn_q8") : quant(&B, att, qd, "attn_q8");
     x = matvec(&B, &L->wo, att, aq, "x", NULL, x); /* x = x + Wo att */
+    }
     int hq;
     int hn = fuse_norm(&B, &L->ffn_norm, dim, "ffn_in", any_q4(&L->wgate, &L->wup, NULL), "ffn_in_q8", &hq);
 
@@ -591,7 +703,7 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx) {
     x = matvec(&B, &L->wdown, gu, gq, "x", NULL, x); /* x = x + Wdown gate */
     if (l + 1 < m->n_layer) {
       const layer *N = &m->l[l + 1];
-      xn = fuse_norm(&B, &N->attn_norm, dim, "attn_in", any_q4(&N->wq, &N->wk, &N->wv), "attn_in_q8", &xq);
+      xn = fuse_norm(&B, &N->attn_norm, dim, "attn_in", layer_in_q8(N), "attn_in_q8", &xq);
     } else {
       xn = fuse_norm(&B, &m->out_norm, dim, "out_in", m->out.kind != MAT_F32, "out_in_q8", &xq);
     }
@@ -614,13 +726,13 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx) {
   }
   g->weight_bytes_per_token = wb;
 
-  /* RoPE tables: theta_i = pos * base^(-2i/hd) */
-  uint32_t h2 = m->hd / 2;
+  /* RoPE tables: theta_i = pos * base^(-2i/n_rot), i < n_rot / 2 */
+  uint32_t h2 = m->n_rot / 2;
   g->rope_cos = ie_alloc((size_t)n_ctx * h2 * 4);
   g->rope_sin = ie_alloc((size_t)n_ctx * h2 * 4);
   for (uint32_t p = 0; p < n_ctx; p++)
     for (uint32_t i = 0; i < h2; i++) {
-      double th = (double)p * pow((double)m->rope_base, -2.0 * i / (double)m->hd);
+      double th = (double)p * pow((double)m->rope_base, -2.0 * i / (double)m->n_rot);
       g->rope_cos[p * h2 + i] = (float)cos(th);
       g->rope_sin[p * h2 + i] = (float)sin(th);
     }

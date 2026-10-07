@@ -181,9 +181,10 @@ IE_FN(u32, ie_q4q8_spec, (u32 n, Mem qw, u32 qb, Mem aw, u32 ab, u32 j)) {
  * 2b. Q8_0 weights x Q8 activations (the output matrix of many GGUF files)
  * ==================================================================== */
 
-/* The sizes of the Q8_0 path: rows < 2^18 and nb < 2^8 blocks per row
- * (K <= 8160). Then rows * nb * 34 < 2^32: no address wraps. */
-IE_FN(bool, ie_q8_sizes_ok, (u32 rows, u32 nb)) { return rows < 0x40000u && nb < 0x100u; }
+/* The sizes of the Q8_0 path: rows < 2^18, nb < 2^11 blocks per row
+ * (K <= 65504) and rows * nb < 2^26 blocks in all. The product cannot wrap
+ * (it is < 2^29), and rows * nb * 34 < 2^32: no address wraps. */
+IE_FN(bool, ie_q8_sizes_ok, (u32 rows, u32 nb)) { return rows < 0x40000u && nb < 0x800u && rows * nb < 0x4000000u; }
 
 /* GGUF Q8_0: block b of row r starts at byte (r * nb + b) * 34. Bytes 0..1:
  * the f16 scale. Byte 2 + k (k < 32): the int8 weight k. */

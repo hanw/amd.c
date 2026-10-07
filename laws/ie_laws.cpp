@@ -62,7 +62,7 @@ constexpr auto law_q4_onto(u32 rows, u32 nb, u32 i) -> bool {
 // LAW act_addr: the Q8 activation words of block b (8 words) are inside an
 // array of nb * 8 words.
 constexpr auto law_act_addr(u32 nb, u32 b, u32 v) -> bool {
-  return !(nb < 0x200u && b < nb && v < 8u) || b * 8u + v < nb * 8u;
+  return !(nb < 0x800u && b < nb && v < 8u) || b * 8u + v < nb * 8u;
 }
 
 // ---------------------------------------------------------------------

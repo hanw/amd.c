@@ -20,7 +20,10 @@ typedef struct {
   const model *m;
   const graph *g;
   uint8_t *arena;
-  float *kc, *vc; /* KV cache: [layer][pos][n_kv * hd] */
+  float *kc, *vc; /* KV cache: [attention layer][pos][n_kv * hd] */
+  /* qwen35 linear attention state per linear layer: the last 4 conv inputs
+   * (ring[slot][conv_dim], slot = pos % 4) and S[head][i (key)][j (value)] */
+  float *ring, *st;
 } cpu_backend;
 
 #define BUF(b, id) ((void *)((b)->arena + (b)->g->bufs[id].off))
@@ -126,6 +129,15 @@ static void mat_row(const mat *w, u32 r, float *out) {
     memcpy(out, w->f + (size_t)r * w->cols, w->cols * 4);
     return;
   }
+  if (w->kind == MAT_Q8) {
+    const Mem qw = {w->qw};
+    for (u32 b = 0; b < w->nb; b++) {
+      const float d = ie_f16_to_f32(w->qs[ie_q8_dst_scale(r, b, w->nb)]);
+      for (u32 j = 0; j < 32; j++)
+        out[32 * b + j] = d * (float)(int8_t)ie_byte(IE_LOAD(qw, ie_q8_dst_word(r, b, j >> 2, w->nb)), j & 3u);
+    }
+    return;
+  }
   const Mem qw = {w->qw};
   for (u32 b = 0; b < w->nb; b++) {
     const float d = ie_f16_to_f32(w->qs[ie_q4_dst_scale(r, b, w->nb)]);
@@ -143,8 +155,9 @@ static void rmsnorm(const float *x, const float *wt, float *y, u32 n, float eps)
   for (u32 i = 0; i < n; i++) y[i] = x[i] * s * wt[i];
 }
 
-static void rope(float *x, u32 nh, u32 hd, int neox, const float *c, const float *s) {
-  const u32 h2 = hd / 2;
+/* RoPE of the first nrot dims of each of nh heads of hd (stride hd). */
+static void rope(float *x, u32 nh, u32 hd, u32 nrot, int neox, const float *c, const float *s) {
+  const u32 h2 = nrot / 2;
   for (u32 h = 0; h < nh; h++) {
     float *v = x + h * hd;
     for (u32 i = 0; i < h2; i++) {
@@ -158,7 +171,7 @@ static void rope(float *x, u32 nh, u32 hd, int neox, const float *c, const float
 
 /* Attention of one decode token. Scores buffer: [n_head][n_ctx]. */
 static void attention(const model *m, const float *q, const float *kc, const float *vc, u32 pos, u32 n_ctx, float *sc,
-                      float *out) {
+                      float *out, const float *gate, u32 gstride) {
   const u32 hd = m->hd, kvd = m->n_kv * hd, grp = m->n_head / m->n_kv;
   const float scale = 1.0f / sqrtf((float)hd);
   for (u32 h = 0; h < m->n_head; h++) {
@@ -181,8 +194,76 @@ static void attention(const model *m, const float *q, const float *kc, const flo
       float acc = 0.0f;
       for (u32 p = 0; p <= pos; p++) acc += s[p] * vc[(size_t)p * kvd + kh * hd + i];
       o[i] = acc * inv;
+      if (gate) o[i] = o[i] * (1.0f / (1.0f + expf(-gate[h * gstride + i])));
     }
   }
+}
+
+static float silu(float x) { return x / (1.0f + expf(-x)); }
+
+/* qwen35: per head RMSNorm of hd values at src (weight w), RoPE of the
+ * first nrot dims (NEOX pairs), into dst. */
+static void qk_head(const model *m, const float *src, const float *w, const float *cs, const float *sn, float *dst) {
+  rmsnorm(src, w, dst, m->hd, m->eps);
+  rope(dst, 1, m->hd, m->n_rot, 1, cs, sn);
+}
+
+/* qwen35 linear attention (Gated DeltaNet) of one token, as ie_gdn. in =
+ * [q k v | z | beta | alpha]; ring, S: the state of this layer. */
+static void gdn(const model *m, const layer *L, const float *in, float *out, float *ring, float *S, u32 pos) {
+  const u32 sd = m->sd, cd = m->conv_dim, nv = m->n_vh, nk = m->n_kh, inner = nv * sd;
+  float *cv = ie_alloc((size_t)cd * 4);
+  /* causal conv over [x(pos-3) .. x(pos)] (0 before position 0), then SiLU */
+  for (u32 c = 0; c < cd; c++) {
+    float acc = 0.0f;
+    for (u32 j = 0; j < 4; j++) {
+      const u32 d = 3 - j;
+      const float x = d == 0 ? in[c] : pos >= d ? ring[((pos - d) & 3u) * cd + c] : 0.0f;
+      acc += x * L->conv.f[c * 4 + j];
+    }
+    cv[c] = silu(acc);
+  }
+  for (u32 c = 0; c < cd; c++) ring[(pos & 3u) * cd + c] = in[c];
+  /* L2 norm of q and k per key head */
+  for (u32 h = 0; h < 2 * nk; h++) {
+    float ss = 0.0f;
+    for (u32 i = 0; i < sd; i++) ss += cv[h * sd + i] * cv[h * sd + i];
+    const float r = 1.0f / sqrtf(ss + m->eps);
+    for (u32 i = 0; i < sd; i++) cv[h * sd + i] *= r;
+  }
+  const float scale = 1.0f / sqrtf((float)sd);
+  float *o = ie_alloc(sd * 4), *delta = ie_alloc(sd * 4);
+  for (u32 h = 0; h < nv; h++) {
+    const float *q = cv + (h % nk) * sd, *k = cv + nk * sd + (h % nk) * sd, *v = cv + 2 * nk * sd + h * sd;
+    const float beta = 1.0f / (1.0f + expf(-in[cd + inner + h]));
+    const float a = in[cd + inner + nv + h] + L->dt_bias.f[h];
+    const float sp = a > 20.0f ? a : logf(1.0f + expf(a)); /* as ggml_compute_softplus_f32 */
+    const float decay = expf(sp * L->ssm_a.f[h]);
+    float *Sh = S + (size_t)h * sd * sd; /* Sh[i * sd + j] = S[i][j] */
+    for (u32 j = 0; j < sd; j++) {
+      float acc = 0.0f;
+      for (u32 i = 0; i < sd; i++) {
+        const float x = pos ? Sh[i * sd + j] * decay : 0.0f;
+        Sh[i * sd + j] = x;
+        acc += x * k[i];
+      }
+      delta[j] = (v[j] - acc) * beta;
+    }
+    for (u32 j = 0; j < sd; j++) {
+      float acc = 0.0f;
+      for (u32 i = 0; i < sd; i++) {
+        Sh[i * sd + j] += k[i] * delta[j];
+        acc += Sh[i * sd + j] * q[i];
+      }
+      o[j] = acc * scale;
+    }
+    /* gated RMSNorm: rmsnorm(o) * ssm_norm * silu(z) */
+    float ss = 0.0f;
+    for (u32 j = 0; j < sd; j++) ss += o[j] * o[j];
+    const float r = 1.0f / sqrtf(ss / (float)sd + m->eps);
+    for (u32 j = 0; j < sd; j++) out[h * sd + j] = o[j] * r * L->ssm_norm.f[j] * silu(in[cd + h * sd + j]);
+  }
+  free(cv), free(o), free(delta);
 }
 
 /* ---------------------------------------------------------------- backend */
@@ -197,9 +278,11 @@ backend *cpu_open(const model *m, const graph *g) {
   b->m = m;
   b->g = g;
   b->arena = ie_alloc(g->arena);
-  const size_t kv = (size_t)m->n_layer * g->n_ctx * m->n_kv * m->hd;
-  b->kc = ie_alloc(kv * 4);
-  b->vc = ie_alloc(kv * 4);
+  const size_t kv = (size_t)m->n_kvl * g->n_ctx * m->n_kv * m->hd;
+  b->kc = ie_alloc(kv * 4 + 4);
+  b->vc = ie_alloc(kv * 4 + 4);
+  b->ring = ie_alloc((size_t)m->n_rec * 4 * m->conv_dim * 4 + 4);
+  b->st = ie_alloc((size_t)m->n_rec * m->n_vh * m->sd * m->sd * 4 + 4);
   return &b->base;
 }
 
@@ -208,6 +291,8 @@ static void cpu_close(backend *bk) {
   free(b->arena);
   free(b->kc);
   free(b->vc);
+  free(b->ring);
+  free(b->st);
   free(b);
 }
 
@@ -217,7 +302,7 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   clock_gettime(CLOCK_MONOTONIC, &t0);
   const model *m = B->m;
   const graph *g = B->g;
-  const u32 h2 = m->hd / 2, kvd = m->n_kv * m->hd;
+  const u32 h2 = m->n_rot / 2, kvd = m->n_kv * m->hd;
   if (tok >= m->vocab) ie_die("token %u >= vocab %u", tok, m->vocab);
   if (pos >= g->n_ctx) ie_die("position %u >= context %u", pos, g->n_ctx);
   for (u32 i = 0; i < g->n_ops; i++) {
@@ -261,26 +346,42 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
         break;
       }
       case OP_ROPE:
-        rope(a, o->nh, m->hd, m->rope == ROPE_NEOX, g->rope_cos + (size_t)pos * h2, g->rope_sin + (size_t)pos * h2);
+        rope(a, o->nh, m->hd, m->n_rot, m->rope == ROPE_NEOX, g->rope_cos + (size_t)pos * h2, g->rope_sin + (size_t)pos * h2);
         break;
       case OP_ROPE_KV: {
         const float *cs = g->rope_cos + (size_t)pos * h2, *sn = g->rope_sin + (size_t)pos * h2;
-        rope(a, o->nh, m->hd, m->rope == ROPE_NEOX, cs, sn);
-        rope(bb, m->n_kv, m->hd, m->rope == ROPE_NEOX, cs, sn);
-        const size_t base = ((size_t)o->layer * g->n_ctx + pos) * kvd;
+        rope(a, o->nh, m->hd, m->n_rot, m->rope == ROPE_NEOX, cs, sn);
+        rope(bb, m->n_kv, m->hd, m->n_rot, m->rope == ROPE_NEOX, cs, sn);
+        const size_t base = ((size_t)m->l[o->layer].kvi * g->n_ctx + pos) * kvd;
         memcpy(B->kc + base, bb, kvd * 4);
         memcpy(B->vc + base, cc, kvd * 4);
         break;
       }
+      case OP_QKN_ROPE_KV: {
+        const float *cs = g->rope_cos + (size_t)pos * h2, *sn = g->rope_sin + (size_t)pos * h2;
+        const size_t base = ((size_t)m->l[o->layer].kvi * g->n_ctx + pos) * kvd;
+        const u32 hd = m->hd, qr = 2 * o->n;
+        for (u32 h = 0; h < o->nh; h++) qk_head(m, a + h * 2 * hd, o->v->f, cs, sn, bb + h * hd);
+        for (u32 h = 0; h < m->n_kv; h++) qk_head(m, a + qr + h * hd, o->nv->f, cs, sn, B->kc + base + h * hd);
+        memcpy(B->vc + base, a + qr + kvd, kvd * 4);
+        break;
+      }
+      case OP_GDN: {
+        const layer *L = &m->l[o->layer];
+        gdn(m, L, a, bb, B->ring + (size_t)L->sti * 4 * m->conv_dim, B->st + (size_t)L->sti * m->n_vh * m->sd * m->sd, pos);
+        if (qo) cpu_quant_q8(bb, qo, o->n / 32);
+        break;
+      }
       case OP_KV: {
-        const size_t base = ((size_t)o->layer * g->n_ctx + pos) * kvd;
+        const size_t base = ((size_t)m->l[o->layer].kvi * g->n_ctx + pos) * kvd;
         memcpy(B->kc + base, a, kvd * 4);
         memcpy(B->vc + base, bb, kvd * 4);
         break;
       }
       case OP_ATTN: {
-        const size_t base = (size_t)o->layer * g->n_ctx * kvd;
-        attention(m, a, B->kc + base, B->vc + base, pos, g->n_ctx, cc, bb);
+        const size_t base = (size_t)m->l[o->layer].kvi * g->n_ctx * kvd;
+        const float *gate = o->gt >= 0 ? (const float *)((char *)BUF(B, o->gt) + o->gtoff) : NULL;
+        attention(m, a, B->kc + base, B->vc + base, pos, g->n_ctx, cc, bb, gate, o->gstride);
         if (qo) cpu_quant_q8(bb, qo, o->n / 32);
         break;
       }

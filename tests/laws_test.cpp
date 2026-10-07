@@ -11,7 +11,7 @@ static u32 small(u32 m) { return rng() % m; }
 // Values near the edges are more useful than uniform ones.
 static u32 edge() {
   static const u32 v[] = {0u, 1u, 2u, 7u, 8u, 31u, 32u, 33u, 127u, 128u, 255u, 256u, 0x1FFu, 0x200u,
-                          0x3FFFFu, 0x40000u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu};
+                          0x3FFFFu, 0x40000u, 0x7FFu, 0x800u, 0x3FFFFFFu, 0x4000000u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu};
   return rng() % 2 ? v[rng() % (sizeof v / sizeof v[0])] : r32();
 }
 
@@ -40,7 +40,7 @@ int main() {
     CHECK("q4_nibble", law_q4_nibble(r32(), r32(), r32(), r32(), small(34)));
     CHECK("q4_word_of", law_q4_word_of(edge()));
     CHECK("q4q8_word", law_q4q8_word(r32(), r32(), r32()));
-    u32 nb8 = small(0x101u), b8 = small(nb8 + 1u);
+    u32 nb8 = it % 4 ? small(0x101u) : small(0x801u), b8 = small(nb8 + 1u);
     CHECK("q8_addr", law_q8_addr(rows, nb8, r, b8, small(9), small(33)));
     CHECK("q8_inverse", law_q8_inverse(rows, nb8, r, b8, small(9)));
     CHECK("q8_onto", law_q8_onto(rows, nb8, small(rows * nb8 * 8u + 3u)));

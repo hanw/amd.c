@@ -278,8 +278,8 @@ theorem q8_addr : Laws.q8_addr := by
     cases hw : BitVec.ult w 8#32 <;> cases hk : BitVec.ult k 32#32 <;>
     simp only [Bool.false_and, Bool.and_false, Bool.not_false, Bool.true_or, Bool.true_and, Bool.not_true, Bool.false_or]
   simp only [ie_q8_sizes_ok, Bool.and_eq_true, BitVec.ult_iff_lt] at hs hr hb hw hk
-  have ⟨q1, q2⟩ := rows_nb8 rows nb hs.1 hs.2
-  have ⟨p1, p2⟩ := r_nb8 rows nb r hs.1 hs.2 hr
+  have ⟨q1, q2⟩ := rows_nb8 rows nb hs.1.1 hs.1.2 hs.2
+  have ⟨p1, p2⟩ := r_nb8 rows nb r hs.1.1 hs.1.2 hs.2 hr
   simp only [ie_q8_dst_word, ie_q8_dst_scale, ie_q8_src_qbyte, ie_q8_src_blk, Bool.and_eq_true, BitVec.ult_iff_lt]
   have hb' : b.toNat < nb.toNat := hb
   have hw' : w.toNat < 8 := hw
@@ -296,8 +296,8 @@ theorem q8_inverse : Laws.q8_inverse := by
     cases hw : BitVec.ult w 8#32 <;>
     simp only [Bool.false_and, Bool.and_false, Bool.not_false, Bool.true_or, Bool.true_and, Bool.not_true, Bool.false_or]
   simp only [ie_q8_sizes_ok, Bool.and_eq_true, BitVec.ult_iff_lt] at hs hr hb hw
-  have ⟨q1, q2⟩ := rows_nb8 rows nb hs.1 hs.2
-  have ⟨p1, p2⟩ := r_nb8 rows nb r hs.1 hs.2 hr
+  have ⟨q1, q2⟩ := rows_nb8 rows nb hs.1.1 hs.1.2 hs.2
+  have ⟨p1, p2⟩ := r_nb8 rows nb r hs.1.1 hs.1.2 hs.2 hr
   have hb' : b.toNat < nb.toNat := hb
   have hw' : w.toNat < 8 := hw
   have hN : 0 < nb.toNat := by omega
@@ -325,9 +325,9 @@ theorem q8_onto : Laws.q8_onto := by
   cases hs : ie_q8_sizes_ok rows nb <;> cases h0 : BitVec.ult 0#32 nb <;> cases hi : BitVec.ult i (rows * nb * 8#32) <;>
     simp only [Bool.false_and, Bool.and_false, Bool.not_false, Bool.true_or, Bool.true_and, Bool.not_true, Bool.false_or]
   simp only [ie_q8_sizes_ok, Bool.and_eq_true, BitVec.ult_iff_lt] at hs h0 hi
-  have ⟨q1, q2⟩ := rows_nb8 rows nb hs.1 hs.2
+  have ⟨q1, q2⟩ := rows_nb8 rows nb hs.1.1 hs.1.2 hs.2
   have hN : 0 < nb.toNat := h0
-  have hN' : nb.toNat < 256 := hs.2
+  have hN' : nb.toNat < 2048 := hs.1.2
   have hi' : i.toNat < rows.toNat * nb.toNat * 8 := by
     have := BitVec.lt_def.mp hi
     simp only [BitVec.toNat_mul, q1, BitVec.toNat_ofNat] at this
