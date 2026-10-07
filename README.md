@@ -56,11 +56,18 @@ clang 18 在 C 语言里不接受 `amdgpu_flat_work_group_size` 属性，
 
 ```sh
 build/ie-run MODEL.gguf [--backend cpu|gpu] [--tokens 1,2,3] [--n 32] [--ctx N] \
-             [--dump-logits FILE] [--hsaco build/ie_kernels.hsaco] [--info]
+             [--dump-logits FILE] [--hsaco build/ie_kernels.hsaco] [--info] \
+             [--tokens-file FILE] [--ppl [--ppl-first N]] [--stop] \
+             [--draft D [--mtp FILE]] [--chunk N] [--temp T [--top-k K] [--top-p P] [--seed S]]
 ```
 
 - `--tokens`：提示词的 token id 列表。这一版没有 BPE 编码，只接受 id。
-- `--n`：贪心生成的 token 数。
+- `--n`：生成的 token 数。
+- `--stop`：生成到结束符（`tokenizer.ggml.eos_token_id`）就停止。
+- `--chunk N`：GPU 上提示按每块最多 N 个 token 处理（1 到 16，默认 16）。一块只读一次权重。
+- `--draft D`：用模型的 MTP 层做推测解码，每步 D 个草稿（1 到 3，只用于 GPU）。`--mtp 文件`：MTP 层在另一个文件里。
+- `--temp T`：采样温度（默认 0 = 贪心）。`--top-k K`：只在最大的 K 个里采样（0 = 不限制）。
+  `--top-p P`：只保留累计概率达到 P 的最大的那些 token（K = 0 且 P < 1 时，先取最大的 1000 个）。`--seed S`：随机数种子。
 - `--dump-logits`：每一步写一行 `位置 token logit0 logit1 ...`。
 - 输出：所有 token id，以及解码后的文本（gpt2 分词器用字节级解码，例如 Qwen2；llama 分词器处理 `▁` 和 `<0xXX>`）。
 - 结束时打印每 token 时间、tokens/s，以及有效带宽（每个 token 读取的权重字节数 ÷ 时间）。
@@ -83,7 +90,11 @@ GPU 后端只在 gfx1201 上编译。核函数需要 `v_dot4_i32_iu8` 指令和 
 | `IE_ATTN=old` | 用旧的注意力核函数 `ie_attn`（每个头一个工作组） |
 | `IE_ATTN=check` | 每层同时运行新旧两个注意力核函数，结束时打印两者输出的最大相对差 |
 | `--tokens-file 文件`、`--ppl`、`--ppl-first N`（命令行选项） | 从文件读 token；计算从第 N 个位置开始的困惑度 |
-| `IE_NORM_FUSE=1` | 把 RMSNorm 合进前一个带残差的矩阵向量乘（最后完成的工作组做）。在 R9700 上更慢，所以默认关闭 |
+| `IE_NORM_FUSE=1` | 把 RMSNorm 合进前一个带残差的矩阵向量乘（最后完成的工作组做）。在 R9700 上更慢，所以默认关闭（27B：48.2 对 46.0 毫秒/token） |
+| `IE_STREAM=0` | 关闭流式加载（先在主机上加载全部权重，再上传） |
+| `IE_TR_MIN=N` | 多 token 矩阵向量乘：token 数 ≥ N 时用每个 wave 算 4 行的核函数 `ie_gemv_q8q8_tr`（默认 5） |
+| `IE_SPEC_TRACE=1` | 推测解码时打印每一步的草稿、模型结果和接受数 |
+| `IE_GEMV_NOBATCH=1` | 调试：多 token 运行时，矩阵向量乘每个 token 单独启动 |
 
 硬件追踪：用 `rocprofv3 --kernel-trace` 运行引擎，再用 `tools/rocprof_ops.py` 把追踪结果对应到算子（见脚本开头的说明）。
 矩阵向量乘基准测试：`tools/gemv_bench.c` 对不同形状单独计时（见文件开头的说明）。
@@ -287,6 +298,63 @@ Qwen3.8-27B Q8_0（ggml-org/Qwen3.8-27B-GGUF，28.6 GB，64 层：48 个线性�
   llama.cpp 的聊天回答在 64 个 token 处结束，所以聊天一行没有对比。
 - 推测：草稿数为 3 时每步约 63 毫秒（不用草稿时每个 token 46 毫秒）。多出的时间主要是 3 次 MTP 预测
   （每次读 MTP 层 0.45 GB 和输出层 1.35 GB）。
+
+### 提示批量处理（预填充）
+
+GPU 上，提示按每块最多 16 个 token 处理（`--chunk`）。一块中：
+- Q8_0 矩阵向量乘一次读权重，算完块中所有 token。token 数 ≥ 5 时用 `ie_gemv_q8q8_tr`：每个 wave 算 4 行，
+  一次读入的激活值给 4 行用，缓存流量是每 wave 1 行时的 1/4。
+- RMSNorm、量化、SwiGLU、q/k 归一化 + RoPE：一次启动，网格的第二维是 token。
+- 线性注意力核函数在一次启动里依次处理块中的 token，只写最后一个 token 之后的状态。
+- 注意力和取最大值仍然每个 token 启动一次（每个 token 的位置不同）。
+
+已确认：每个 token 的算术和单 token 时相同，所以输出逐个 token 相同，困惑度也相同
+（0.8B 第 0 段 9.8883；27B 第 0 段 4.3322）。
+
+| Qwen3.8-27B Q8_0，512 个 token 的提示 | token/秒 |
+|---|---|
+| 一次一个 token（以前） | 21.6 |
+| 每块 16 个，每 wave 1 行 | 118 |
+| 每块 16 个，每 wave 4 行 | 172 |
+| 每块 16 个，每 wave 4 行，小核函数按 token 合并启动 | **217** |
+| llama.cpp b11222（Vulkan），pp512 | 1283 |
+| llama.cpp b11222（Vulkan），pp16 | 187 |
+
+每 wave 2 行：167；每 wave 8 行：118（寄存器 247 个）。
+长提示时 llama.cpp 快 6 倍：它用矩阵核心指令做真正的矩阵乘，块也大得多。推测：要追上，需要用 WMMA 指令
+（`v_wmma_i32_16x16x16_iu8`）写矩阵乘核函数，并用 256 到 512 个 token 的块。
+
+### 采样
+
+`--temp`、`--top-k`、`--top-p`、`--seed`。采样在主机上做（每个 token 从 GPU 读一行 logits，1 MB）。
+和 MTP 一起用时是"采样后比对"：模型在每个位置从自己的分布采样一个 token，草稿等于这个采样结果才接受。
+草稿是 MTP 的最大值（固定的），所以每个输出的 token 都是模型分布的一个样本，输出分布和不用 MTP 时相同。
+
+已确认：每输出一个 token 只用一个随机数，顺序和不用 MTP 时相同，而且 logits 逐位相同。所以同一个种子下，
+用 MTP 和不用 MTP 的输出完全相同（0.8B：300 个种子，每个比较 3 个 token；27B：种子 42，300 个 token）。
+
+| Qwen3.8-27B，写代码，300 个 token，`--temp 0.7 --top-k 20 --top-p 0.95` | token/秒 |
+|---|---|
+| 不用 MTP | 21.7 |
+| 3 个草稿（接受率 92.1%） | 50.7 |
+
+贪心时 3 个草稿是 60.1 个/秒。采样多出约 3 毫秒/token：每步从 GPU 读 4 行 logits（4 MB），
+再在主机上从 248320 个 logits 里取最大的 K 个。推测：把取前 K 个放到 GPU 上可以省掉大部分。
+
+### 27B 解码的硬件追踪
+
+`rocprofv3`，每个 token 47.1 毫秒（含追踪开销；不追踪时 46.0 毫秒）：
+
+| 部分 | 毫秒/token | 说明 |
+|---|---|---|
+| 矩阵向量乘 | 43.7 | 平均约 627 GB/s（标称值的 98%）；5120 × 6144 只有 568 GB/s |
+| RMSNorm（129 次） | 0.71 | 每次 5.5 微秒 |
+| 线性注意力（48 次） | 0.47 | 每次 9.8 微秒 |
+| 其他核函数 | 0.30 | |
+| 核函数之间的间隔 | 1.9 | 532 次启动 |
+
+只读权重的下限是 27.2 GB ÷ 640 GB/s = 42.5 毫秒。剩下的约 3.5 毫秒（8%）分散在间隔、RMSNorm 和较小的矩阵上，
+没有一个大的单项。
 
 ## 什么被验证、什么被测试、什么没有测试
 

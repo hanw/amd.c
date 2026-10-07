@@ -12,9 +12,17 @@ struct backend {
   void (*close)(backend *b);
   /* GPU only (NULL on the CPU). Run section sec of the op list (0: the
    * model, 1: the MTP head) for T tokens toks at positions pos .. pos + T -
-   * 1; slot: the linear attention state slot to read (ie_gdn; the state
-   * after token t goes to slot (slot + t) % 4). out: the T argmax tokens. */
-  void (*run)(backend *b, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, uint32_t slot, uint32_t *out);
+   * 1. The linear attention state after each token t is kept (or, if
+   * last_only, after the last token only) until accept. out: the T argmax
+   * tokens. */
+  void (*run)(backend *b, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out);
+  /* The tokens 0 .. k of the last model run are final: later runs continue
+   * from the linear attention state after token k. (A one-token step needs
+   * no accept.) */
+  void (*accept)(backend *b, uint32_t k);
+  /* Copy n token rows of buffer id (from row r0) to the host: dst gets n *
+   * buf.stride bytes (rows buf.stride apart). */
+  void (*read_rows)(backend *b, int id, uint32_t r0, uint32_t n, float *dst);
   /* Copy n token rows of buffer src (from row r0) to buffer dst (from row
    * d0); src < 0: write zeros. */
   void (*copy_rows)(backend *b, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n);

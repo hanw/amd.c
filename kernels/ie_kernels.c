@@ -26,6 +26,11 @@ typedef _Float16 f16;
 static inline u32 tid(void) { return __builtin_amdgcn_workitem_id_x(); }
 static inline u32 wgid(void) { return __builtin_amdgcn_workgroup_id_x(); }
 static inline u32 lane(void) { return tid() & 31u; }
+/* Token index of a multi-token launch (grid dimension y; 0 for one token).
+ * The kernels that take byte strides move their pointers by y strides. */
+static inline u32 tokid(void) { return __builtin_amdgcn_workgroup_id_y(); }
+#define TOK(p, s) ((p) ? (__typeof__(p))((G u8 *)(p) + (unsigned long)tokid() * (s)) : (p))
+#define TOKC(p, s) ((__typeof__(p))((const G u8 *)(p) + (unsigned long)tokid() * (s)))
 
 /* Workgroup barrier with the memory ordering of LDS and global memory. */
 static inline void barrier(void) {
@@ -157,7 +162,8 @@ static inline void quant_wave(float v, u32 b, G u8 *q, u32 nb) {
 }
 
 /* One wave per block of 32, 8 blocks per workgroup. */
-KERNEL ie_quant_q8(const G float *x, G u8 *q, u32 nb) {
+KERNEL ie_quant_q8(const G float *x, G u8 *q, u32 nb, u32 xs, u32 qs) {
+  x = TOKC(x, xs), q = TOK(q, qs);
   const u32 b = wgid() * 8u + (tid() >> 5);
   if (b >= nb) return; /* whole waves leave together */
   quant_wave(x[b * 32u + lane()], b, q, nb);
@@ -183,7 +189,8 @@ static inline void rmsnorm_wg(const G float *x, const G float *w, G float *y, u3
  * whole sum of squares (the same code, so the same value in every
  * workgroup); then wave v of workgroup g normalizes and quantizes block
  * g * 8 + v only. n is a multiple of 32. */
-KERNEL ie_rmsnorm(const G float *x, const G float *w, G float *y, u32 n, float eps, G u8 *q) {
+KERNEL ie_rmsnorm(const G float *x, const G float *w, G float *y, u32 n, float eps, G u8 *q, u32 xs, u32 ys, u32 qs) {
+  x = TOKC(x, xs), y = TOK(y, ys), q = TOK(q, qs);
   float ss = 0.0f;
   for (u32 i = tid(); i < n; i += NT) ss += x[i] * x[i];
   ss = wg_sum(ss);
@@ -321,18 +328,19 @@ KERNEL ie_gemv_q8q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y
   if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
 }
 
-/* The same GEMV for T <= 4 tokens (speculative decoding: verify several
- * tokens in one pass). Each weight block is loaded once and used for every
+/* The same GEMV for T <= 16 tokens (speculative decoding: verify several
+ * tokens in one pass; prompt processing in chunks). Each weight block is loaded once and used for every
  * token. For each token the arithmetic and its order are those of
  * ie_gemv_q8q8, so token t's result is bitwise the result of a one-token
  * launch. xs: bytes between the Q8 activations of two tokens; ys: floats
  * between the outputs (and the residuals) of two tokens. */
-#define GEMV_T 4u
+#define GEMV_T 16u
 KERNEL ie_gemv_q8q8_t(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                       const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
   const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
   if (r >= rows) return;
-  float acc[GEMV_T] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float acc[GEMV_T];
+  for (u32 j = 0; j < GEMV_T; j++) acc[j] = 0.0f;
   for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
     u32x4 w0[GEMV_U], w1[GEMV_U];
     float sw[GEMV_U];
@@ -375,6 +383,69 @@ KERNEL ie_gemv_q8q8_t(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float 
   }
 }
 
+/* The multi-token GEMV for many tokens (prompt chunks): wave v of
+ * workgroup g does the 4 rows 4 (8 g + v) .. + 3 (32 rows per workgroup),
+ * so each activation load serves 4 rows (4 times less cache traffic than
+ * ie_gemv_q8q8_t). For each (row, token) the arithmetic and its order are
+ * those of ie_gemv_q8q8: the same lane blocks, the same block dot product,
+ * the same reduction. */
+#ifndef GEMV_R
+#define GEMV_R 4u
+#endif
+KERNEL ie_gemv_q8q8_tr(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                       const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
+#pragma clang fp contract(off) /* no fused multiply-add: the same rounding as ie_gemv_q8q8 */
+  const u32 r0 = (wgid() * 8u + (tid() >> 5)) * GEMV_R, l = lane();
+  if (r0 >= rows) return;
+  float acc[GEMV_R][GEMV_T];
+#pragma unroll
+  for (u32 q = 0; q < GEMV_R; q++)
+#pragma unroll
+    for (u32 j = 0; j < GEMV_T; j++) acc[q][j] = 0.0f;
+  for (u32 t = 0; ie_lane_blk(l, t) < nb; t++) {
+    const u32 b = ie_lane_blk(l, t);
+    u32x4 w0[GEMV_R], w1[GEMV_R];
+    float sw[GEMV_R];
+#pragma unroll
+    for (u32 q = 0; q < GEMV_R; q++) {
+      const u32 r = r0 + q < rows ? r0 + q : r0; /* a row past the end: row r0 again, not stored */
+      const G u32 *wp = qw + ie_q8_dst_word(r, b, 0u, nb);
+      w0[q] = *(const G u32x4 *)wp;
+      w1[q] = *(const G u32x4 *)(wp + 4u);
+      sw[q] = (float)qs[ie_q8_dst_scale(r, b, nb)];
+    }
+#pragma unroll
+    for (u32 j = 0; j < GEMV_T; j++) {
+      if (j < T) { /* uniform */
+        const G u8 *xj = xq + j * xs;
+        const G u32 *aw = (const G u32 *)xj;
+        const u32x4 a0 = *(const G u32x4 *)(aw + b * 8u), a1 = *(const G u32x4 *)(aw + b * 8u + 4u);
+        const float da = ((const G float *)(xj + 32u * nb))[b];
+        const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+#pragma unroll
+        for (u32 q = 0; q < GEMV_R; q++) {
+          const u32 wq[8] = {w0[q].x, w0[q].y, w0[q].z, w0[q].w, w1[q].x, w1[q].y, w1[q].z, w1[q].w};
+          const Mem qm = {wq}, am = {av};
+          const int dot = (int)ie_q8q8_block(qm, 0u, am, 0u);
+          const float sc = sw[q] * da;
+          acc[q][j] = acc[q][j] + sc * (float)dot;
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (u32 q = 0; q < GEMV_R; q++) {
+    const u32 r = r0 + q;
+#pragma unroll
+    for (u32 j = 0; j < GEMV_T; j++) {
+      if (j < T) {
+        const float v = wave_tree_f(acc[q][j]);
+        if (l == 0u && r < rows) y[j * ys + r] = epilogue(v, r, bias, res ? res + j * rs : res);
+      }
+    }
+  }
+}
+
 /* y = W x for an f32 matrix (F16 weights dequantized at load):
  * the same grid; lane l does the elements ie_lane_blk(l, t) < cols. */
 KERNEL ie_gemv_f32(const G float *w, const G float *x, G float *y, u32 rows, u32 cols, const G float *bias,
@@ -405,7 +476,8 @@ KERNEL ie_add(const G float *a, const G float *b, G float *c, u32 n) {
 /* a = silu(a) * b */
 /* a = silu(a) * b. n is a multiple of 32, so a wave is one whole block (or
  * none). If q is not NULL, also write the Q8 copy of the result. */
-KERNEL ie_swiglu(G float *a, const G float *b, u32 n, G u8 *q) {
+KERNEL ie_swiglu(G float *a, const G float *b, u32 n, G u8 *q, u32 as, u32 qs) {
+  a = TOK(a, as), b = TOKC(b, as), q = TOK(q, qs);
   const u32 i = wgid() * NT + tid();
   if (i >= n) return; /* whole waves leave together */
   const float g = a[i];
@@ -607,7 +679,12 @@ KERNEL ie_attn_split(const G float *q, const G float *kc, const G float *vc, G f
  * qo + g * hd, k to the cache kc. */
 static LDS float qk_buf[256];
 KERNEL ie_qkn_rope_kv(const G float *qkv, G float *qo, G float *kc, G float *vc, const G float *qw, const G float *kw,
-                      const G float *cs, const G float *sn, u32 nq, u32 nkv, u32 hd, u32 nrot, float eps) {
+                      const G float *cs, const G float *sn, u32 nq, u32 nkv, u32 hd, u32 nrot, float eps, u32 ins,
+                      u32 qos) {
+  /* token y of a multi-token launch: position + y (KV rows and RoPE tables) */
+  qkv = TOKC(qkv, ins), qo = TOK(qo, qos);
+  kc = TOK(kc, nkv * hd * 4u), vc = TOK(vc, nkv * hd * 4u);
+  cs = TOKC(cs, (nrot >> 1) * 4u), sn = TOKC(sn, (nrot >> 1) * 4u);
   const u32 g = wgid(), t = tid();
   if (g >= nq + nkv) { /* value head */
     const u32 h = g - nq - nkv;
@@ -633,40 +710,42 @@ KERNEL ie_qkn_rope_kv(const G float *qkv, G float *qo, G float *kc, G float *vc,
   if (t < hd) (is_k ? kc + h * hd : qo + h * hd)[t] = r;
 }
 
-/* Linear attention (Gated DeltaNet) of T <= 4 tokens at positions pos ..
+/* Linear attention (Gated DeltaNet) of T <= 16 tokens at positions pos ..
  * pos + T - 1, one after the other; one workgroup per value head h (key
  * head kh = h % nk), state dims 128 x 128. Token t: in + t * is = [q k v (cd)
  * | z (inner) | beta (nv) | alpha (nv)], inner = nv * 128; output at out +
- * t * os, its Q8 copy at oq + t * qs. ring: the conv inputs of the last 8
- * positions [slot][cd] (slot = position % 8). S: GDN_SLOTS (4) state slots [slot][h][i][j]
+ * t * os, its Q8 copy at oq + t * qs. ring: the conv inputs of the last 32
+ * positions [slot][cd] (slot = position % 32). S: GDN_SLOTS (4) state slots [slot][h][i][j]
  * (i: key dim, j: value dim); the state is read from slot c and the state
- * after token t is written to slot (c + t) % 4, so that a speculative step
+ * after token t is written to slot (c + t) % 4 (only for t >= wfrom: a prompt chunk keeps only its last state), so that a speculative step
  * can go back to the state after any of its tokens. Each thread reads and
  * writes only its own state values, so slot c can be overwritten. Thread t:
  * value dim j = t % 128, key dims i of half t / 128. The CPU backend (cpu.c,
  * gdn) does the same arithmetic for one token (slot c = 0). */
 #define GDN_SLOTS 4u
+#define GDN_RING 32u
 static LDS float gd_q[128], gd_k[128], gd_v[128], gd_p[2][128], gd_r[8];
 /* conv input of channel c at token u of this launch, or (before the launch)
  * from the ring; 0 before position 0 */
 static inline float conv_in(const G float *in, u32 is, const G float *ring, u32 c, u32 t, u32 d, u32 pos, u32 cd) {
   if (d <= t) return in[(t - d) * is + c];
   const u32 p = pos + t;
-  return p >= d ? ring[((p - d) & 7u) * cd + c] : 0.0f;
+  return p >= d ? ring[((p - d) & (GDN_RING - 1u)) * cd + c] : 0.0f;
 }
 static inline float conv_ch(const G float *in, u32 is, G float *ring, const G float *cw, u32 c, u32 t, u32 pos, u32 cd,
                             int writer) {
   float acc = 0.0f;
   for (u32 j = 0; j < 4u; j++) /* oldest first, as ggml_ssm_conv */
     acc += conv_in(in, is, ring, c, t, 3u - j, pos, cd) * cw[c * 4u + j];
-  /* slot (pos + t) % 8: no workgroup reads it in this launch (reads of the
-   * ring are of positions pos - 3 .. pos - 1; writes of pos .. pos + 3) */
-  if (writer) ring[((pos + t) & 7u) * cd + c] = in[t * is + c];
+  /* slot (pos + t) % GDN_RING: no workgroup reads it in this launch (reads
+   * of the ring are of positions pos - 3 .. pos - 1, writes of pos .. pos +
+   * 15: 19 slots < GDN_RING) */
+  if (writer) ring[((pos + t) & (GDN_RING - 1u)) * cd + c] = in[t * is + c];
   return acc / (1.0f + __builtin_expf(-acc));
 }
 KERNEL ie_gdn(const G float *in, G float *out, G u8 *oq, G float *ring, G float *S, const G float *cw, const G float *dtb,
               const G float *sa, const G float *nw, u32 pos, u32 cd, u32 nk, u32 nv, float eps, u32 T, u32 is, u32 os,
-              u32 qs, u32 c) {
+              u32 qs, u32 c, u32 wfrom) {
   const u32 h = wgid(), t0 = tid(), j = t0 & 127u, half = t0 >> 7, kh = h % nk, w = t0 >> 5, inner = nv * 128u;
   const unsigned long slot = (unsigned long)nv * 16384u, own = (unsigned long)h * 16384u + half * 64u * 128u + j;
   /* the state loads first: they do not depend on the conv, so their
@@ -706,7 +785,7 @@ KERNEL ie_gdn(const G float *in, G float *out, G u8 *oq, G float *ring, G float 
     G float *Sw = S + ((c + t) % GDN_SLOTS) * slot + own;
     for (u32 ii = 0; ii < 64u; ii++) {
       st[ii] += gd_k[half * 64u + ii] * delta;
-      Sw[ii * 128u] = st[ii];
+      if (t >= wfrom) Sw[ii * 128u] = st[ii]; /* uniform */
       po += st[ii] * gd_q[half * 64u + ii];
     }
     gd_p[half][j] = po;

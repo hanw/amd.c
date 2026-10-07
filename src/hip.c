@@ -77,13 +77,13 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
-enum { GDN_RING = 8, GDN_SLOTS = 4 }; /* as in ie_kernels.c */
+enum { GDN_RING = 32, GDN_SLOTS = 4 }; /* as in ie_kernels.c */
 /* The argmax kernel: workgroups, and its device scratch (partial results and
  * the counter of finished workgroups). */
 enum { ARGMAX_GROUPS = 128 };
@@ -105,6 +105,7 @@ typedef struct {
   u32 *am_part, *am_count; /* argmax scratch (device) */
   u32 *at_count;           /* ie_attn_split: finished workgroups per head (device) */
   u32 *gm_count;           /* GEMV with a fused RMSNorm: finished workgroups (device) */
+  u32 slot;                /* ie_gdn: the state slot that holds the current state */
   int attn_split;          /* use ie_attn_split (hd <= IE_ATT_MAX_HD, and not IE_ATTN=old) */
   /* IE_ATTN=check: after each ie_attn_split, also run ie_attn into chk and
    * compare the two outputs on the host (max |a - b| / max |a|). */
@@ -166,7 +167,9 @@ static void upload_mat(gpu_backend *b, const mat *w, void **w0, void **w1) {
 }
 
 static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits, double *ms);
-static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, uint32_t slot, uint32_t *out);
+static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out);
+static void gpu_accept(backend *bk, uint32_t k);
+static void gpu_read_rows(backend *bk, int id, uint32_t r0, uint32_t n, float *dst);
 static void gpu_copy_rows(backend *bk, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n);
 static void gpu_close(backend *bk);
 
@@ -228,6 +231,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   b->base.step = gpu_step;
   b->base.run = gpu_run;
   b->base.copy_rows = gpu_copy_rows;
+  b->base.accept = gpu_accept;
+  b->base.read_rows = gpu_read_rows;
   b->base.close = gpu_close;
   b->m = m;
   b->g = g;
@@ -298,6 +303,10 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
 static void launch_lds(gpu_backend *b, int k, unsigned groups, unsigned lds_bytes, void **args) {
   HIP(H.ModuleLaunchKernel(b->k[k], groups, 1, 1, 256, 1, 1, lds_bytes, NULL, args, NULL));
 }
+/* groups x T workgroups: grid dimension y is the token (kernels with byte strides) */
+static void launch_t(gpu_backend *b, int k, unsigned groups, unsigned T, void **args) {
+  HIP(H.ModuleLaunchKernel(b->k[k], groups, T, 1, 256, 1, 1, 0, NULL, args, NULL));
+}
 static void launch(gpu_backend *b, int k, unsigned groups, void **args) { launch_lds(b, k, groups, 0, args); }
 
 /* GEMV grids: on the R9700 (gfx1201, 64 CUs) a GEMV with 253 .. 256
@@ -313,7 +322,7 @@ static unsigned gemv_groups(u32 rows) {
 /* Launch op i for token t of a run: tok is its token id, pos its position.
  * For OP_GDN and, when T > 1, OP_GEMV_Q8, one launch does all T tokens (t
  * = 0). slot: the linear attention state slot to read (ie_gdn). */
-static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T, u32 slot) {
+static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T, u32 slot, u32 wfrom) {
   const model *m = b->m;
   const graph *g = b->g;
   const u32 h2 = m->n_rot / 2, kvd = m->n_kv * m->hd, hd = m->hd, nhd = m->n_head, nkv = m->n_kv, nctx = g->n_ctx;
@@ -347,14 +356,15 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         }
         break;
       case OP_RMSNORM: {
-        void *args[] = {&A, &w0, &B, &n, &eps, &Q};
-        launch(b, K_RMSNORM, (n + 255u) / 256u, args); /* one block of 32 per wave */
+        u32 xs = g->bufs[o->a].stride, ys = g->bufs[o->b].stride, qs = o->qo >= 0 ? g->bufs[o->qo].stride : 0u;
+        void *args[] = {&A, &w0, &B, &n, &eps, &Q, &xs, &ys, &qs};
+        launch_t(b, K_RMSNORM, (n + 255u) / 256u, T, args); /* one block of 32 per wave */
         break;
       }
       case OP_QUANT: {
-        u32 nb = n / 32u;
-        void *args[] = {&A, &B, &nb};
-        launch(b, K_QUANT, (nb + 7u) / 8u, args);
+        u32 nb = n / 32u, xs = g->bufs[o->a].stride, qs = g->bufs[o->b].stride;
+        void *args[] = {&A, &B, &nb, &xs, &qs};
+        launch_t(b, K_QUANT, (nb + 7u) / 8u, T, args);
         break;
       }
       case OP_GEMV_Q4: {
@@ -369,7 +379,19 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           if (NW) ie_die("a GEMV with a fused norm (IE_NORM_FUSE) cannot do several tokens");
           u32 xs = g->bufs[o->a].stride, ys = g->bufs[o->b].stride / 4u, rs = o->res >= 0 ? g->bufs[o->res].stride / 4u : 0u;
           void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R, &T, &xs, &ys, &rs};
-          launch(b, K_GEMV_Q8_T, gemv_groups(rows), args);
+          /* many tokens (prompt chunks): 4 rows per wave, 4 times less
+           * activation traffic; few tokens (verify): one row per wave, more
+           * workgroups. The same results either way. */
+          static int trmin = -1;
+          if (trmin < 0) trmin = getenv("IE_TR_MIN") ? atoi(getenv("IE_TR_MIN")) : 5;
+          if ((int)T >= trmin) {
+            static unsigned rpw = 0; /* rows per wave of ie_gemv_q8q8_tr (GEMV_R) */
+            if (!rpw) rpw = getenv("IE_TR_R") ? (unsigned)atoi(getenv("IE_TR_R")) : 4u;
+            unsigned gr = (rows + 8u * rpw - 1u) / (8u * rpw);
+            launch(b, K_GEMV_Q8_TR, gr >= 253u && gr <= 256u ? 257u : gr, args);
+          } else {
+            launch(b, K_GEMV_Q8_T, gemv_groups(rows), args);
+          }
           break;
         }
         void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R, &NW, &NY, &NQ, &eps, &b->gm_count};
@@ -393,8 +415,9 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         break;
       }
       case OP_SWIGLU: {
-        void *args[] = {&A, &B, &n, &Q};
-        launch(b, K_SWIGLU, elem_groups, args);
+        u32 as = g->bufs[o->a].stride, qs = o->qo >= 0 ? g->bufs[o->qo].stride : 0u;
+        void *args[] = {&A, &B, &n, &Q, &as, &qs};
+        launch_t(b, K_SWIGLU, elem_groups, T, args);
         break;
       }
       case OP_ROPE: {
@@ -418,8 +441,9 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         const size_t base = ((size_t)m->l[o->layer].kvi * nctx + pos) * kvd;
         float *kc = b->kc + base, *vc = b->vc + base;
         u32 nq = o->nh, nrot = m->n_rot;
-        void *args[] = {&A, &B, &kc, &vc, &w0, &NW, &cs, &sn, &nq, (void *)&nkv, (void *)&hd, &nrot, &eps};
-        launch(b, K_QKN_ROPE_KV, nq + 2u * nkv, args);
+        u32 ins = g->bufs[o->a].stride, qos = g->bufs[o->b].stride;
+        void *args[] = {&A, &B, &kc, &vc, &w0, &NW, &cs, &sn, &nq, (void *)&nkv, (void *)&hd, &nrot, &eps, &ins, &qos};
+        launch_t(b, K_QKN_ROPE_KV, nq + 2u * nkv, T, args);
         break;
       }
       case OP_GDN: {
@@ -429,7 +453,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         void *cw = b->d[i].w0, *dtb = b->d[i].w1, *sa = b->d[i].bias, *nw = b->d[i].nw;
         u32 cd = m->conv_dim, nk = m->n_kh, nv = m->n_vh;
         u32 is = g->bufs[o->a].stride / 4u, os = g->bufs[o->b].stride / 4u, qs = o->qo >= 0 ? g->bufs[o->qo].stride : 0u;
-        void *args[] = {&A, &B, &Q, &ring, &st, &cw, &dtb, &sa, &nw, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &qs, &slot};
+        void *args[] = {&A, &B, &Q, &ring, &st, &cw, &dtb, &sa, &nw, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &qs, &slot, &wfrom};
         launch(b, K_GDN, nv, args);
         break;
       }
@@ -482,7 +506,8 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
 }
 
 /* Run the ops [i0, i1) for T tokens toks at positions pos .. pos + T - 1. */
-static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u32 T, u32 pos, u32 slot) {
+static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u32 T, u32 pos, u32 wfrom) {
+  const u32 slot = b->slot;
   const graph *g = b->g;
   for (u32 t = 0; t < T; t++) {
     if (toks[t] >= b->m->vocab) ie_die("token %u >= vocab %u", toks[t], b->m->vocab);
@@ -493,9 +518,13 @@ static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u
     const int k = g->ops[i].kind;
     static int nobatch = -1;
     if (nobatch < 0) nobatch = getenv("IE_GEMV_NOBATCH") != NULL; /* debug: one GEMV launch per token */
-    if (k == OP_GDN || (k == OP_GEMV_Q8 && T > 1 && !nobatch)) launch_op(b, i, 0, toks[0], pos, T, slot);
+    /* one launch for all tokens: GDN (sequential inside), Q8 GEMV (weights
+     * read once), and the per-token kernels with a token grid dimension */
+    const int all = k == OP_GDN || (k == OP_GEMV_Q8 && !nobatch) || k == OP_RMSNORM || k == OP_QUANT || k == OP_SWIGLU ||
+                    k == OP_QKN_ROPE_KV;
+    if (all) launch_op(b, i, 0, toks[0], pos, T, slot, wfrom);
     else
-      for (u32 t = 0; t < T; t++) launch_op(b, i, t, toks[t], pos + t, 1, slot);
+      for (u32 t = 0; t < T; t++) launch_op(b, i, t, toks[t], pos + t, 1, slot, wfrom);
     if (b->prof && i < g->n_main) HIP(H.EventRecord(b->pev[i], NULL));
   }
 }
@@ -507,7 +536,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   HIP(H.EventRecord(b->e0, NULL));
   struct timespec h0, h1;
   clock_gettime(CLOCK_MONOTONIC, &h0);
-  run_ops(b, 0, g->n_main, &tok, 1, pos, 0);
+  run_ops(b, 0, g->n_main, &tok, 1, pos, 0); /* state: slot -> slot */
   clock_gettime(CLOCK_MONOTONIC, &h1);
   if (pos > 0) b->host_ms += (h1.tv_sec - h0.tv_sec) * 1e3 + (h1.tv_nsec - h0.tv_nsec) / 1e6, b->host_n++;
   HIP(H.EventRecord(b->e1, NULL));
@@ -529,15 +558,26 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   return r;
 }
 
-static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, uint32_t slot, uint32_t *out) {
+static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out) {
   gpu_backend *b = (gpu_backend *)bk;
   const graph *g = b->g;
   if (sec == 1 && g->mtp_argmax < 0) ie_die("the graph has no MTP ops");
-  run_ops(b, sec ? g->n_main : 0, sec ? g->n_ops : g->n_main, toks, T, pos, slot);
+  run_ops(b, sec ? g->n_main : 0, sec ? g->n_ops : g->n_main, toks, T, pos, last_only ? T - 1 : 0);
   const buf *am = &g->bufs[sec ? g->mtp_argmax : g->argmax];
-  u32 tmp[4 * 64];
+  u32 tmp[16 * 64];
   HIP(H.Memcpy(tmp, b->arena + am->off, (size_t)T * am->stride, hipMemcpyDeviceToHost));
   for (u32 t = 0; t < T; t++) out[t] = tmp[t * am->stride / 4u];
+}
+
+static void gpu_accept(backend *bk, uint32_t k) {
+  gpu_backend *b = (gpu_backend *)bk;
+  b->slot = (b->slot + k) % GDN_SLOTS;
+}
+
+static void gpu_read_rows(backend *bk, int id, uint32_t r0, uint32_t n, float *dst) {
+  gpu_backend *b = (gpu_backend *)bk;
+  const buf *B = &b->g->bufs[id];
+  HIP(H.Memcpy(dst, b->arena + B->off + (size_t)r0 * B->stride, (size_t)n * B->stride, hipMemcpyDeviceToHost));
 }
 
 static void gpu_copy_rows(backend *bk, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n) {
