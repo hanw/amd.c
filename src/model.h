@@ -35,6 +35,11 @@ typedef struct {
   vec attn_norm, ffn_norm;
   mat wq, wk, wv, wo, wgate, wup, wdown;
   vec bq, bk, bv; /* n == 0 if absent */
+  /* Merged matrices (rows == 0 if not merged: the parts differ in kind).
+   * wqkv = [wq; wk; wv] with bias bqkv; wgu = [wgate; wup]. When merged, the
+   * parts are freed (their rows stay set, their arrays are NULL). */
+  mat wqkv, wgu;
+  vec bqkv;
 } layer;
 
 typedef struct {
@@ -88,6 +93,14 @@ typedef struct {
   int layer;
   const mat *w;
   const vec *v;
+  /* Byte offsets into the buffers a, b, c (a buffer can hold several
+   * vectors, for example q, k and v). */
+  uint32_t aoff, boff, coff;
+  /* GEMV only: after the result (with bias and residual) is complete,
+   * nout = rmsnorm(result) * nv and, if nq >= 0, its Q8 copy in nq. The GPU
+   * does this in the last workgroup to finish. */
+  const vec *nv;
+  int nout, nq;
   /* Fused work (-1: none):
    *  qo:  also write the Q8 copy of this op's f32 result (RMSNORM: b,
    *       ATTN: b, SWIGLU: a), as OP_QUANT would.

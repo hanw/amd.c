@@ -8,7 +8,7 @@
 #include <stdlib.h>
 
 /* GGML tensor types that the engine reads. */
-enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8 };
+enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8, GGML_Q6_K = 14 };
 
 /* Print a message and exit(1). */
 void ie_die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
@@ -18,6 +18,8 @@ void *ie_alloc(size_t n);
 
 /* IEEE half -> float (exact). */
 float ie_f16_to_f32(uint16_t h);
+/* float -> IEEE half, round to nearest even (as numpy and ggml's F16C path). */
+uint16_t ie_f32_to_f16(float f);
 
 /* Q8 activation buffer of nb blocks (one buffer in the arena):
  *   bytes [0, 32 nb)        : the int8 values, 8 u32 words per block

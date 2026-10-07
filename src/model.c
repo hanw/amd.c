@@ -48,6 +48,40 @@ static void dequant(const gguf_tensor *t, uint64_t first, uint64_t n, float *out
         out[i] = ie_f16_to_f32(h) * (float)((int)q - 8);
       }
       break;
+    case GGML_Q6_K: {
+      /* blocks of 256: ql[128], qh[64], int8 scales[16], f16 d (as ggml's
+       * dequantize_row_q6_K) */
+      const uint64_t b0 = first / 256, b1 = (first + n + 255) / 256;
+      float tmp[256];
+      for (uint64_t bk = b0; bk < b1; bk++) {
+        const uint8_t *blk = p + bk * 210, *ql = blk, *qh = blk + 128;
+        const int8_t *sc = (const int8_t *)(blk + 192);
+        uint16_t h;
+        memcpy(&h, blk + 208, 2);
+        const float d = ie_f16_to_f32(h);
+        for (int half = 0; half < 2; half++) {
+          const uint8_t *L = ql + 64 * half, *Hh = qh + 32 * half;
+          const int8_t *S = sc + 8 * half;
+          float *y = tmp + 128 * half;
+          for (int l = 0; l < 32; l++) {
+            const int is = l / 16;
+            const int q1 = (int)((L[l] & 0xF) | (((Hh[l] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((L[l + 32] & 0xF) | (((Hh[l] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((L[l] >> 4) | (((Hh[l] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((L[l + 32] >> 4) | (((Hh[l] >> 6) & 3) << 4)) - 32;
+            y[l] = d * S[is] * q1;
+            y[l + 32] = d * S[is + 2] * q2;
+            y[l + 64] = d * S[is + 4] * q3;
+            y[l + 96] = d * S[is + 6] * q4;
+          }
+        }
+        for (int j = 0; j < 256; j++) {
+          const uint64_t e = bk * 256 + j;
+          if (e >= first && e < first + n) out[e - first] = tmp[j];
+        }
+      }
+      break;
+    }
     default: ie_die("tensor %s: type %s is not supported here", t->name, ggml_type_name(t->type));
   }
 }
@@ -103,6 +137,19 @@ void repack_q8(mat *w, const uint8_t *src) {
     }
 }
 
+/* GGUF Q8_0 bytes of n floats (n % 32 == 0), as ggml's quantize_row_q8_0:
+ * d = amax / 127 (stored as f16), q = round(x / d). */
+static void quant_q8_0_bytes(const float *x, uint64_t n, uint8_t *out) {
+  for (uint64_t b = 0; b < n / 32; b++) {
+    float amax = 0.0f;
+    for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(x[32 * b + j]));
+    const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+    const uint16_t h = ie_f32_to_f16(d);
+    memcpy(out + 34 * b, &h, 2);
+    for (int j = 0; j < 32; j++) out[34 * b + 2 + j] = (uint8_t)(int8_t)roundf(x[32 * b + j] * id);
+  }
+}
+
 /* Load matrix `name` of rows x cols (GGUF ne = [cols, rows]). A Q8_0 matrix
  * keeps its integer form (MAT_Q8) when q8_ok, else it becomes f32. */
 static void load_mat(mat *w, gguf_file *g, const char *name, uint32_t rows, uint32_t cols, uint64_t *bytes, int q8_ok) {
@@ -118,6 +165,20 @@ static void load_mat(mat *w, gguf_file *g, const char *name, uint32_t rows, uint
     w->nb = cols / 32;
     repack_q4(w, t->data);
     *bytes += (uint64_t)rows * w->nb * 18;
+  } else if (t->type == GGML_Q6_K && q8_ok && ie_q8_sizes_ok(rows, cols / 32)) {
+    /* Q6_K: no integer kernel; requantize to Q8_0 at load (an
+     * approximation: Q8_0 has one scale per 32 weights, Q6_K one per 16) */
+    w->kind = MAT_Q8;
+    w->nb = cols / 32;
+    float *row = ie_alloc((size_t)cols * 4);
+    uint8_t *q8 = ie_alloc((size_t)rows * w->nb * 34);
+    for (uint32_t r = 0; r < rows; r++) {
+      dequant(t, (uint64_t)r * cols, cols, row);
+      quant_q8_0_bytes(row, cols, q8 + (size_t)r * w->nb * 34);
+    }
+    repack_q8(w, q8);
+    free(row), free(q8);
+    *bytes += (uint64_t)rows * w->nb * 34;
   } else if (t->type == GGML_Q8_0 && q8_ok && ie_q8_sizes_ok(rows, cols / 32)) {
     w->kind = MAT_Q8;
     w->nb = cols / 32;
@@ -129,6 +190,62 @@ static void load_mat(mat *w, gguf_file *g, const char *name, uint32_t rows, uint
     dequant(t, 0, (uint64_t)rows * cols, w->f);
     *bytes += (uint64_t)rows * cols * 4;
   }
+}
+
+/* Concatenate the rows of n matrices of one kind and width into dst. The
+ * GPU layouts are row major (ie_q4_dst_word / ie_q8_dst_word are
+ * (r * nb + b) * W + w), so row r of part i becomes row off_i + r and the
+ * index maps stay those of the verified core. The parts are freed. Returns
+ * 0 (and changes nothing) if the kinds or widths differ or the sizes are
+ * outside the verified limits. */
+static int concat_mats(mat *dst, mat *const *src, int n) {
+  uint32_t rows = 0;
+  for (int i = 0; i < n; i++) {
+    if (src[i]->kind != src[0]->kind || src[i]->cols != src[0]->cols) return 0;
+    rows += src[i]->rows;
+  }
+  const int kind = src[0]->kind;
+  const uint32_t cols = src[0]->cols, nb = src[0]->nb;
+  if (kind == MAT_Q4 && !ie_sizes_ok(rows, nb)) return 0;
+  if (kind == MAT_Q8 && !ie_q8_sizes_ok(rows, nb)) return 0;
+  memset(dst, 0, sizeof *dst);
+  dst->kind = kind, dst->rows = rows, dst->cols = cols, dst->nb = nb;
+  const size_t words = kind == MAT_Q4 ? 4 : 8;
+  if (kind == MAT_F32) {
+    dst->f = ie_alloc((size_t)rows * cols * 4);
+  } else {
+    dst->qw = ie_alloc((size_t)rows * nb * words * 4);
+    dst->qs = ie_alloc((size_t)rows * nb * 2);
+  }
+  size_t r0 = 0;
+  for (int i = 0; i < n; i++) {
+    mat *w = src[i];
+    if (kind == MAT_F32) {
+      memcpy(dst->f + r0 * cols, w->f, (size_t)w->rows * cols * 4);
+    } else {
+      memcpy(dst->qw + r0 * nb * words, w->qw, (size_t)w->rows * nb * words * 4);
+      memcpy(dst->qs + r0 * nb, w->qs, (size_t)w->rows * nb * 2);
+    }
+    r0 += w->rows;
+    free(w->qw), free(w->qs), free(w->f);
+    w->qw = NULL, w->qs = NULL, w->f = NULL;
+  }
+  return 1;
+}
+
+/* The bias of [q; k; v]: the parts, or zeros for a missing part. n = 0 if
+ * no part has a bias. */
+static void concat_bias(vec *dst, const vec *const *src, const uint32_t *len, int n) {
+  int any = 0;
+  uint32_t tot = 0;
+  for (int i = 0; i < n; i++) any |= src[i]->n != 0, tot += len[i];
+  memset(dst, 0, sizeof *dst);
+  if (!any) return;
+  dst->n = tot;
+  dst->f = calloc(tot, 4);
+  if (!dst->f) ie_die("out of memory");
+  for (uint32_t i = 0, o = 0; i < (uint32_t)n; o += len[i], i++)
+    if (src[i]->n) memcpy(dst->f + o, src[i]->f, len[i] * 4);
 }
 
 static uint32_t need_u32(gguf_file *g, const char *arch, const char *key) {
@@ -196,6 +313,14 @@ void model_load(model *m, gguf_file *g) {
     load_vec(&L->bq, g, NAME("attn_q.bias"), qd, 1);
     load_vec(&L->bk, g, NAME("attn_k.bias"), kvd, 1);
     load_vec(&L->bv, g, NAME("attn_v.bias"), kvd, 1);
+    mat *qkv[3] = {&L->wq, &L->wk, &L->wv};
+    if (concat_mats(&L->wqkv, qkv, 3)) {
+      const vec *b3[3] = {&L->bq, &L->bk, &L->bv};
+      const uint32_t n3[3] = {qd, kvd, kvd};
+      concat_bias(&L->bqkv, b3, n3, 3);
+    }
+    mat *gu[2] = {&L->wgate, &L->wup};
+    concat_mats(&L->wgu, gu, 2);
 #undef NAME
   }
 
@@ -229,7 +354,8 @@ void model_free(model *m) {
   free(m->out_norm.f);
   for (uint32_t i = 0; i < m->n_layer; i++) {
     layer *L = &m->l[i];
-    free(L->attn_norm.f), free(L->ffn_norm.f), free(L->bq.f), free(L->bk.f), free(L->bv.f);
+    free(L->attn_norm.f), free(L->ffn_norm.f), free(L->bq.f), free(L->bk.f), free(L->bv.f), free(L->bqkv.f);
+    free_mat(&L->wqkv), free_mat(&L->wgu);
     free_mat(&L->wq), free_mat(&L->wk), free_mat(&L->wv), free_mat(&L->wo);
     free_mat(&L->wgate), free_mat(&L->wup), free_mat(&L->wdown);
   }
@@ -328,7 +454,7 @@ static op *emit(gb *B, int kind, int a, int b, int c) {
   }
   op *o = &g->ops[g->n_ops];
   memset(o, 0, sizeof *o);
-  o->kind = kind, o->a = a, o->b = b, o->c = c, o->layer = B->layer, o->qo = -1, o->res = -1;
+  o->kind = kind, o->a = a, o->b = b, o->c = c, o->layer = B->layer, o->qo = -1, o->res = -1, o->nout = -1, o->nq = -1;
   touch(g, a, g->n_ops), touch(g, b, g->n_ops), touch(g, c, g->n_ops);
   g->n_ops++;
   return o;
@@ -340,17 +466,55 @@ static void use_last(gb *B, int id) {
 }
 
 /* y = W x (+ bias) (+ res), where xq is the Q8 copy of x (or -1) and xf the
- * f32 x. bias may be NULL or empty; res is a buffer id or -1. */
-static int matvec(gb *B, const mat *w, int xf, int xq, const char *name, const vec *bias, int res) {
-  int y = new_buf(B->g, name, w->rows * 4);
+ * f32 x. bias may be NULL or empty; res is a buffer id or -1. The result goes
+ * to buffer `into` at byte offset `off`, or (into < 0) to a new buffer. */
+static int matvec_into(gb *B, const mat *w, int xf, int xq, int into, uint32_t off, const char *name, const vec *bias,
+                       int res) {
+  int y = into >= 0 ? into : new_buf(B->g, name, w->rows * 4);
   const int quant_in = w->kind == MAT_Q4 || w->kind == MAT_Q8;
   op *o = emit(B, w->kind == MAT_Q4 ? OP_GEMV_Q4 : w->kind == MAT_Q8 ? OP_GEMV_Q8 : OP_GEMV_F32, quant_in ? xq : xf, y, -1);
   o->w = w;
   o->n = w->cols;
   if (bias && bias->n) o->v = bias;
   o->res = res;
+  o->boff = into >= 0 ? off : 0;
   use_last(B, res);
   return y;
+}
+static int matvec(gb *B, const mat *w, int xf, int xq, const char *name, const vec *bias, int res) {
+  return matvec_into(B, w, xf, xq, -1, 0, name, bias, res);
+}
+
+static int fuse_quant(gb *B, uint32_t n, const char *name);
+
+/* The last op (a GEMV) also writes out = rmsnorm(its result) * nv and, if
+ * quantized, its Q8 copy (a new buffer, returned in *q). */
+static int fuse_norm(gb *B, const vec *nv, uint32_t n, const char *name, int quantized, const char *qname, int *q) {
+  graph *g = B->g;
+  /* By default the norm is a separate RMSNORM op: measured on the R9700, the
+   * fused form (the last workgroup of the GEMV does the norm) is slower
+   * (Qwen2.5-1.5B: 2.94 vs 2.81 ms/token). IE_NORM_FUSE=1 selects it. */
+  const char *nf = getenv("IE_NORM_FUSE");
+  if (!(nf && nf[0] == '1')) {
+    const op *p = &g->ops[g->n_ops - 1];
+    int x = p->b, out = new_buf(g, name, n * 4);
+    op *o = emit(B, OP_RMSNORM, x, out, -1);
+    o->n = n, o->v = nv;
+    *q = quantized ? fuse_quant(B, n, qname) : -1;
+    return out;
+  }
+  op *o = &g->ops[g->n_ops - 1];
+  int out = new_buf(g, name, n * 4);
+  o->nv = nv;
+  o->nout = out;
+  use_last(B, out);
+  *q = -1;
+  if (quantized) {
+    *q = new_buf(g, qname, (uint32_t)q8_bytes(n / 32));
+    g->ops[g->n_ops - 1].nq = *q;
+    use_last(B, *q);
+  }
+  return out;
 }
 
 /* A Q8 copy of the f32 result of the last op, written by that op (qo). */
@@ -380,39 +544,59 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx) {
 
   int x = new_buf(g, "x", dim * 4);
   emit(&B, OP_EMBED, x, -1, -1)->n = dim;
+  /* the norm of layer 0; the later norms are fused into the residual GEMVs */
+  B.layer = 0;
+  int xn = new_buf(g, "attn_in", dim * 4);
+  op *o = emit(&B, OP_RMSNORM, x, xn, -1);
+  o->n = dim, o->v = &m->l[0].attn_norm;
+  int xq = any_q4(&m->l[0].wq, &m->l[0].wk, &m->l[0].wv) ? fuse_quant(&B, dim, "attn_in_q8") : -1;
+  const uint32_t kvd = m->n_kv * m->hd;
   for (uint32_t l = 0; l < m->n_layer; l++) {
     const layer *L = &m->l[l];
     B.layer = (int)l;
-    int xn = new_buf(g, "attn_in", dim * 4);
-    op *o = emit(&B, OP_RMSNORM, x, xn, -1);
-    o->n = dim, o->v = &L->attn_norm;
-    int xq = any_q4(&L->wq, &L->wk, &L->wv) ? fuse_quant(&B, dim, "attn_in_q8") : -1;
-    int q = matvec(&B, &L->wq, xn, xq, "q", &L->bq, -1);
-    int k = matvec(&B, &L->wk, xn, xq, "k", &L->bk, -1);
-    int v = matvec(&B, &L->wv, xn, xq, "v", &L->bv, -1);
-    o = emit(&B, OP_ROPE_KV, q, k, v), o->n = qd, o->nh = m->n_head;
+    /* q, k, v in one buffer: [q | k | v] */
+    int qkv;
+    if (L->wqkv.rows) {
+      qkv = matvec(&B, &L->wqkv, xn, xq, "qkv", &L->bqkv, -1);
+    } else {
+      qkv = new_buf(g, "qkv", (qd + 2 * kvd) * 4);
+      matvec_into(&B, &L->wq, xn, xq, qkv, 0, "q", &L->bq, -1);
+      matvec_into(&B, &L->wk, xn, xq, qkv, qd * 4, "k", &L->bk, -1);
+      matvec_into(&B, &L->wv, xn, xq, qkv, (qd + kvd) * 4, "v", &L->bv, -1);
+    }
+    o = emit(&B, OP_ROPE_KV, qkv, qkv, qkv), o->n = qd, o->nh = m->n_head;
+    o->boff = qd * 4, o->coff = (qd + kvd) * 4;
     int att = new_buf(g, "attn", qd * 4);
     const uint32_t sc_cpu = m->n_head * n_ctx, sc_gpu = m->n_head * ((n_ctx + IE_ATT_CH - 1) / IE_ATT_CH) * (m->hd + 2);
     int sc = new_buf(g, "scores", (sc_cpu > sc_gpu ? sc_cpu : sc_gpu) * 4);
-    o = emit(&B, OP_ATTN, q, att, sc), o->n = qd;
+    o = emit(&B, OP_ATTN, qkv, att, sc), o->n = qd;
     int aq = -1;
     if (L->wo.kind != MAT_F32) aq = m->hd % 32 == 0 && m->hd <= 256 ? fuse_quant(&B, qd, "attn_q8") : quant(&B, att, qd, "attn_q8");
     x = matvec(&B, &L->wo, att, aq, "x", NULL, x); /* x = x + Wo att */
+    int hq;
+    int hn = fuse_norm(&B, &L->ffn_norm, dim, "ffn_in", any_q4(&L->wgate, &L->wup, NULL), "ffn_in_q8", &hq);
 
-    int hn = new_buf(g, "ffn_in", dim * 4);
-    o = emit(&B, OP_RMSNORM, x, hn, -1), o->n = dim, o->v = &L->ffn_norm;
-    int hq = any_q4(&L->wgate, &L->wup, NULL) ? fuse_quant(&B, dim, "ffn_in_q8") : -1;
-    int gt = matvec(&B, &L->wgate, hn, hq, "gate", NULL, -1);
-    int up = matvec(&B, &L->wup, hn, hq, "up", NULL, -1);
-    emit(&B, OP_SWIGLU, gt, up, -1)->n = m->ffn; /* gate = silu(gate) * up */
+    /* gate and up in one buffer: [gate | up] */
+    int gu;
+    if (L->wgu.rows) {
+      gu = matvec(&B, &L->wgu, hn, hq, "gate_up", NULL, -1);
+    } else {
+      gu = new_buf(g, "gate_up", 2 * m->ffn * 4);
+      matvec_into(&B, &L->wgate, hn, hq, gu, 0, "gate", NULL, -1);
+      matvec_into(&B, &L->wup, hn, hq, gu, m->ffn * 4, "up", NULL, -1);
+    }
+    o = emit(&B, OP_SWIGLU, gu, gu, -1); /* gate = silu(gate) * up */
+    o->n = m->ffn, o->boff = m->ffn * 4;
     int gq = L->wdown.kind != MAT_F32 ? fuse_quant(&B, m->ffn, "ffn_mid_q8") : -1;
-    x = matvec(&B, &L->wdown, gt, gq, "x", NULL, x); /* x = x + Wdown gate */
+    x = matvec(&B, &L->wdown, gu, gq, "x", NULL, x); /* x = x + Wdown gate */
+    if (l + 1 < m->n_layer) {
+      const layer *N = &m->l[l + 1];
+      xn = fuse_norm(&B, &N->attn_norm, dim, "attn_in", any_q4(&N->wq, &N->wk, &N->wv), "attn_in_q8", &xq);
+    } else {
+      xn = fuse_norm(&B, &m->out_norm, dim, "out_in", m->out.kind != MAT_F32, "out_in_q8", &xq);
+    }
   }
   B.layer = -1;
-  int xn = new_buf(g, "out_in", dim * 4);
-  op *o = emit(&B, OP_RMSNORM, x, xn, -1);
-  o->n = dim, o->v = &m->out_norm;
-  int xq = m->out.kind != MAT_F32 ? fuse_quant(&B, dim, "out_in_q8") : -1;
   g->logits = matvec(&B, &m->out, xn, xq, "logits", NULL, -1);
   g->argmax = new_buf(g, "argmax", 4);
   emit(&B, OP_ARGMAX, g->logits, g->argmax, -1)->n = m->vocab;

@@ -31,7 +31,7 @@ import sys
 import numpy as np
 from gguf import GGUFReader
 
-Q4_0, Q8_0, F16, F32 = 2, 8, 1, 0
+Q4_0, Q8_0, F16, F32, Q6_K = 2, 8, 1, 0, 14
 
 
 def field(r, key, default=None):
@@ -59,6 +59,11 @@ def dequant(t):
         b = raw.reshape(-1, 34)
         d = b[:, :2].copy().view(np.float16).astype(np.float64)
         a = (d * b[:, 2:].view(np.int8).astype(np.float64)).reshape(-1)
+    elif tt == Q6_K:
+        # the gguf package's own dequantizer (independent of the engine)
+        from gguf.quants import dequantize
+        from gguf import GGMLQuantizationType
+        a = dequantize(raw, GGMLQuantizationType.Q6_K).astype(np.float64).reshape(-1)
     elif tt == Q4_0:
         b = raw.reshape(-1, 18)
         d = b[:, :2].copy().view(np.float16).astype(np.float64)
@@ -74,7 +79,7 @@ class Mat:
         self.w = dequant(t)
         tt = int(t.tensor_type)
         # keep the integer form for the q8 mode (the engine's integer paths)
-        self.qint = tt in (Q4_0, Q8_0)
+        self.qint = tt in (Q4_0, Q8_0)  # Q6_K: set below
         rows, cols = self.w.shape
         nb = cols // 32
         if tt == Q4_0:
@@ -82,6 +87,19 @@ class Mat:
             self.d = raw[:, :2].copy().view(np.float16).astype(np.float64).reshape(rows, nb)
             q = np.concatenate([raw[:, 2:] & 15, raw[:, 2:] >> 4], axis=1).astype(np.int64) - 8
             self.q = q.reshape(rows, nb, 32)
+        elif tt == Q6_K:
+            # the engine requantizes Q6_K to Q8_0 at load (ggml's
+            # quantize_row_q8_0: d = amax/127 in float32, stored as f16;
+            # q = round half away from zero of x * (1/d)); in q8 mode the
+            # reference uses the same Q8_0 weights
+            x = self.w.astype(np.float32).reshape(rows, nb, 32)
+            amax = np.abs(x).max(axis=2)
+            d = (amax / np.float32(127.0)).astype(np.float32)
+            idv = np.where(d == 0, np.float32(0), np.float32(1) / np.where(d == 0, np.float32(1), d)).astype(np.float32)
+            r = (x * idv[:, :, None]).astype(np.float32)
+            self.q = (np.sign(r) * np.floor(np.abs(r) + np.float32(0.5))).astype(np.int64)
+            self.d = d.astype(np.float16).astype(np.float64)
+            self.qint = True
         elif tt == Q8_0:
             raw = np.asarray(t.data).view(np.uint8).reshape(-1, 34)
             self.d = raw[:, :2].copy().view(np.float16).astype(np.float64).reshape(rows, nb)

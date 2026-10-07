@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 
 #include "../core/ie_core.h"
 #include "backend.h"
@@ -87,6 +88,7 @@ enum { ARGMAX_GROUPS = 128 };
 typedef struct {
   void *w0, *w1; /* Q4/Q8: words, scales; f32 matrix: floats; vec: floats */
   void *bias;    /* GEMV: the fused bias (o->v), or NULL */
+  void *nw;      /* GEMV: the weight of the fused RMSNorm (o->nv), or NULL */
 } dop;
 
 typedef struct {
@@ -98,6 +100,7 @@ typedef struct {
   char *arena; /* device */
   u32 *am_part, *am_count; /* argmax scratch (device) */
   u32 *at_count;           /* ie_attn_split: finished workgroups per head (device) */
+  u32 *gm_count;           /* GEMV with a fused RMSNorm: finished workgroups (device) */
   int attn_split;          /* use ie_attn_split (hd <= IE_ATT_MAX_HD, and not IE_ATTN=old) */
   /* IE_ATTN=check: after each ie_attn_split, also run ie_attn into chk and
    * compare the two outputs on the host (max |a - b| / max |a|). */
@@ -105,6 +108,9 @@ typedef struct {
   float *chk, *chk_a, *chk_b;
   double chk_worst;
   uint32_t chk_n;
+  /* host time spent issuing the launches of a step (not waiting) */
+  double host_ms;
+  uint32_t host_n;
   float *kc, *vc, *rcos, *rsin;
   void *tok0, *tok1; /* token_embd */
   dop *d;
@@ -184,6 +190,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   HIP(H.Malloc((void **)&b->am_part, ARGMAX_GROUPS * 8u));
   HIP(H.Malloc((void **)&b->am_count, 4u));
   HIP(H.Memset(b->am_count, 0, 4u)); /* the kernel sets it back to 0 */
+  HIP(H.Malloc((void **)&b->gm_count, 4u));
+  HIP(H.Memset(b->gm_count, 0, 4u)); /* the kernel sets it back to 0 */
   HIP(H.Malloc((void **)&b->at_count, m->n_head * 4u));
   HIP(H.Memset(b->at_count, 0, m->n_head * 4u)); /* the kernel sets it back to 0 */
   const char *ae = getenv("IE_ATTN");
@@ -208,6 +216,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     if (o->w) upload_mat(b, o->w, &b->d[i].w0, &b->d[i].w1);
     if (o->v && o->w) b->d[i].bias = upload(b, o->v->f, o->v->n * 4); /* GEMV bias */
     else if (o->v) b->d[i].w0 = upload(b, o->v->f, o->v->n * 4);
+    if (o->nv) b->d[i].nw = upload(b, o->nv->f, o->nv->n * 4);
   }
   HIP(H.EventCreate(&b->e0));
   HIP(H.EventCreate(&b->e1));
@@ -223,8 +232,19 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   return &b->base;
 }
 
-static void launch(gpu_backend *b, int k, unsigned groups, void **args) {
-  HIP(H.ModuleLaunchKernel(b->k[k], groups, 1, 1, 256, 1, 1, 0, NULL, args, NULL));
+static void launch_lds(gpu_backend *b, int k, unsigned groups, unsigned lds_bytes, void **args) {
+  HIP(H.ModuleLaunchKernel(b->k[k], groups, 1, 1, 256, 1, 1, lds_bytes, NULL, args, NULL));
+}
+static void launch(gpu_backend *b, int k, unsigned groups, void **args) { launch_lds(b, k, groups, 0, args); }
+
+/* GEMV grids: on the R9700 (gfx1201, 64 CUs) a GEMV with 253 .. 256
+ * workgroups runs 2-3 times slower than with 252 or 257 (measured with
+ * tools/gemv_bench.c: 2048 rows x 48 blocks, 17.0 us at 256 workgroups,
+ * 6.5 us at 257). The cause is not known. A GEMV grid in that range gets
+ * extra workgroups up to 257; they have no row (r >= rows) and do nothing. */
+static unsigned gemv_groups(u32 rows) {
+  const unsigned g = ie_gemv_ngroups(rows);
+  return g >= 253u && g <= 256u ? 257u : g;
 }
 
 static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits, double *ms) {
@@ -235,11 +255,17 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   if (pos >= g->n_ctx) ie_die("position %u >= context %u", pos, g->n_ctx);
   const u32 h2 = m->hd / 2, kvd = m->n_kv * m->hd, hd = m->hd, nhd = m->n_head, nkv = m->n_kv, nctx = g->n_ctx;
   HIP(H.EventRecord(b->e0, NULL));
+  struct timespec h0, h1;
+  clock_gettime(CLOCK_MONOTONIC, &h0);
   for (uint32_t i = 0; i < g->n_ops; i++) {
     const op *o = &g->ops[i];
-    void *A = o->a >= 0 ? b->arena + g->bufs[o->a].off : NULL;
-    void *B = o->b >= 0 ? b->arena + g->bufs[o->b].off : NULL;
-    void *C = o->c >= 0 ? b->arena + g->bufs[o->c].off : NULL;
+    void *A = o->a >= 0 ? b->arena + g->bufs[o->a].off + o->aoff : NULL;
+    void *B = o->b >= 0 ? b->arena + g->bufs[o->b].off + o->boff : NULL;
+    void *C = o->c >= 0 ? b->arena + g->bufs[o->c].off + o->coff : NULL;
+    void *NW = b->d[i].nw;
+    void *NY = o->nout >= 0 ? b->arena + g->bufs[o->nout].off : NULL;
+    void *NQ = o->nq >= 0 ? b->arena + g->bufs[o->nq].off : NULL;
+    float eps = m->eps;
     void *w0 = b->d[i].w0, *w1 = b->d[i].w1, *bias = b->d[i].bias;
     void *Q = o->qo >= 0 ? b->arena + g->bufs[o->qo].off : NULL;
     void *R = o->res >= 0 ? b->arena + g->bufs[o->res].off : NULL;
@@ -258,7 +284,6 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
         }
         break;
       case OP_RMSNORM: {
-        float eps = m->eps;
         void *args[] = {&A, &w0, &B, &n, &eps, &Q};
         launch(b, K_RMSNORM, 1, args);
         break;
@@ -271,20 +296,20 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
       }
       case OP_GEMV_Q4: {
         u32 rows = o->w->rows, nb = o->w->nb;
-        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R};
-        launch(b, K_GEMV_Q4, ie_gemv_ngroups(rows), args);
+        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R, &NW, &NY, &NQ, &eps, &b->gm_count};
+        launch(b, K_GEMV_Q4, gemv_groups(rows), args);
         break;
       }
       case OP_GEMV_Q8: {
         u32 rows = o->w->rows, nb = o->w->nb;
-        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R};
-        launch(b, K_GEMV_Q8, ie_gemv_ngroups(rows), args);
+        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R, &NW, &NY, &NQ, &eps, &b->gm_count};
+        launch(b, K_GEMV_Q8, gemv_groups(rows), args);
         break;
       }
       case OP_GEMV_F32: {
         u32 rows = o->w->rows, cols = o->w->cols;
-        void *args[] = {&w0, &A, &B, &rows, &cols, &bias, &R};
-        launch(b, K_GEMV_F32, ie_gemv_ngroups(rows), args);
+        void *args[] = {&w0, &A, &B, &rows, &cols, &bias, &R, &NW, &NY, &NQ, &eps, &b->gm_count};
+        launch(b, K_GEMV_F32, gemv_groups(rows), args);
         break;
       }
       case OP_BIAS: {
@@ -363,6 +388,8 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
     }
     if (b->prof) HIP(H.EventRecord(b->pev[i], NULL));
   }
+  clock_gettime(CLOCK_MONOTONIC, &h1);
+  if (pos > 0) b->host_ms += (h1.tv_sec - h0.tv_sec) * 1e3 + (h1.tv_nsec - h0.tv_nsec) / 1e6, b->host_n++;
   HIP(H.EventRecord(b->e1, NULL));
   HIP(H.EventSynchronize(b->e1));
   float t = 0;
@@ -521,6 +548,8 @@ static void prof_layers(gpu_backend *b) {
 
 static void gpu_close(backend *bk) {
   gpu_backend *b = (gpu_backend *)bk;
+  if (b->host_n)
+    fprintf(stderr, "gpu: host issue time %.3f ms/token (%u launches per token)\n", b->host_ms / b->host_n, b->g->n_ops);
   if (b->attn_check) {
     fprintf(stderr, "attn check: %u calls, max |split - old| / max |old| = %.2e\n", b->chk_n, b->chk_worst);
     H.Free(b->chk), free(b->chk_a), free(b->chk_b);
@@ -529,7 +558,7 @@ static void gpu_close(backend *bk) {
   HIP(H.DeviceSynchronize());
   for (uint32_t i = 0; i < b->nh; i++) H.Free(b->hv[i]);
   H.Free(b->arena), H.Free(b->kc), H.Free(b->vc);
-  H.Free(b->am_part), H.Free(b->am_count), H.Free(b->at_count);
+  H.Free(b->am_part), H.Free(b->am_count), H.Free(b->at_count), H.Free(b->gm_count);
   if (b->prof) {
     for (uint32_t i = 0; i < b->g->n_ops; i++) H.EventDestroy(b->pev[i]);
     free(b->pev), free(b->pms);

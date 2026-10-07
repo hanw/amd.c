@@ -222,7 +222,9 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   if (pos >= g->n_ctx) ie_die("position %u >= context %u", pos, g->n_ctx);
   for (u32 i = 0; i < g->n_ops; i++) {
     const op *o = &g->ops[i];
-    float *a = o->a >= 0 ? BUF(B, o->a) : NULL, *bb = o->b >= 0 ? BUF(B, o->b) : NULL;
+    float *a = o->a >= 0 ? (float *)((char *)BUF(B, o->a) + o->aoff) : NULL;
+    float *bb = o->b >= 0 ? (float *)((char *)BUF(B, o->b) + o->boff) : NULL;
+    float *cc = o->c >= 0 ? (float *)((char *)BUF(B, o->c) + o->coff) : NULL;
     uint8_t *qo = o->qo >= 0 ? (uint8_t *)BUF(B, o->qo) : NULL;
     const float *res = o->res >= 0 ? (const float *)BUF(B, o->res) : NULL;
     switch (o->kind) {
@@ -245,13 +247,17 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
           if (res) y = res[j] + y;
           bb[j] = y;
         }
+        if (o->nv) { /* the fused RMSNorm of the result */
+          float *ny = (float *)BUF(B, o->nout);
+          rmsnorm(bb, o->nv->f, ny, o->w->rows, m->eps);
+          if (o->nq >= 0) cpu_quant_q8(ny, (uint8_t *)BUF(B, o->nq), o->w->rows / 32);
+        }
         break;
       case OP_BIAS:
         for (u32 j = 0; j < o->n; j++) a[j] += o->v->f[j];
         break;
       case OP_ADD: {
-        float *c = BUF(B, o->c);
-        for (u32 j = 0; j < o->n; j++) c[j] = a[j] + bb[j];
+        for (u32 j = 0; j < o->n; j++) cc[j] = a[j] + bb[j];
         break;
       }
       case OP_ROPE:
@@ -263,7 +269,7 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
         rope(bb, m->n_kv, m->hd, m->rope == ROPE_NEOX, cs, sn);
         const size_t base = ((size_t)o->layer * g->n_ctx + pos) * kvd;
         memcpy(B->kc + base, bb, kvd * 4);
-        memcpy(B->vc + base, BUF(B, o->c), kvd * 4);
+        memcpy(B->vc + base, cc, kvd * 4);
         break;
       }
       case OP_KV: {
@@ -274,8 +280,7 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
       }
       case OP_ATTN: {
         const size_t base = (size_t)o->layer * g->n_ctx * kvd;
-        float *sc = BUF(B, o->c);
-        attention(m, a, B->kc + base, B->vc + base, pos, g->n_ctx, sc, bb);
+        attention(m, a, B->kc + base, B->vc + base, pos, g->n_ctx, cc, bb);
         if (qo) cpu_quant_q8(bb, qo, o->n / 32);
         break;
       }

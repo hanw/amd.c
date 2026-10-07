@@ -44,3 +44,24 @@ float ie_f16_to_f32(uint16_t h) {
   memcpy(&f, &bits, 4);
   return f;
 }
+
+uint16_t ie_f32_to_f16(float f) {
+  uint32_t x;
+  memcpy(&x, &f, 4);
+  const uint32_t sign = (x >> 16) & 0x8000u, ax = x & 0x7FFFFFFFu;
+  if (ax >= 0x7F800000u) return (uint16_t)(sign | 0x7C00u | (ax > 0x7F800000u ? 0x200u : 0u)); /* inf, nan */
+  if (ax >= 0x477FF000u) return (uint16_t)(sign | 0x7C00u); /* rounds to >= 65520: inf */
+  if (ax < 0x38800000u) { /* below the smallest normal half: subnormal or 0 */
+    if (ax < 0x33000000u) return (uint16_t)sign; /* < 2^-25: rounds to 0 */
+    const uint32_t m = (ax & 0x7FFFFFu) | 0x800000u;
+    const int shift = 126 - (int)(ax >> 23); /* 14 .. 24 */
+    uint32_t h = m >> shift;
+    const uint32_t rem = m & ((1u << shift) - 1u), half = 1u << (shift - 1);
+    if (rem > half || (rem == half && (h & 1u))) h++;
+    return (uint16_t)(sign | h);
+  }
+  uint32_t h = ((ax >> 13) - (112u << 10)); /* rebias exponent 127 -> 15 */
+  const uint32_t rem = ax & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+  return (uint16_t)(sign | h);
+}

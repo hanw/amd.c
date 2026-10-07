@@ -129,7 +129,7 @@ KERNEL ie_quant_q8(const G float *x, G u8 *q, u32 nb) {
 /* y = x / sqrt(mean(x^2) + eps) * w. One workgroup. n is a multiple of 32.
  * If q is not NULL, also write the Q8 copy of y (fused quantize): wave w
  * does the blocks w, w + 8, ...; each lane stores and quantizes its own y. */
-KERNEL ie_rmsnorm(const G float *x, const G float *w, G float *y, u32 n, float eps, G u8 *q) {
+static inline void rmsnorm_wg(const G float *x, const G float *w, G float *y, u32 n, float eps, G u8 *q) {
   float ss = 0.0f;
   for (u32 i = tid(); i < n; i += NT) ss += x[i] * x[i];
   ss = wg_sum(ss);
@@ -142,8 +142,31 @@ KERNEL ie_rmsnorm(const G float *x, const G float *w, G float *y, u32 n, float e
     if (q) quant_wave(v, b, q, nb);
   }
 }
+KERNEL ie_rmsnorm(const G float *x, const G float *w, G float *y, u32 n, float eps, G u8 *q) {
+  rmsnorm_wg(x, w, y, n, eps, q);
+}
 
 /* ------------------------------------------------------------------ GEMV */
+
+/* The fused RMSNorm of a GEMV result y (rows elements): every workgroup
+ * makes its rows visible and counts itself; the last one (count[0] reaches
+ * ngroups) computes ny = rmsnorm(y) * nw and its Q8 copy nq, then sets the
+ * count back to 0 for the next GEMV. Every thread of the workgroup calls it. */
+static LDS u32 gm_last;
+static inline void gemv_norm_tail(const G float *y, u32 rows, const G float *nw, G float *ny, G u8 *nq, float eps,
+                                  G u32 *count) {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  barrier();
+  /* the number of launched workgroups (the host may add idle ones): the
+   * dispatch packet's grid_size_x (byte 12) over the workgroup size */
+  const u32 ngroups = ((const __attribute__((address_space(4))) u32 *)__builtin_amdgcn_dispatch_ptr())[3] / NT;
+  if (tid() == 0u) gm_last = __atomic_fetch_add(count, 1u, __ATOMIC_ACQ_REL) == ngroups - 1u;
+  barrier();
+  if (!gm_last) return;
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  rmsnorm_wg(y, nw, ny, rows, eps, nq);
+  if (tid() == 0u) *count = 0u;
+}
 
 /* The fused epilogue of a GEMV row (the CPU backend does the same, in the
  * same order): y = acc (+ bias[r]) then (res[r] +) y. */
@@ -154,74 +177,112 @@ static inline float epilogue(float acc, u32 r, const G float *bias, const G floa
   return y;
 }
 
+/* GEMV_U: blocks per lane per loop step. The loads of the GEMV_U blocks are
+ * all issued before the first dot product, so a lane waits for memory once
+ * per step, not once per block. A block past nb loads block t (valid) again
+ * and adds 0.0f. The terms are added in block order, as before (and as
+ * the CPU backend does). */
+#ifndef GEMV_U
+#define GEMV_U 2u
+#endif
+
+
 /* y = W x: W is Q4 (GPU layout: words qw, f16 scales qs), x is Q8 (as
  * written by ie_quant_q8). Grid: ie_gemv_ngroups(rows) workgroups of 8
  * waves; wave v of workgroup g does row ie_gemv_row(g, v); lane l does the
  * blocks ie_lane_blk(l, t) < nb; then the ie_tree wave reduction. */
 KERNEL ie_gemv_q4q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
-                  const G float *bias, const G float *res) {
+                  const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                  G u32 *count) {
   const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
-  if (r >= rows) return;
-  const G u32 *aw = (const G u32 *)xq;
-  const G float *da = (const G float *)(xq + 32u * nb);
-  const G u32 *asum = (const G u32 *)(xq + 36u * nb);
-  float acc = 0.0f;
-  for (u32 t = 0; ie_lane_blk(l, t) < nb; t++) {
-    const u32 b = ie_lane_blk(l, t);
-    /* One 128-bit load of the 4 nibble words of the block (16-byte aligned),
-     * two 128-bit loads of the 8 activation words. */
-    const u32x4 w4 = *(const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb));
-    const u32x4 a0 = *(const G u32x4 *)(aw + b * 8u);
-    const u32x4 a1 = *(const G u32x4 *)(aw + b * 8u + 4u);
-    const u32 wq[4] = {w4.x, w4.y, w4.z, w4.w};
-    const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-    const Mem qm = {wq}, am = {av};
-    const int dot = (int)ie_q4q8_block(qm, 0u, am, 0u, asum[b]);
-    acc += ((float)qs[ie_q4_dst_scale(r, b, nb)] * da[b]) * (float)dot;
+  if (r < rows) {
+    const G u32 *aw = (const G u32 *)xq;
+    const G float *da = (const G float *)(xq + 32u * nb);
+    const G u32 *asum = (const G u32 *)(xq + 36u * nb);
+    float acc = 0.0f;
+    for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
+      u32x4 w4[GEMV_U], a0[GEMV_U], a1[GEMV_U];
+      float sc[GEMV_U];
+      u32 as[GEMV_U];
+      int ok[GEMV_U];
+      for (u32 k = 0; k < GEMV_U; k++) {
+        ok[k] = ie_lane_blk(l, t + k) < nb;
+        const u32 b = ok[k] ? ie_lane_blk(l, t + k) : ie_lane_blk(l, t);
+        /* one 128-bit load of the 4 nibble words, two of the 8 activation words */
+        w4[k] = *(const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb));
+        a0[k] = *(const G u32x4 *)(aw + b * 8u);
+        a1[k] = *(const G u32x4 *)(aw + b * 8u + 4u);
+        sc[k] = (float)qs[ie_q4_dst_scale(r, b, nb)] * da[b];
+        as[k] = asum[b];
+      }
+      for (u32 k = 0; k < GEMV_U; k++) {
+        /* no branch: a branch lets the compiler sink the loads into it */
+        const u32 wq[4] = {w4[k].x, w4[k].y, w4[k].z, w4[k].w};
+        const u32 av[8] = {a0[k].x, a0[k].y, a0[k].z, a0[k].w, a1[k].x, a1[k].y, a1[k].z, a1[k].w};
+        const Mem qm = {wq}, am = {av};
+        const int dot = (int)ie_q4q8_block(qm, 0u, am, 0u, as[k]);
+        acc += ok[k] ? sc[k] * (float)dot : 0.0f; /* + 0.0f leaves acc unchanged */
+      }
+    }
+    acc = wave_tree_f(acc);
+    if (l == 0u) y[r] = epilogue(acc, r, bias, res);
   }
-  acc = wave_tree_f(acc);
-  if (l == 0u) y[r] = epilogue(acc, r, bias, res);
+  if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
 }
 
 /* y = W x: W is Q8_0 (GPU layout: 8 int8 words per block in qw, f16 scales
  * qs), x is Q8. The same grid, lane split and reduction as ie_gemv_q4q8;
  * the block dot product is ie_q8q8_block (8 v_dot4_i32_iu8, both signed). */
 KERNEL ie_gemv_q8q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
-                  const G float *bias, const G float *res) {
+                  const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                  G u32 *count) {
   const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
-  if (r >= rows) return;
-  const G u32 *aw = (const G u32 *)xq;
-  const G float *da = (const G float *)(xq + 32u * nb);
-  float acc = 0.0f;
-  for (u32 t = 0; ie_lane_blk(l, t) < nb; t++) {
-    const u32 b = ie_lane_blk(l, t);
-    /* Two 128-bit loads of the 8 weight words (32-byte aligned blocks), two
-     * of the 8 activation words. */
-    const G u32 *wp = qw + ie_q8_dst_word(r, b, 0u, nb);
-    const u32x4 w0 = *(const G u32x4 *)wp, w1 = *(const G u32x4 *)(wp + 4u);
-    const u32x4 a0 = *(const G u32x4 *)(aw + b * 8u);
-    const u32x4 a1 = *(const G u32x4 *)(aw + b * 8u + 4u);
-    const u32 wq[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
-    const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-    const Mem qm = {wq}, am = {av};
-    const int dot = (int)ie_q8q8_block(qm, 0u, am, 0u);
-    acc += ((float)qs[ie_q8_dst_scale(r, b, nb)] * da[b]) * (float)dot;
+  if (r < rows) {
+    const G u32 *aw = (const G u32 *)xq;
+    const G float *da = (const G float *)(xq + 32u * nb);
+    float acc = 0.0f;
+    for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
+      u32x4 w0[GEMV_U], w1[GEMV_U], a0[GEMV_U], a1[GEMV_U];
+      float sc[GEMV_U];
+      int ok[GEMV_U];
+      for (u32 k = 0; k < GEMV_U; k++) {
+        ok[k] = ie_lane_blk(l, t + k) < nb;
+        const u32 b = ok[k] ? ie_lane_blk(l, t + k) : ie_lane_blk(l, t);
+        /* two 128-bit loads of the 8 weight words, two of the 8 activation words */
+        const G u32 *wp = qw + ie_q8_dst_word(r, b, 0u, nb);
+        w0[k] = *(const G u32x4 *)wp;
+        w1[k] = *(const G u32x4 *)(wp + 4u);
+        a0[k] = *(const G u32x4 *)(aw + b * 8u);
+        a1[k] = *(const G u32x4 *)(aw + b * 8u + 4u);
+        sc[k] = (float)qs[ie_q8_dst_scale(r, b, nb)] * da[b];
+      }
+      for (u32 k = 0; k < GEMV_U; k++) {
+        const u32 wq[8] = {w0[k].x, w0[k].y, w0[k].z, w0[k].w, w1[k].x, w1[k].y, w1[k].z, w1[k].w};
+        const u32 av[8] = {a0[k].x, a0[k].y, a0[k].z, a0[k].w, a1[k].x, a1[k].y, a1[k].z, a1[k].w};
+        const Mem qm = {wq}, am = {av};
+        const int dot = (int)ie_q8q8_block(qm, 0u, am, 0u);
+        acc += ok[k] ? sc[k] * (float)dot : 0.0f;
+      }
+    }
+    acc = wave_tree_f(acc);
+    if (l == 0u) y[r] = epilogue(acc, r, bias, res);
   }
-  acc = wave_tree_f(acc);
-  if (l == 0u) y[r] = epilogue(acc, r, bias, res);
+  if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
 }
 
 /* y = W x for an f32 matrix (F16 weights dequantized at load):
  * the same grid; lane l does the elements ie_lane_blk(l, t) < cols. */
 KERNEL ie_gemv_f32(const G float *w, const G float *x, G float *y, u32 rows, u32 cols, const G float *bias,
-                   const G float *res) {
+                   const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps, G u32 *count) {
   const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
-  if (r >= rows) return;
+  if (r < rows) {
   const G float *row = w + (unsigned long)r * cols;
   float acc = 0.0f;
   for (u32 t = 0; ie_lane_blk(l, t) < cols; t++) acc += row[ie_lane_blk(l, t)] * x[ie_lane_blk(l, t)];
   acc = wave_tree_f(acc);
   if (l == 0u) y[r] = epilogue(acc, r, bias, res);
+  }
+  if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
 }
 
 /* ---------------------------------------------------------- elementwise */
