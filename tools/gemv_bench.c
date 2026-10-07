@@ -88,7 +88,9 @@ int main(int argc, char **argv) {
   hipModule_t mod;
   hipFunction_t k;
   CK(H.ModuleLoadData(&mod, img));
-  CK(H.ModuleGetFunction(&k, mod, "ie_gemv_q4q8"));
+  const char *kn = getenv("KERNEL") ? getenv("KERNEL") : "ie_gemv_q4q8"; /* or ie_gemv_rows (prototype) */
+  const unsigned rpw = getenv("ROWS_PER_WAVE") ? (unsigned)atoi(getenv("ROWS_PER_WAVE")) : 1u;
+  CK(H.ModuleGetFunction(&k, mod, kn));
 
   static const unsigned def[][2] = {{896, 28},   {1152, 28},  {2048, 48},  {1536, 48},  {4096, 48},
                                     {8192, 48},  {17920, 48}, {1536, 280}, {2048, 64},  {4096, 64},
@@ -119,7 +121,7 @@ int main(int argc, char **argv) {
     CK(H.Memset(xq, 0x03, (size_t)nb * 40));
     void *nul = NULL;
     float eps = 1e-6f;
-    unsigned groups = (rows + 7) / 8;
+    unsigned groups = (rows + 8 * rpw - 1) / (8 * rpw);
     const char *pe = getenv("PAD_GROUPS"); /* launch at least this many workgroups (extra ones do nothing) */
     if (pe && (unsigned)atoi(pe) > groups) groups = (unsigned)atoi(pe);
     const int iters = 200;

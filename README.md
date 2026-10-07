@@ -86,6 +86,7 @@ GPU 后端只在 gfx1201 上编译。核函数需要 `v_dot4_i32_iu8` 指令和 
 
 硬件追踪：用 `rocprofv3 --kernel-trace` 运行引擎，再用 `tools/rocprof_ops.py` 把追踪结果对应到算子（见脚本开头的说明）。
 矩阵向量乘基准测试：`tools/gemv_bench.c` 对不同形状单独计时（见文件开头的说明）。
+`tools/gemv_rows_proto.c` 是一个原型（每个 wave 算 R 行），测试结果：R = 2 和 R = 1 一样快，R = 4 和 8 更慢，所以引擎没有用它。
 
 支持的模型：Llama 和 Qwen2 架构。Q4_0 和 Q8_0 矩阵走整数路径（dot4 指令）。F32 和 F16 矩阵在加载时转成 f32。
 Q6_K 矩阵在加载时先还原成浮点数，再按 Q8_0 重新量化（近似：Q8_0 每 32 个权重一个缩放，Q6_K 每 16 个一个；
@@ -162,6 +163,19 @@ CPU 后端按完全相同的划分和顺序计算，所以两者只差浮点舍�
 1.5B 生成 64 个 token 时，有效带宽 374 GB/s（标称 640 GB/s 的 58%）。
 硬件追踪中，大矩阵的核函数接近标称带宽：gate+up（17920 × 1536）585 GB/s，down（1536 × 8960）540 GB/s，
 输出层（151936 × 1536，Q8_0）629 GB/s。剩下的时间主要是注意力、几个小矩阵（qkv、输出投影）和核函数之间的间隔。
+
+与 llama.cpp 对比（同一块卡，同样的 GGUF 文件；llama.cpp b11222，Vulkan 后端，RADV 驱动，`llama-bench -p 0 -n 64,512 -r 5`；
+本引擎用 1 个 token 的提示，各跑 5 次）。单位：每秒生成的 token 数。
+
+| 模型 | 测试 | llama.cpp（Vulkan） | 本引擎 | 倍数 |
+|---|---|---|---|---|
+| Qwen2.5-0.5B Q4_0 | 生成 64 个 | 465 ± 36 | 716 | 1.54 |
+| Qwen2.5-0.5B Q4_0 | 生成 512 个 | 533 ± 28 | 683 | 1.28 |
+| Qwen2.5-1.5B Q4_0 | 生成 64 个 | 280 ± 8 | 381 | 1.36 |
+| Qwen2.5-1.5B Q4_0 | 生成 512 个 | 328 ± 7 | 371 | 1.13 |
+
+注意：llama.cpp 这里用的是 Vulkan 后端，不是 ROCm（HIP）后端，没有测 ROCm 版本。1.5B 的输出层，llama.cpp 直接读 Q6_K，
+本引擎读重新量化后的 Q8_0（字节更多，而且是近似）。
 
 - 回答 "What is the capital of France? Answer in one sentence." 时，两个模型都输出 "The capital of France is Paris."。
 - 两个小模型：GPU 与 CPU 的 logits 相对误差最大 7e-3，中位数约 1e-7 到 3e-7，贪心 token 相同。
