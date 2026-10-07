@@ -195,7 +195,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   HIP(H.Malloc((void **)&b->at_count, m->n_head * 4u));
   HIP(H.Memset(b->at_count, 0, m->n_head * 4u)); /* the kernel sets it back to 0 */
   const char *ae = getenv("IE_ATTN");
-  b->attn_split = m->hd <= IE_ATT_MAX_HD && !(ae && !strcmp(ae, "old"));
+  b->attn_split = m->hd <= IE_ATT_MAX_HD && ie_att_max_split(g->n_ctx) <= IE_ATT_MAX_SPLIT && !(ae && !strcmp(ae, "old"));
   b->attn_check = b->attn_split && ae && !strcmp(ae, "check");
   if (b->attn_check) {
     HIP(H.Malloc((void **)&b->chk, m->n_head * m->hd * 4u));
@@ -285,7 +285,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
         break;
       case OP_RMSNORM: {
         void *args[] = {&A, &w0, &B, &n, &eps, &Q};
-        launch(b, K_RMSNORM, 1, args);
+        launch(b, K_RMSNORM, (n + 255u) / 256u, args); /* one block of 32 per wave */
         break;
       }
       case OP_QUANT: {
@@ -354,7 +354,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
         const size_t base = (size_t)o->layer * nctx * kvd;
         float *kc = b->kc + base, *vc = b->vc + base;
         if (b->attn_split) {
-          u32 ch = IE_ATT_CH, nsplit = (pos + ch) / ch; /* ceil((pos + 1) / ch) */
+          u32 ch = ie_att_ch(pos), nsplit = ie_att_nsplit(pos);
           void *args[] = {&A, &kc, &vc, &C, &B, &pos, (void *)&hd, (void *)&nhd, (void *)&nkv, &nsplit, &ch, &b->at_count, &Q};
           launch(b, K_ATTN_SPLIT, nhd * nsplit, args);
           if (b->attn_check) {

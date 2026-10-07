@@ -567,7 +567,7 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx) {
     o = emit(&B, OP_ROPE_KV, qkv, qkv, qkv), o->n = qd, o->nh = m->n_head;
     o->boff = qd * 4, o->coff = (qd + kvd) * 4;
     int att = new_buf(g, "attn", qd * 4);
-    const uint32_t sc_cpu = m->n_head * n_ctx, sc_gpu = m->n_head * ((n_ctx + IE_ATT_CH - 1) / IE_ATT_CH) * (m->hd + 2);
+    const uint32_t sc_cpu = m->n_head * n_ctx, sc_gpu = m->n_head * ie_att_max_split(n_ctx) * (m->hd + 2);
     int sc = new_buf(g, "scores", (sc_cpu > sc_gpu ? sc_cpu : sc_gpu) * 4);
     o = emit(&B, OP_ATTN, qkv, att, sc), o->n = qd;
     int aq = -1;

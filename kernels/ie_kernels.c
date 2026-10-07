@@ -35,12 +35,6 @@ static inline void barrier(void) {
 }
 
 /* Value of lane (this lane + off) of the wave: ds_bpermute (byte address). */
-static inline float shfl_down_f(float v, u32 off) {
-  return __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((int)((lane() + off) * 4u), __builtin_bit_cast(int, v)));
-}
-static inline u32 shfl_down_u(u32 v, u32 off) {
-  return (u32)__builtin_amdgcn_ds_bpermute((int)((lane() + off) * 4u), (int)v);
-}
 static inline float shfl_xor_f(float v, u32 m) {
   return __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((int)((lane() ^ m) * 4u), __builtin_bit_cast(int, v)));
 }
@@ -48,14 +42,49 @@ static inline float shfl_xor_f(float v, u32 m) {
 /* The wave reduction of ie_tree: step m (1..5) adds the value of lane
  * i + (32 >> m), i.e. shuffle down by 16, 8, 4, 2, 1. Lane 0 holds the sum
  * (law wave_sum). Other lanes hold partial values. */
+/* The same reduction with DPP (register moves, no LDS). Step 1: lane i of
+ * row 0 gets lane i + 16 (v_permlanex16 with the identity selects). Steps
+ * 2-5: lane i gets lane i + 8, 4, 2, 1 inside its row of 16 (DPP row_shl;
+ * a source past the row reads 0). Lane 0 adds exactly the same values in
+ * the same order as with the shuffles, so its result is the same. */
+static inline int xrow_i(int v) { return __builtin_amdgcn_permlanex16(v, v, 0x76543210, 0xfedcba98, false, false); }
+static inline int shl_i(int v, int n) {
+  switch (n) { /* the DPP control must be a constant: row_shl:n = 0x100 + n */
+    case 8: return __builtin_amdgcn_update_dpp(0, v, 0x108, 0xF, 0xF, true);
+    case 4: return __builtin_amdgcn_update_dpp(0, v, 0x104, 0xF, 0xF, true);
+    case 2: return __builtin_amdgcn_update_dpp(0, v, 0x102, 0xF, 0xF, true);
+    default: return __builtin_amdgcn_update_dpp(0, v, 0x101, 0xF, 0xF, true);
+  }
+}
+#define F2I(x) __builtin_bit_cast(int, (x))
+#define I2F(x) __builtin_bit_cast(float, (x))
 static inline float wave_tree_f(float v) {
-  for (u32 m = 1u; m <= 5u; m++) v += shfl_down_f(v, 32u >> m);
+  v += I2F(xrow_i(F2I(v)));
+  v += I2F(shl_i(F2I(v), 8));
+  v += I2F(shl_i(F2I(v), 4));
+  v += I2F(shl_i(F2I(v), 2));
+  v += I2F(shl_i(F2I(v), 1));
   return v;
 }
 static inline u32 wave_tree_u(u32 v) {
-  for (u32 m = 1u; m <= 5u; m++) v += shfl_down_u(v, 32u >> m);
+  v += (u32)xrow_i((int)v);
+  v += (u32)shl_i((int)v, 8);
+  v += (u32)shl_i((int)v, 4);
+  v += (u32)shl_i((int)v, 2);
+  v += (u32)shl_i((int)v, 1);
   return v;
 }
+/* The maximum of a wave (v >= 0: a source past the row reads 0), in every lane. */
+static inline float wave_max_pos(float v) {
+  v = __builtin_fmaxf(v, I2F(xrow_i(F2I(v))));
+  v = __builtin_fmaxf(v, I2F(shl_i(F2I(v), 8)));
+  v = __builtin_fmaxf(v, I2F(shl_i(F2I(v), 4)));
+  v = __builtin_fmaxf(v, I2F(shl_i(F2I(v), 2)));
+  v = __builtin_fmaxf(v, I2F(shl_i(F2I(v), 1)));
+  return I2F(__builtin_amdgcn_readlane(F2I(v), 0));
+}
+/* The sum of a wave, in every lane. */
+static inline float wave_sum_all(float v) { return I2F(__builtin_amdgcn_readlane(F2I(wave_tree_f(v)), 0)); }
 
 /* Workgroup sum (all 256 threads); every thread gets the result. */
 static LDS float red_sum[8];
@@ -107,8 +136,7 @@ KERNEL ie_embed_f32(G float *out, const G float *f, u32 cols, u32 tok) {
  * the one ie_quant_q8 would write. */
 static inline void quant_wave(float v, u32 b, G u8 *q, u32 nb) {
   const u32 j = lane();
-  float amax = __builtin_fabsf(v);
-  for (u32 m = 16u; m >= 1u; m >>= 1) amax = __builtin_fmaxf(amax, shfl_xor_f(amax, m));
+  const float amax = wave_max_pos(__builtin_fabsf(v));
   const float d = amax / 127.0f;
   const int qi = d != 0.0f ? (int)__builtin_roundf(v / d) : 0;
   ((G i8 *)q)[b * 32u + j] = (i8)qi;
@@ -142,8 +170,22 @@ static inline void rmsnorm_wg(const G float *x, const G float *w, G float *y, u3
     if (q) quant_wave(v, b, q, nb);
   }
 }
+/* The RMSNorm op: ceil(n / 256) workgroups. Every workgroup computes the
+ * whole sum of squares (the same code, so the same value in every
+ * workgroup); then wave v of workgroup g normalizes and quantizes block
+ * g * 8 + v only. n is a multiple of 32. */
 KERNEL ie_rmsnorm(const G float *x, const G float *w, G float *y, u32 n, float eps, G u8 *q) {
-  rmsnorm_wg(x, w, y, n, eps, q);
+  float ss = 0.0f;
+  for (u32 i = tid(); i < n; i += NT) ss += x[i] * x[i];
+  ss = wg_sum(ss);
+  const float s = 1.0f / __builtin_sqrtf(ss / (float)n + eps);
+  const u32 nb = n >> 5, b = wgid() * 8u + (tid() >> 5);
+  if (b < nb) { /* whole waves */
+    const u32 i = b * 32u + lane();
+    const float v = x[i] * s * w[i];
+    y[i] = v;
+    if (q) quant_wave(v, b, q, nb);
+  }
 }
 
 /* ------------------------------------------------------------------ GEMV */
@@ -409,6 +451,8 @@ KERNEL ie_attn(const G float *q, const G float *kc, const G float *vc, G float *
 static LDS float at_m[8], at_l[8];
 static LDS float at_o[8][256];
 static LDS u32 at_last;
+/* the weights of the splits in the merge (nsplit <= IE_ATT_MAX_SPLIT) */
+static LDS float at_w[2048];
 KERNEL ie_attn_split(const G float *q, const G float *kc, const G float *vc, G float *part, G float *out, u32 pos,
                      u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq) {
   const u32 h = wgid() / nsplit, s = wgid() % nsplit, kh = h / (n_head / n_kv), kvd = n_kv * hd;
@@ -428,7 +472,7 @@ KERNEL ie_attn_split(const G float *q, const G float *kc, const G float *vc, G f
     float d = 0.0f;
     for (u32 j = 0; j < 8u; j++)
       if (l + 32u * j < hd) d += qv[j] * k[l + 32u * j];
-    for (u32 mm = 16u; mm >= 1u; mm >>= 1) d += shfl_xor_f(d, mm);
+    d = wave_sum_all(d);
     d *= scale;
     const float mn = __builtin_fmaxf(m, d), c = __builtin_expf(m - mn), e = __builtin_expf(d - mn);
     sum = sum * c + e;
@@ -462,13 +506,22 @@ KERNEL ie_attn_split(const G float *q, const G float *kc, const G float *vc, G f
   barrier();
   if (!at_last) return;
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  /* merge: the whole workgroup finds M2 = max m_t and L2 = sum l_t w_t, with
+   * the weight w_t = exp(m_t - M2) of split t computed once, in LDS */
   const G float *ph = part + (unsigned long)h * nsplit * (hd + 2u);
-  float M2 = -__builtin_inff(), L2 = 0.0f;
-  for (u32 t = 0; t < nsplit; t++) M2 = __builtin_fmaxf(M2, ph[t * (hd + 2u)]);
-  for (u32 t = 0; t < nsplit; t++) L2 += ph[t * (hd + 2u) + 1u] * __builtin_expf(ph[t * (hd + 2u)] - M2);
+  float mv = -__builtin_inff();
+  for (u32 t = tid(); t < nsplit; t += NT) mv = __builtin_fmaxf(mv, ph[t * (hd + 2u)]);
+  const float M2 = wg_max(mv);
+  float lv = 0.0f;
+  for (u32 t = tid(); t < nsplit; t += NT) {
+    const float wt = __builtin_expf(ph[t * (hd + 2u)] - M2);
+    at_w[t] = wt;
+    lv += ph[t * (hd + 2u) + 1u] * wt;
+  }
+  const float L2 = wg_sum(lv); /* its barrier also makes at_w visible */
   if (tid() < hd) { /* hd % 32 == 0 when oq is set: whole waves */
     float o = 0.0f;
-    for (u32 t = 0; t < nsplit; t++) o += ph[t * (hd + 2u) + 2u + tid()] * __builtin_expf(ph[t * (hd + 2u)] - M2);
+    for (u32 t = 0; t < nsplit; t++) o += ph[t * (hd + 2u) + 2u + tid()] * at_w[t];
     o = o / L2;
     out[h * hd + tid()] = o;
     if (oq) quant_wave(o, (h * hd + tid()) >> 5, oq, (n_head * hd) >> 5);

@@ -112,11 +112,24 @@ typedef struct {
 /* Activation buffers. Each has a size in bytes and, after planning, an
  * arena offset and a lifetime [first, last] in op indices. */
 #define MAX_BUFS 4096
-/* GPU attention (ie_attn_split): positions per workgroup. The scores buffer
- * of OP_ATTN also holds its partial results: n_head * ceil(n_ctx / IE_ATT_CH)
- * * (hd + 2) floats. ie_attn_split needs hd <= IE_ATT_MAX_HD. */
-#define IE_ATT_CH 32u
+/* GPU attention (ie_attn_split): positions per workgroup at decode position
+ * pos (positions 0 .. pos). Measured on the R9700: chunks of 8 or 16 for
+ * short contexts were not faster at 64 tokens and slower at 512 (the last
+ * workgroup merges more partial results), so the chunk is 32. */
+static inline uint32_t ie_att_ch(uint32_t pos) { (void)pos; return 32u; }
+static inline uint32_t ie_att_nsplit(uint32_t pos) { return (pos + ie_att_ch(pos)) / ie_att_ch(pos); }
+/* The most splits for any position below n_ctx. The scores buffer of OP_ATTN
+ * also holds the partial results: n_head * ie_att_max_split(n_ctx) * (hd + 2)
+ * floats. ie_attn_split needs hd <= IE_ATT_MAX_HD. */
+static inline uint32_t ie_att_max_split(uint32_t n_ctx) {
+  uint32_t mx = 1;
+  for (uint32_t p = 0; p < n_ctx; p++)
+    if (ie_att_nsplit(p) > mx) mx = ie_att_nsplit(p);
+  return mx;
+}
 #define IE_ATT_MAX_HD 256u
+/* ie_attn_split keeps the weights of up to this many splits in LDS. */
+#define IE_ATT_MAX_SPLIT 2048u
 typedef struct {
   const char *name;
   uint32_t size, off, first, last;
