@@ -1,0 +1,32 @@
+[
+  {
+    "url": "https://arxiv.org/abs/2302.01318",
+    "title": "[2302.01318] Accelerating Large Language Model Decoding with Speculative Sampling",
+    "authors": [
+      "Chen, Charlie",
+      "Borgeaud, Sebastian",
+      "Irving, Geoffrey",
+      "Lespiau, Jean-Baptiste",
+      "Sifre, Laurent",
+      "Jumper, John"
+    ],
+    "verified": "official page retrieved",
+    "date": "2026-10-07",
+    "doi_url": "https://doi.org/10.48550/arXiv.2302.01318",
+    "doi_resolves_to": "https://arxiv.org/abs/2302.01318"
+  },
+  {
+    "url": "https://arxiv.org/abs/1609.07843",
+    "title": "[1609.07843] Pointer Sentinel Mixture Models",
+    "authors": [
+      "Merity, Stephen",
+      "Xiong, Caiming",
+      "Bradbury, James",
+      "Socher, Richard"
+    ],
+    "verified": "official page retrieved",
+    "date": "2026-10-07",
+    "doi_url": "https://doi.org/10.48550/arXiv.1609.07843",
+    "doi_resolves_to": "https://arxiv.org/abs/1609.07843"
+  }
+]

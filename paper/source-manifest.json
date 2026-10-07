@@ -1,0 +1,50 @@
+{
+  "commit": "ff3c7f3f465bdfce9a9a2f0050fbac6db6af82fc",
+  "sources": [
+    {
+      "path": "README.md",
+      "sha256": "3028316183dfcfd19aa02addc8828fcf191f65f6ba8ab68e555e42b2a6df52e0"
+    },
+    {
+      "path": "core/ie_core.h",
+      "sha256": "b89f3125d00c5c13051b33ddfc6e9dc835d96d1bd80c6cacaf55fab63d8b2762"
+    },
+    {
+      "path": "laws/ie_laws.cpp",
+      "sha256": "d91b56fb9223c954914b1bb1c4e82c4c8dc59ab1728956020ddc05d76ac81635"
+    },
+    {
+      "path": "proofs/IeProof.lean",
+      "sha256": "2829739b3c50131dce6646a4bc2af4501d92fb6c16e52bcfe394dc5e3b73cd19"
+    },
+    {
+      "path": "proofs/IeLemmas.lean",
+      "sha256": "53c4389f48767e6449a8aa9575cef941ae49a6da9275145eec4eee04aa27a75e"
+    },
+    {
+      "path": "src/main.c",
+      "sha256": "8185f144fed86354807183d5b24c03b1c256cb59fd52993b21e354becb6b7adf"
+    },
+    {
+      "path": "src/model.c",
+      "sha256": "d30d1a50fba12979d51aba50d9922e52192e650c5b21d5b7971e299173bb1e46"
+    },
+    {
+      "path": "src/hip.c",
+      "sha256": "4926148e0a33ad0f9168646fbd815e0d42baee2452d316deeb92f6d6692869b1"
+    },
+    {
+      "path": "src/plan.c",
+      "sha256": "25a71abae64767dff62a2b8ef10126e2f69a68cf5f67b9dce66a3a645bf8f26b"
+    },
+    {
+      "path": "kernels/ie_kernels.c",
+      "sha256": "f279dba0b35182dce470049a3a962e17ebb4a06bb8e59fd7bdc44da04d657785"
+    },
+    {
+      "path": "Makefile",
+      "sha256": "8a6872d66446cd5113d5ce1df983f769a6ddcedcb193c3279caa30815209b972"
+    }
+  ],
+  "results_status": "README-reported; not rerun; raw GPU logs absent"
+}

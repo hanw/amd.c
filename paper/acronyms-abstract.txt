@@ -1,0 +1,10 @@
+### Acronym check (advisory; no reply needed)
+Coverage: English abstract (complete)
+
+| Scope | Line | Rule | Acronym | Uses |
+|---|---|---|---|---|
+| EN abstract | 4 | Not defined | AI | 1 |
+| EN abstract | 4 | Not defined | AMD | 1 |
+| EN abstract | 4 | Not defined | GB | 1 |
+| EN abstract | 4 | Not defined | PRO | 1 |
+| EN abstract | 4 | Not defined | RDNA4 | 1 |

@@ -1,0 +1,19 @@
+### Acronym check (advisory; no reply needed)
+Coverage: body (partial)
+Not checked:
+- Body, line 63: KV (the initials before its parentheses do not spell it)
+- Body, line 147: CRediT (the initials before its parentheses do not spell it)
+
+| Scope | Line | Rule | Acronym | Uses |
+|---|---|---|---|---|
+| Body | 4 | Not defined | GB | 8 |
+| Body | 4 | Not defined | GGUF | 2 |
+| Body | 4 | Not defined | README | 15 |
+| Body | 19 | Not defined | GGML | 1 |
+| Body | 54 | Not defined | SiLU | 1 |
+| Body | 63 | Not defined | NEOX | 1 |
+| Body | 78 | Not defined | AI | 2 |
+| Body | 78 | Not defined | PRO | 1 |
+| Body | 78 | Not defined | ROCm | 1 |
+| Body | 135 | Not defined | MB | 1 |
+| Body | 150 | Not defined | LaTeX | 1 |
