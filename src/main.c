@@ -14,13 +14,14 @@ static void usage(void) {
   fprintf(stderr,
           "usage: ie-run MODEL.gguf [--backend cpu|gpu] [--tokens 1,2,3] [--n 32] [--ctx N]\n"
           "              [--dump-logits FILE] [--hsaco build/ie_kernels.hsaco] [--info]\n"
-          "              [--tokens-file FILE] [--ppl [--ppl-first N]]\n");
+          "              [--tokens-file FILE] [--ppl [--ppl-first N]] [--stop]\n"
+          "  --stop: end the generation at the end-of-sequence token\n");
   exit(2);
 }
 
 int main(int argc, char **argv) {
   const char *path = NULL, *be = "cpu", *toks = "1", *dump = NULL, *hsaco = "build/ie_kernels.hsaco", *tfile = NULL;
-  int n_gen = 32, info = 0, ppl = 0;
+  int n_gen = 32, info = 0, ppl = 0, stop = 0;
   uint32_t ppl_first = 0;
   uint32_t n_ctx = 0;
   for (int i = 1; i < argc; i++) {
@@ -33,6 +34,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--info")) info = 1;
     else if (!strcmp(argv[i], "--tokens-file") && i + 1 < argc) tfile = argv[++i];
     else if (!strcmp(argv[i], "--ppl")) ppl = 1;
+    else if (!strcmp(argv[i], "--stop")) stop = 1;
     else if (!strcmp(argv[i], "--ppl-first") && i + 1 < argc) ppl_first = (uint32_t)atoi(argv[++i]);
     else if (argv[i][0] != '-' && !path) path = argv[i];
     else usage();
@@ -99,6 +101,8 @@ int main(int argc, char **argv) {
   FILE *df = dump ? fopen(dump, "w") : NULL;
   if (dump && !df) ie_die("cannot write %s", dump);
   float *logits = malloc(m.vocab * 4);
+  int64_t eos_v = -1;
+  if (!gguf_get_int(&g, "tokenizer.ggml.eos_token_id", &eos_v)) eos_v = -1;
   uint32_t total = n_prompt + (uint32_t)n_gen, tok = prompt[0], *out = malloc(total * 4);
   double ms_sum = 0, ms_gen = 0, nll = 0;
   uint32_t n_nll = 0;
@@ -123,6 +127,11 @@ int main(int argc, char **argv) {
       fprintf(df, "\n");
     }
     tok = pos + 1 < n_prompt ? prompt[pos + 1] : next;
+    if (stop && pos + 1 >= n_prompt && (int64_t)tok == eos_v) { /* keep the eos token, then end */
+      out[pos + 1] = tok;
+      total = pos + 2;
+      break;
+    }
   }
   if (df) fclose(df);
 

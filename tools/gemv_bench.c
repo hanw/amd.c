@@ -103,7 +103,9 @@ int main(int argc, char **argv) {
   for (unsigned s = 0; s < ns; s++) {
     unsigned rows = argc > 2 ? (unsigned)atoi(argv[2 + 2 * s]) : def[s][0];
     unsigned nb = argc > 2 ? (unsigned)atoi(argv[3 + 2 * s]) : def[s][1];
-    size_t wbytes = (size_t)rows * nb * 16, sbytes = (size_t)rows * nb * 2;
+    /* Q8=1: Q8_0 weights (32 bytes per block; use KERNEL=ie_gemv_q8q8) */
+    const int q8 = getenv("Q8") && getenv("Q8")[0] == '1';
+    size_t wbytes = (size_t)rows * nb * (q8 ? 32 : 16), sbytes = (size_t)rows * nb * 2;
     size_t per = wbytes + sbytes;
     unsigned ncopy = (unsigned)(256u * 1024u * 1024u / per);
     if (ncopy < 2) ncopy = 2;
@@ -135,7 +137,7 @@ int main(int argc, char **argv) {
     CK(H.EventSynchronize(e1));
     float ms = 0;
     CK(H.EventElapsedTime(&ms, e0, e1));
-    double us = ms * 1e3 / iters, mb = (double)rows * nb * 18 / 1e6;
+    double us = ms * 1e3 / iters, mb = (double)rows * nb * (q8 ? 34 : 18) / 1e6;
     printf("%8u %5u %6u %10.2f %9.2f %8.1f\n", rows, nb, groups, mb, us, 1000.0 * mb / us);
     for (unsigned c = 0; c < ncopy; c++) H.Free(qw[c]), H.Free(qs[c]);
     H.Free(xq), H.Free(y);

@@ -600,6 +600,11 @@ static inline float conv_ch(const G float *in, G float *ring, const G float *cw,
 KERNEL ie_gdn(const G float *in, G float *out, G u8 *oq, G float *ring, G float *S, const G float *cw, const G float *dtb,
               const G float *sa, const G float *nw, u32 pos, u32 cd, u32 nk, u32 nv, float eps) {
   const u32 h = wgid(), t = tid(), j = t & 127u, half = t >> 7, kh = h % nk, w = t >> 5, inner = nv * 128u;
+  /* the state loads first: they do not depend on the conv, so their
+   * memory latency overlaps it */
+  G float *Sh = S + (unsigned long)h * 16384u + half * 64u * 128u + j;
+  float st[64];
+  for (u32 ii = 0; ii < 64u; ii++) st[ii] = pos ? Sh[ii * 128u] : 0.0f;
   /* conv + SiLU: threads t < 128 do q (channel kh*128 + j) and v (2 nk 128 +
    * h 128 + j); threads t >= 128 do k (nk 128 + kh 128 + j). The q and k
    * ring slots are written by the workgroup h == kh only. */
@@ -618,11 +623,9 @@ KERNEL ie_gdn(const G float *in, G float *out, G u8 *oq, G float *ring, G float 
   const float sp = al > 20.0f ? al : __builtin_logf(1.0f + __builtin_expf(al));
   const float decay = __builtin_expf(sp * sa[h]);
   barrier();
-  G float *Sh = S + (unsigned long)h * 16384u + half * 64u * 128u + j;
-  float st[64];
   float pk = 0.0f;
   for (u32 ii = 0; ii < 64u; ii++) {
-    st[ii] = pos ? Sh[ii * 128u] * decay : 0.0f;
+    st[ii] = st[ii] * decay;
     pk += st[ii] * gd_k[half * 64u + ii];
   }
   gd_p[half][j] = pk;
