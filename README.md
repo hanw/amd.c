@@ -246,6 +246,48 @@ Qwen3.8-27B Q8_0（ggml-org/Qwen3.8-27B-GGUF，28.6 GB，64 层：48 个线性�
 - 两个模型的分词结果相同（wikitext-2 全文的 token 序列逐个相同）。
 - 聊天模板下，"Explain in two sentences why the sky is blue." 的回答正确（瑞利散射），`--stop` 在 `<|im_end|>` 处停止。
 
+### MTP 推测解码（Qwen3.5 / 3.8）
+
+**MTP**（多 token 预测）：模型自带的一个预测层（GGUF 里的 `blk.N.nextn.*`）。它先猜后面 D 个 token（"草稿"），
+模型再一次验证这 D 个草稿。用法：`--draft D`（D = 1 到 3，只用于 GPU）；`--mtp 文件`：MTP 层在另一个文件里。
+
+一步的做法（`src/main.c`，`spec_generate`）：
+1. MTP 层补算上一步接受的位置（用模型真实的隐藏状态），再从 (h(P−1), t(P)) 猜出 d1。
+2. 用 MTP 层自己的输出 h 和 d1 猜 d2，依此类推到 dD。
+3. 模型一次处理 [t(P), d1, …, dD] 这 D + 1 个 token，权重只读一次（`ie_gemv_q8q8_t`）。
+4. 从 d1 开始，草稿等于模型的贪心结果就接受，第一个不等就停止。所以输出和普通贪心解码逐个 token 相同。
+
+为了能退回到任一个被接受的 token：
+- 线性注意力状态有 4 个槽。第 t 个 token 之后的状态写到槽 (c + t) % 4。
+- 卷积输入环形缓冲区有 8 个槽。
+- KV 缓存按位置覆盖，不需要退回。
+
+已确认：多 token 矩阵向量乘的每个 token 与单 token 核函数的算术和顺序相同，结果逐位相同。
+
+**27B 的 MTP 层**：ggml-org 的 Q8_0 文件没有 MTP 层。unsloth 的 Q8_0 文件有，而且 MTP 张量都在文件末尾。
+所以只用 HTTP 分段请求下载了最后 451 MB，再做成一个只含 MTP 层的 GGUF。
+
+结果（Qwen3.8-27B Q8_0，R9700，贪心，每次生成 300 个 token）。单位：每秒 token 数。
+
+| 提示 | 草稿数 | 本引擎 | 本引擎接受率 | llama.cpp b11222（Vulkan，`--spec-type draft-mtp`） |
+|---|---|---|---|---|
+| 写代码 | 0 | 21.7 | - | 19.6 |
+| 写代码 | 1 | 38.4 | 98.7% | 33.0 |
+| 写代码 | 2 | 51.3 | 97.1% | 44.2 |
+| 写代码 | 3 | **60.1** | 93.2% | 53.2 |
+| 续写 wikitext | 0 | 21.7 | - | 19.4 |
+| 续写 wikitext | 1 | 36.0 | 86.9% | 30.3 |
+| 续写 wikitext | 2 | 45.6 | 81.6% | 37.2 |
+| 续写 wikitext | 3 | **50.6** | 74.2% | 40.0 |
+| 聊天（天空为什么是蓝的） | 3 | 47.5 | 67.3% | - |
+
+- 所有本引擎的结果都和不用草稿时的输出逐个 token 相同（0.8B 和 27B，草稿数 1 到 3）。
+- llama.cpp 的数字来自 `llama-server` 的 `predicted_per_second`（同一请求跑两次，取第二次）。
+  它用的是把 ggml-org 权重和 unsloth 的 MTP 层合并成的一个文件（`qwen35.block_count` = 65，`nextn_predict_layers` = 1）。
+  llama.cpp 的聊天回答在 64 个 token 处结束，所以聊天一行没有对比。
+- 推测：草稿数为 3 时每步约 63 毫秒（不用草稿时每个 token 46 毫秒）。多出的时间主要是 3 次 MTP 预测
+  （每次读 MTP 层 0.45 GB 和输出层 1.35 GB）。
+
 ## 什么被验证、什么被测试、什么没有测试
 
 **被验证（Lean 证明，对所有输入成立，`make proofs` 约 1 分钟）**：`core/ie_core.h` 中的函数满足 `laws/ie_laws.cpp` 的 22 条定律：

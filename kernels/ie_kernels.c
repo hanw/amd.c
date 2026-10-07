@@ -321,18 +321,18 @@ KERNEL ie_gemv_q8q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y
   if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
 }
 
-/* The same GEMV for T <= 3 tokens (speculative decoding: verify several
+/* The same GEMV for T <= 4 tokens (speculative decoding: verify several
  * tokens in one pass). Each weight block is loaded once and used for every
  * token. For each token the arithmetic and its order are those of
  * ie_gemv_q8q8, so token t's result is bitwise the result of a one-token
  * launch. xs: bytes between the Q8 activations of two tokens; ys: floats
  * between the outputs (and the residuals) of two tokens. */
-#define GEMV_T 3u
+#define GEMV_T 4u
 KERNEL ie_gemv_q8q8_t(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                       const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
   const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
   if (r >= rows) return;
-  float acc[GEMV_T] = {0.0f, 0.0f, 0.0f};
+  float acc[GEMV_T] = {0.0f, 0.0f, 0.0f, 0.0f};
   for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
     u32x4 w0[GEMV_U], w1[GEMV_U];
     float sw[GEMV_U];
@@ -633,18 +633,19 @@ KERNEL ie_qkn_rope_kv(const G float *qkv, G float *qo, G float *kc, G float *vc,
   if (t < hd) (is_k ? kc + h * hd : qo + h * hd)[t] = r;
 }
 
-/* Linear attention (Gated DeltaNet) of T <= 3 tokens at positions pos ..
+/* Linear attention (Gated DeltaNet) of T <= 4 tokens at positions pos ..
  * pos + T - 1, one after the other; one workgroup per value head h (key
  * head kh = h % nk), state dims 128 x 128. Token t: in + t * is = [q k v (cd)
  * | z (inner) | beta (nv) | alpha (nv)], inner = nv * 128; output at out +
  * t * os, its Q8 copy at oq + t * qs. ring: the conv inputs of the last 8
- * positions [slot][cd] (slot = position % 8). S: 3 state slots [slot][h][i][j]
+ * positions [slot][cd] (slot = position % 8). S: GDN_SLOTS (4) state slots [slot][h][i][j]
  * (i: key dim, j: value dim); the state is read from slot c and the state
- * after token t is written to slot (c + t) % 3, so that a speculative step
+ * after token t is written to slot (c + t) % 4, so that a speculative step
  * can go back to the state after any of its tokens. Each thread reads and
  * writes only its own state values, so slot c can be overwritten. Thread t:
  * value dim j = t % 128, key dims i of half t / 128. The CPU backend (cpu.c,
  * gdn) does the same arithmetic for one token (slot c = 0). */
+#define GDN_SLOTS 4u
 static LDS float gd_q[128], gd_k[128], gd_v[128], gd_p[2][128], gd_r[8];
 /* conv input of channel c at token u of this launch, or (before the launch)
  * from the ring; 0 before position 0 */
@@ -659,7 +660,7 @@ static inline float conv_ch(const G float *in, u32 is, G float *ring, const G fl
   for (u32 j = 0; j < 4u; j++) /* oldest first, as ggml_ssm_conv */
     acc += conv_in(in, is, ring, c, t, 3u - j, pos, cd) * cw[c * 4u + j];
   /* slot (pos + t) % 8: no workgroup reads it in this launch (reads of the
-   * ring are of positions < pos, at least 6 slots away) */
+   * ring are of positions pos - 3 .. pos - 1; writes of pos .. pos + 3) */
   if (writer) ring[((pos + t) & 7u) * cd + c] = in[t * is + c];
   return acc / (1.0f + __builtin_expf(-acc));
 }
@@ -702,7 +703,7 @@ KERNEL ie_gdn(const G float *in, G float *out, G u8 *oq, G float *ring, G float 
     const float delta = (gd_v[j] - (gd_p[0][j] + gd_p[1][j])) * beta;
     barrier();
     float po = 0.0f;
-    G float *Sw = S + ((c + t) % 3u) * slot + own;
+    G float *Sw = S + ((c + t) % GDN_SLOTS) * slot + own;
     for (u32 ii = 0; ii < 64u; ii++) {
       st[ii] += gd_k[half * 64u + ii] * delta;
       Sw[ii * 128u] = st[ii];

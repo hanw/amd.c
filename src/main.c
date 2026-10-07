@@ -21,16 +21,16 @@ static double now_ms(void) {
  * Positions < P are done in the model and in the MTP KV cache (MTP position
  * q holds the pair (h(q-1), token q), h = the model's normed final hidden
  * state). A step: (1) the MTP head catches up the tokens accepted in the last
- * step with their true h and drafts d1 from (h(P-1), t(P)); (2) for D = 2 it
- * drafts d2 from (its own h, d1); (3) the model runs [t(P), d1, .., dD] at
+ * step with their true h and drafts d1 from (h(P-1), t(P)); (2) for D >= 2 it
+ * drafts d2 from (its own h, d1), and so on; (3) the model runs [t(P), d1, .., dD] at
  * P .. P + D in one pass (the weights read once) and gives the greedy token
  * a_j after each; (4) d_j is accepted while d_j == a_(j-1). So the output is
  * exactly the plain greedy output. The linear attention state after the
- * last accepted token is in slot (slot + k) % 3 (ie_gdn). out[0 .. n_prompt)
+ * last accepted token is in slot (slot + k) % 4 (ie_gdn). out[0 .. n_prompt)
  * is the prompt; returns the number of tokens in out. */
 static uint32_t spec_generate(backend *b, const graph *g, uint32_t *out, uint32_t n_prompt, uint32_t total, uint32_t D,
                               int64_t eos, int stop, double *gen_ms, uint32_t *n_steps, uint32_t *n_acc) {
-  uint32_t a[4], d[4], tk[4];
+  uint32_t a[5], d[5], tk[5];
   /* the prompt: the model and the MTP head, one token at a time */
   for (uint32_t p = 0; p < n_prompt; p++) {
     if (p == 0) b->copy_rows(b, g->mtp_h, 0, -1, 0, 1); /* h(-1) = 0, as llama.cpp */
@@ -68,7 +68,7 @@ static uint32_t spec_generate(backend *b, const graph *g, uint32_t *out, uint32_
     }
     for (uint32_t j = 1; j <= k && n < total; j++) out[n++] = d[j];
     if (n < total) out[n++] = a[k];
-    slot = (slot + k) % 3u;
+    slot = (slot + k) % 4u; /* GDN_SLOTS */
     P += k + 1;
     tP = a[k];
     (*n_steps)++, *n_acc += k;
@@ -87,7 +87,7 @@ static void usage(void) {
           "              [--tokens-file FILE] [--ppl [--ppl-first N]] [--stop]\n"
           "              [--draft D [--mtp FILE]]\n"
           "  --stop: end the generation at the end-of-sequence token\n"
-          "  --draft D: speculative decoding with the model's MTP head, D = 1 or 2 drafts per step (GPU);\n"
+          "  --draft D: speculative decoding with the model's MTP head, D = 1 to 3 drafts per step (GPU);\n"
           "             --mtp FILE: the MTP head from FILE (default: the model file)\n");
   exit(2);
 }
@@ -161,7 +161,7 @@ int main(int argc, char **argv) {
   model_load(&m, &g);
   gguf_file g2;
   if (draft) {
-    if (draft > 2 || ppl || dump || strcmp(be, "gpu")) ie_die("--draft: 1 or 2, GPU only, not with --ppl or --dump-logits");
+    if (draft > 3 || ppl || dump || strcmp(be, "gpu")) ie_die("--draft: 1 to 3, GPU only, not with --ppl or --dump-logits");
     if (mtp_path) gguf_open(&g2, mtp_path);
     if (!model_load_mtp(&m, mtp_path ? &g2 : &g)) ie_die("no MTP head (blk.N.nextn.*) in %s", mtp_path ? mtp_path : path);
   }

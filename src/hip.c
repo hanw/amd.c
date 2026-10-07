@@ -83,7 +83,7 @@ static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "i
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
                                  "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
-enum { GDN_RING = 8, GDN_SLOTS = 3 };
+enum { GDN_RING = 8, GDN_SLOTS = 4 }; /* as in ie_kernels.c */
 /* The argmax kernel: workgroups, and its device scratch (partial results and
  * the counter of finished workgroups). */
 enum { ARGMAX_GROUPS = 128 };
@@ -535,7 +535,7 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
   if (sec == 1 && g->mtp_argmax < 0) ie_die("the graph has no MTP ops");
   run_ops(b, sec ? g->n_main : 0, sec ? g->n_ops : g->n_main, toks, T, pos, slot);
   const buf *am = &g->bufs[sec ? g->mtp_argmax : g->argmax];
-  u32 tmp[3 * 64];
+  u32 tmp[4 * 64];
   HIP(H.Memcpy(tmp, b->arena + am->off, (size_t)T * am->stride, hipMemcpyDeviceToHost));
   for (u32 t = 0; t < T; t++) out[t] = tmp[t * am->stride / 4u];
 }
