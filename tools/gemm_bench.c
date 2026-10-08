@@ -37,9 +37,20 @@ int main(int argc, char **argv) {
   for (unsigned s = 0; s < ns; s++) {
     unsigned rows = argc > 3 ? (unsigned)atoi(argv[3 + 2 * s]) : def[s][0], nb = argc > 3 ? (unsigned)atoi(argv[4 + 2 * s]) : def[s][1];
     size_t wb = (size_t)rows * nb * 32 + 64, sb = (size_t)rows * nb * 4, /* 4: room for the MAT_Q4K / Q6K scales */ xs = ((size_t)nb * 40 + 255) & ~(size_t)255;
-    void *qw, *qs, *xq, *y;
-    Malloc(&qw, wb); Malloc(&qs, sb); Malloc(&xq, xs * T); Malloc(&y, (size_t)rows * 4 * T);
-    Memset(qw, 0x5A, wb); Memset(qs, 0x11, sb); Memset(xq, 0x03, xs * T);
+    /* NCOPY copies of the weights (about 512 MB in all), one per launch in
+     * turn: the weights come from memory, not from the 64 MB cache */
+    unsigned nc = (unsigned)(512ull * 1024 * 1024 / (wb + sb));
+    if (nc < 1) nc = 1;
+    if (nc > 64) nc = 64;
+    if (getenv("NOCOPY")) nc = 1;
+    void *qwc[64], *qsc[64], *xq, *y;
+    for (unsigned c = 0; c < nc; c++) {
+      Malloc(&qwc[c], wb); Malloc(&qsc[c], sb);
+      Memset(qwc[c], 0x5A, wb); Memset(qsc[c], 0x11, sb);
+    }
+    void *qw = qwc[0], *qs = qsc[0];
+    Malloc(&xq, xs * T); Malloc(&y, (size_t)rows * 4 * T);
+    Memset(xq, 0x03, xs * T);
     unsigned xsu = (unsigned)xs, ys = rows, rs = 0;
     void *nul = NULL;
     void *args[] = {&qw, &qs, &xq, &y, &rows, &nb, &nul, &nul, &T, &xsu, &ys, &rs};
@@ -53,6 +64,7 @@ int main(int argc, char **argv) {
     const int it = 20;
     for (int i = -3; i < it; i++) {
       if (i == 0) EvR(e0, NULL);
+      qw = qwc[(unsigned)(i + 3) % nc], qs = qsc[(unsigned)(i + 3) % nc];
       Launch(k, g, 1, 1, 256, 1, 1, 0, NULL, args, NULL);
     }
     EvR(e1, NULL); EvS(e1);
@@ -60,7 +72,8 @@ int main(int argc, char **argv) {
     double us = ms * 1e3 / it, mac = (double)rows * nb * 32 * T;
     tot += us;
     printf("%8u %5u %5u %7u %9.1f %9.1f\n", rows, nb, T, g, us, mac / us / 1e6);
-    Free(qw); Free(qs); Free(xq); Free(y);
+    for (unsigned c = 0; c < nc; c++) Free(qwc[c]), Free(qsc[c]);
+    Free(xq); Free(y);
   }
   printf("sum %.1f us\n", tot);
   return 0;

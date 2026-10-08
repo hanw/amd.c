@@ -529,7 +529,13 @@ void model_load(model *m, gguf_file *g) {
       load_mat(&L->wbeta, g, NAME("ssm_beta.weight"), m->n_vh, m->dim, &m->weight_bytes, 1);
       load_mat(&L->walpha, g, NAME("ssm_alpha.weight"), m->n_vh, m->dim, &m->weight_bytes, 1);
       mat *in4[4] = {&L->wlqkv, &L->wz, &L->wbeta, &L->walpha};
-      concat_mats(&L->win, in4, 4);
+      if (!concat_mats(&L->win, in4, 4)) { /* kinds differ (Q4_K_M: F32 beta, alpha): at least [beta; alpha] in one matrix */
+        mat ba, *in2[2] = {&L->wbeta, &L->walpha};
+        if (concat_mats(&ba, in2, 2)) {
+          L->wbeta = ba; /* walpha: rows 0 (merged into wbeta) */
+          L->walpha.rows = 0;
+        }
+      }
       load_vec(&L->conv, g, NAME("ssm_conv1d.weight"), m->conv_dim * m->d_conv, 0);
       load_vec(&L->dt_bias, g, NAME("ssm_dt.bias"), m->n_vh, 0);
       load_vec(&L->ssm_a, g, NAME("ssm_a"), m->n_vh, 0);
@@ -991,7 +997,7 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx, uint32_t T, int mtp) 
         matvec_into(&B, &L->wlqkv, xn, xq, lin, 0, "lqkv", NULL, -1);
         matvec_into(&B, &L->wz, xn, xq, lin, cd * 4, "z", NULL, -1);
         matvec_into(&B, &L->wbeta, xn, xq, lin, (cd + inner) * 4, "beta", NULL, -1);
-        matvec_into(&B, &L->walpha, xn, xq, lin, (cd + inner + m->n_vh) * 4, "alpha", NULL, -1);
+        if (L->walpha.rows) matvec_into(&B, &L->walpha, xn, xq, lin, (cd + inner + m->n_vh) * 4, "alpha", NULL, -1);
       }
       int go = new_buf(g, "gdn", inner * 4);
       o = emit(&B, OP_GDN, lin, go, -1), o->n = inner;

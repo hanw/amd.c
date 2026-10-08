@@ -105,7 +105,10 @@ int main(int argc, char **argv) {
     unsigned nb = argc > 2 ? (unsigned)atoi(argv[3 + 2 * s]) : def[s][1];
     /* Q8=1: Q8_0 weights (32 bytes per block; use KERNEL=ie_gemv_q8q8) */
     const int q8 = getenv("Q8") && getenv("Q8")[0] == '1';
-    size_t wbytes = (size_t)rows * nb * (q8 ? 32 : 16), sbytes = (size_t)rows * nb * 2;
+    /* KIND=q4k / q6k: MAT_Q4K (18 bytes per block) / MAT_Q6K (26.25) weights */
+    const char *kd = getenv("KIND") ? getenv("KIND") : "";
+    const int q4k = kd[0] == 'q' && kd[1] == '4', q6k = kd[0] == 'q' && kd[1] == '6';
+    size_t wbytes = (size_t)rows * nb * (q8 ? 32 : q6k ? 24 : 16), sbytes = (size_t)rows * nb * 3;
     size_t per = wbytes + sbytes;
     unsigned ncopy = (unsigned)(256u * 1024u * 1024u / per);
     if (ncopy < 2) ncopy = 2;
@@ -137,7 +140,8 @@ int main(int argc, char **argv) {
     CK(H.EventSynchronize(e1));
     float ms = 0;
     CK(H.EventElapsedTime(&ms, e0, e1));
-    double us = ms * 1e3 / iters, mb = (double)rows * nb * (q8 ? 34 : 18) / 1e6;
+    double us = ms * 1e3 / iters, mb = (double)rows * nb * (q8 ? 34 : q6k ? 26.25 : 18) / 1e6;
+    (void)q4k;
     printf("%8u %5u %6u %10.2f %9.2f %8.1f\n", rows, nb, groups, mb, us, 1000.0 * mb / us);
     for (unsigned c = 0; c < ncopy; c++) H.Free(qw[c]), H.Free(qs[c]);
     H.Free(xq), H.Free(y);
