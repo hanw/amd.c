@@ -37,6 +37,7 @@ make build/ie-serve build/ie_kernels.hsaco
 | `--chunk N` | 256 | 预填充每块的 token 数（1 到 512） |
 | `--temp T`、`--top-k K`、`--top-p P` | 0.7、20、0.8 | 请求没有给出这些参数时使用 |
 | `--no-think` | 关 | 提示末尾加一个空的 `<think></think>`，模型不输出推理过程 |
+| `--effort E` | xhigh | 思考时的推理强度：xhigh、medium、low（模板里的 reasoning_effort） |
 | `--queue N` | 8 | 最多排队的请求数。超过时返回 HTTP 503 |
 | `--show-template` | - | 打印模型文件里的聊天模板，然后退出 |
 
@@ -46,10 +47,15 @@ make build/ie-serve build/ie_kernels.hsaco
 |---|---|
 | `GET /health` | 返回 `{"status":"ok"}`。不检查密钥 |
 | `GET /v1/models` | 返回一个模型 |
-| `POST /v1/chat/completions` | 聊天。支持 `messages`、`stream`、`stream_options.include_usage`、`max_tokens`（或 `max_completion_tokens`）、`temperature`、`top_p`、`top_k`、`seed`、`chat_template_kwargs.enable_thinking` |
+| `POST /v1/chat/completions` | 聊天。支持 `messages`、`stream`、`stream_options.include_usage`、`max_tokens`（或 `max_completion_tokens`）、`temperature`、`top_p`、`top_k`、`seed`、`reasoning_effort`、`chat_template_kwargs.enable_thinking` |
 
 `messages` 的角色只能是 system、user、assistant（developer 当作 system）。内容只能是文字。
-在 assistant 消息里，服务删除最后一个 `</think>` 之前的文字。Qwen3 的模板也这样做。
+
+服务按模型文件里的模板（`--show-template`）生成提示，只是不处理工具和图片：
+
+- 思考打开时，提示开头有一条 system 消息，内容是推理强度说明（medium 时没有）。
+- 提示以 `<|im_start|>assistant\n<think>\n` 结束。所以服务在回答的开头补上 `<think>\n`，客户端能看到完整的 `<think>…</think>` 块。
+- 以前的回答写成 `<think>\n推理\n</think>\n\n回答`。推理来自 `reasoning_content` 字段，或者来自内容里 `</think>` 之前的文字（Open WebUI 的格式）。
 
 例子：
 
@@ -83,18 +89,14 @@ docker run -d --network host --restart always --name open-webui \
 3. 你运行 `sudo systemctl daemon-reload && sudo systemctl enable --now ie-serve`。
 4. 你用 `journalctl -u ie-serve -f` 看日志。每个请求有一行：提示 token 数、预填充速度、输出速度、MTP 每步 token 数。
 
-## 6. 第一次在 GPU 上运行前的检查
+## 6. GPU 上的检查结果（2026-10-08，amd-gpu-host）
 
-以下几项只在 CPU 上测试过，GPU 路径还没有运行过。
+1. `ie-run` 的输出不变：917db85 和新代码在三种设置下的 `ids:` 完全相同（不用草稿；7 个草稿；7 个草稿加采样）。
+2. 提示与官方模板相同：4 段对话（思考打开、关闭、多轮加 low、medium）用 Jinja 渲染模板，
+   再用 llama.cpp b11222 的 `llama-tokenize` 分词。结果与 ie-serve 的提示 ID 逐个相同。
+3. 生成：中文聊天（3 个草稿）每秒 51 个 token，写代码每秒 78 个 token。客户端断开后，生成会停止。
 
-1. **`ie-run` 的输出不变。** 采样、预填充和 MTP 的代码从 `main.c` 移到了 `gen.c`，只加了一个回调参数。
-   请用旧的提交和新的提交各运行一次，比较 `ids:` 行：
-   `./build/ie-run MODEL --backend gpu --tokens-file ~/q35/code_ids.txt --n 300 --draft 7 --stop`
-2. **聊天模板。** 运行 `./build/ie-serve MODEL --show-template`，确认 Qwen3.8 使用 ChatML。
-   特别确认：生成提示是否需要以 `<think>\n` 开头。服务现在只写 `<|im_start|>assistant\n`。
-3. **分词。** 运行 `./build/tok_check MODEL --text "你好，world 123"`，
-   再运行 llama.cpp 的 `llama-tokenize -m MODEL -p "你好，world 123" --ids`，比较两组 ID。
-   也可以设置 `IE_SERVE_DEBUG=1`，服务会打印每个请求的提示 ID。
+以后修改模板代码时，可以设置 `IE_SERVE_DEBUG=1`，服务会打印每个请求的提示 ID，用来重复第 2 项检查。
 
 ## 7. 分词器
 

@@ -36,14 +36,14 @@
 
 /* ---- options ---- */
 typedef struct {
-  const char *path, *backend, *hsaco, *host, *api_key, *mtp, *name;
+  const char *path, *backend, *hsaco, *host, *api_key, *mtp, *name, *effort;
   int port, think, queue_max;
   uint32_t ctx, draft, chunk, top_k, max_body;
   float pmin, temp, top_p;
 } options;
 
 static options O = {
-    .backend = "gpu", .hsaco = "build/ie_kernels.hsaco", .host = "127.0.0.1", .port = 8000, .think = 1, .queue_max = 8,
+    .effort = "xhigh", .backend = "gpu", .hsaco = "build/ie_kernels.hsaco", .host = "127.0.0.1", .port = 8000, .think = 1, .queue_max = 8,
     .ctx = 8192, .draft = 0, .chunk = 256, .top_k = 20, .max_body = 4u << 20, .pmin = 0.6f, .temp = 0.7f, .top_p = 0.8f,
 };
 
@@ -62,6 +62,7 @@ static void usage(void) {
           "  --chunk N           prompt chunk, 1 to 512 (GPU; default 256)\n"
           "  --temp T --top-k K --top-p P   defaults when a request does not set them (0.7, 20, 0.8)\n"
           "  --no-think          end the prompt with an empty <think></think> block (no reasoning text)\n"
+          "  --effort E          reasoning effort when thinking: xhigh (default), medium, low\n"
           "  --queue N           the most waiting requests (default 8; more: HTTP 503)\n"
           "  --show-template     print the chat template of the model file and exit\n");
   exit(2);
@@ -93,6 +94,7 @@ typedef struct job {
   sbuf pend, content; /* bytes not yet sent (a cut UTF-8 sequence), the whole text (not streaming) */
   uint32_t n_tok;     /* output tokens, without the stop token */
   int finish;         /* 0: length, 1: stop, 2: client gone */
+  int think;          /* the prompt ends with <think>\n: the answer text starts with it too */
   int dead;           /* a write failed */
 } job;
 
@@ -218,6 +220,10 @@ static void run_job(job *j) {
     const char *h = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     if (send_all(j->fd, h, strlen(h))) return;
     sse_chunk(j, NULL, 0, NULL); /* the role */
+  }
+  if (j->think) { /* the prompt opened <think>: the client sees the whole block (Open WebUI folds it) */
+    sb_add(&j->pend, "<think>\n", 8);
+    out_text(j, j->pend.n);
   }
   j->gp.emit = on_tokens, j->gp.ctx = j;
   gen_stats st;
@@ -408,25 +414,57 @@ static int content_text(const jval *c, sbuf *out) {
   return 1;
 }
 
-/* The Qwen (ChatML) chat template, as tokens:
- *   <|im_start|>ROLE\nCONTENT<|im_end|>\n   per message, then
- *   <|im_start|>assistant\n   (and an empty <think></think> block if no thinking)
- * The content is tokenized without control tokens, so a user cannot write
- * <|im_start|> into the prompt. In assistant messages, the text up to the
- * last </think> is removed, as the Qwen3 template does. 0 and a message in
- * err if a message is not valid. */
-static int chat_prompt(const jval *msgs, int think, tok_ids *out, char *err, size_t errn) {
+/* Strip ASCII white space at both ends (as Jinja's trim for this text). */
+static void trim_ws(const char **s, size_t *n) {
+  while (*n && strchr(" \t\n\r\v\f", (*s)[0])) (*s)++, (*n)--;
+  while (*n && strchr(" \t\n\r\v\f", (*s)[*n - 1])) (*n)--;
+}
+
+/* <|im_start|> TEXT <|im_end|> \n, with TEXT tokenized without control
+ * tokens (a user cannot write <|im_start|> into the prompt) */
+static void turn(tok_ids *out, const sbuf *text, int close) {
+  tok_ids_push(out, (uint32_t)IM_START);
+  tok_encode(TK, text->p ? text->p : "", text->n, 0, out);
+  if (close) {
+    tok_ids_push(out, (uint32_t)IM_END);
+    tok_encode(TK, "\n", 1, 0, out);
+  }
+}
+
+/* The reasoning_effort instruction of the Qwen3.8 template ("" for medium). */
+static const char *effort_text(const char *e) {
+  if (!strcmp(e, "low") || !strcmp(e, "minimal"))
+    return "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without "
+           "unnecessary elaboration.";
+  if (!strcmp(e, "medium")) return "";
+  return "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider "
+         "plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+}
+
+/* The chat template of the Qwen3.8 GGUF (tokenizer.chat_template; ie-serve
+ * --show-template), without tools and images, as tokens:
+ *   [<|im_start|>system\n(EFFORT\n\n)SYSTEM<|im_end|>\n]   (thinking on: always, for EFFORT)
+ *   <|im_start|>user\nTEXT<|im_end|>\n
+ *   <|im_start|>assistant\n<think>\nREASONING\n</think>\n\nTEXT<|im_end|>\n
+ *   <|im_start|>assistant\n<think>\n              (thinking off: <think>\n\n</think>\n\n)
+ * Contents are trimmed. For an earlier answer, REASONING is its
+ * "reasoning_content", or the text before </think> in its content (Open
+ * WebUI). 0 and a message in err if the messages are not valid. */
+static int chat_prompt(const jval *msgs, int think, const char *effort, tok_ids *out, char *err, size_t errn) {
   if (!msgs || msgs->t != J_ARR || !msgs->kid) { snprintf(err, errn, "\"messages\" must be a non-empty array"); return 0; }
-  for (const jval *m = msgs->kid; m; m = m->next) {
+  const char *ri = think ? effort_text(effort) : "";
+  int n_user = 0, first = 1;
+  for (const jval *m = msgs->kid; m; m = m->next, first = 0) {
     const jval *role = json_get(m, "role");
     if (!role || role->t != J_STR) { snprintf(err, errn, "a message has no \"role\""); return 0; }
-    const char *r = role->str;
-    if (!strcmp(r, "developer")) r = "system";
+    const char *r = !strcmp(role->str, "developer") ? "system" : role->str;
     if (strcmp(r, "system") && strcmp(r, "user") && strcmp(r, "assistant")) {
       snprintf(err, errn, "role \"%.40s\" is not supported (system, user, assistant)", role->str);
       return 0;
     }
-    sbuf c = {0};
+    if (!strcmp(r, "system") && !first) { snprintf(err, errn, "a system message must be the first message"); return 0; }
+    n_user += !strcmp(r, "user");
+    sbuf c = {0}, s = {0};
     if (!content_text(json_get(m, "content"), &c)) {
       sb_free(&c);
       snprintf(err, errn, "only text content is supported");
@@ -434,27 +472,47 @@ static int chat_prompt(const jval *msgs, int think, tok_ids *out, char *err, siz
     }
     const char *text = c.p ? c.p : "";
     size_t tn = c.n;
-    if (!strcmp(r, "assistant")) { /* drop the reasoning of earlier answers */
-      const char *e = NULL;
-      for (const char *p = text; (p = strstr(p, "</think>")); p++) e = p;
-      if (e) {
-        tn -= (size_t)(e + 8 - text), text = e + 8;
-        while (tn && (*text == '\n' || *text == ' ')) text++, tn--;
+    if (!strcmp(r, "system")) {
+      trim_ws(&text, &tn);
+      if (tn || ri[0]) {
+        sb_puts(&s, "system\n");
+        if (ri[0]) sb_puts(&s, ri), sb_puts(&s, tn ? "\n\n" : "");
+        sb_add(&s, text, tn);
+        turn(out, &s, 1);
       }
+    } else {
+      if (first && ri[0]) { /* no system message: the effort alone */
+        sb_puts(&s, "system\n"), sb_puts(&s, ri);
+        turn(out, &s, 1);
+        s.n = 0;
+      }
+      if (!strcmp(r, "user")) {
+        trim_ws(&text, &tn);
+        sb_puts(&s, "user\n"), sb_add(&s, text, tn);
+      } else {
+        const char *rs = "";
+        size_t rn = 0;
+        const jval *rc = json_get(m, "reasoning_content");
+        const char *e = NULL;
+        for (const char *p = text; (p = strstr(p, "</think>")); p++) e = p;
+        if (e) { /* Open WebUI style: <think>REASONING</think>TEXT */
+          rs = text, rn = (size_t)(e - text);
+          trim_ws(&rs, &rn);
+          if (rn >= 7 && !memcmp(rs, "<think>", 7)) rs += 7, rn -= 7;
+          tn -= (size_t)(e + 8 - text), text = e + 8;
+        } else if (rc && rc->t == J_STR) rs = rc->str, rn = rc->slen;
+        trim_ws(&rs, &rn), trim_ws(&text, &tn);
+        sb_puts(&s, "assistant\n<think>\n"), sb_add(&s, rs, rn), sb_puts(&s, "\n</think>\n\n"), sb_add(&s, text, tn);
+      }
+      turn(out, &s, 1);
     }
-    sbuf s = {0};
-    sb_puts(&s, r);
-    sb_add(&s, "\n", 1);
-    sb_add(&s, text, tn);
-    tok_ids_push(out, (uint32_t)IM_START);
-    tok_encode(TK, s.p, s.n, 0, out);
-    tok_ids_push(out, (uint32_t)IM_END);
-    tok_encode(TK, "\n", 1, 0, out);
     sb_free(&s), sb_free(&c);
   }
-  tok_ids_push(out, (uint32_t)IM_START);
-  tok_encode(TK, "assistant\n", 10, 0, out);
-  if (!think) tok_encode(TK, "<think>\n\n</think>\n\n", 19, 0, out);
+  if (!n_user) { snprintf(err, errn, "no user message"); return 0; }
+  sbuf g = {0};
+  sb_puts(&g, think ? "assistant\n<think>\n" : "assistant\n<think>\n\n</think>\n\n");
+  turn(out, &g, 0);
+  sb_free(&g);
   return 1;
 }
 
@@ -497,8 +555,13 @@ static void handle_chat(int fd, const request *r) {
   int think = O.think;
   const jval *kw = json_get(root, "chat_template_kwargs"), *et = json_get(kw, "enable_thinking");
   if (et && (et->t == J_TRUE || et->t == J_FALSE)) think = et->t == J_TRUE;
+  const char *effort = O.effort;
+  const jval *ef = json_get(root, "reasoning_effort");
+  if (!ef || ef->t != J_STR) ef = json_get(kw, "reasoning_effort");
+  if (ef && ef->t == J_STR) effort = ef->str;
+  j->think = think;
 
-  if (!chat_prompt(json_get(root, "messages"), think, &j->prompt, err, sizeof err)) {
+  if (!chat_prompt(json_get(root, "messages"), think, effort, &j->prompt, err, sizeof err)) {
     http_error(fd, 400, "invalid_request_error", "%s", err);
     goto bad;
   }
@@ -610,6 +673,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--top-k")) O.top_k = (uint32_t)atoi(ARG);
     else if (!strcmp(a, "--top-p")) O.top_p = (float)atof(ARG);
     else if (!strcmp(a, "--no-think")) O.think = 0;
+    else if (!strcmp(a, "--effort")) O.effort = ARG;
     else if (!strcmp(a, "--queue")) O.queue_max = atoi(ARG);
     else if (!strcmp(a, "--show-template")) show_template = 1;
     else if (a[0] != '-' && !O.path) O.path = a;
