@@ -82,12 +82,28 @@ docker run -d --network host --restart always --name open-webui \
 
 如果 ie-serve 设置了 `--api-key`，请把 `OPENAI_API_KEY` 改成同一个密钥。
 
+amd-gpu-host 上的容器另外加了 `-e ENABLE_OLLAMA_API=false -e ENABLE_TAGS_GENERATION=false -e ENABLE_FOLLOW_UP_GENERATION=false -e ENABLE_AUTOCOMPLETE_GENERATION=false`。
+原因：ie-serve 一次只运行一个请求，这些后台任务会让聊天排队。标题生成仍然打开。
+
+注意：Open WebUI 第一次启动时会下载一个文本向量模型，下载慢时要等 5 到 10 分钟，8080 端口才会打开。
+
 ## 5. 开机自动启动（systemd）
+
+**没有 sudo 时（amd-gpu-host 现在用这种）：用户级服务。**
+
+1. 你把 `tools/ie-serve.service` 的 `[Service]` 和 `[Install]` 部分写到 `~/.config/systemd/user/ie-serve.service`，删掉 `User=` 行，把 `WantedBy` 改成 `default.target`。
+2. 你运行 `systemctl --user daemon-reload && systemctl --user enable --now ie-serve`。
+3. 你运行 `loginctl enable-linger $USER`。这样没有登录时服务也运行，开机后自动启动。
+4. 你用 `journalctl --user -u ie-serve -f` 看日志。
+
+**有 sudo 时：系统级服务。**
 
 1. 你修改 `tools/ie-serve.service` 里的用户和路径。
 2. 你运行 `sudo cp tools/ie-serve.service /etc/systemd/system/`。
 3. 你运行 `sudo systemctl daemon-reload && sudo systemctl enable --now ie-serve`。
-4. 你用 `journalctl -u ie-serve -f` 看日志。每个请求有一行：提示 token 数、预填充速度、输出速度、MTP 每步 token 数。
+4. 你用 `journalctl -u ie-serve -f` 看日志。
+
+每个请求在日志里有一行：提示 token 数、预填充速度、输出速度、MTP 每步 token 数。
 
 ## 6. GPU 上的检查结果（2026-10-08，amd-gpu-host）
 
