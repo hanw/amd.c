@@ -49,6 +49,9 @@ int main() {
     CHECK("q4k_addr", law_q4k_addr(rows, nbk, r, bk, small(5), small(34)));
     CHECK("q4k_inverse", law_q4k_inverse(rows, nbk, r, bk, small(5)));
     CHECK("q4k_onto", law_q4k_onto(rows, nbk, small(rows * nbk * 4u + 3u)));
+    CHECK("q6k_addr", law_q6k_addr(rows, nbk, r, bk, small(5), small(3), small(34)));
+    CHECK("q6k_unpack", law_q6k_unpack(r32(), r32(), r32(), r32(), r32(), r32(), r32(), r32(), r32(), r32(), r32(), r32(), r32(),
+                                       r32(), r32(), r32(), small(18)));
     CHECK("q4k_nibble", law_q4k_nibble(r32(), r32(), r32(), r32(), r32(), r32(), r32(), r32(), edge(), small(34)));
   }
   // Memory arrays.
@@ -63,6 +66,17 @@ int main() {
     CHECK("q4q8_block", law_q4q8_block(q, small(32), a, small(32)));
     CHECK("q8q8_block", law_q8q8_block(q, small(32), a, small(32)));
     CHECK("q4k_dot", law_q4k_dot(q, small(32), a, small(32)));
+    CHECK("q6k_dot", law_q6k_dot(q, small(32), a, small(32), a, small(32), small(3)));
+    CHECK("q6k_dots", law_q6k_dots(q, small(32), a, small(32), a, small(32), small(3)));
+    {
+      static u32 us[16], ss[8];
+      const u32 qb = small(32), hb = small(32), h = small(2);
+      for (u32 k = 0; k < 4; k++) us[2 * k] = ie_q4k_lo(qs[qb + k]), us[2 * k + 1] = ie_q4k_hi(qs[qb + k]);
+      for (u32 k = 0; k < 4; k++) ss[k] = ie_q6k_sw(qs[qb + k], as[hb], h, k);
+      Mem u{us}, sw{ss};
+      CHECK("q4k_dot_u", law_q4k_dot_u(q, qb, u, 0u, a, small(32)));
+      CHECK("q6k_dots_s", law_q6k_dots_s(q, qb, a, hb, sw, 0u, a, small(32), h));
+    }
   }
   // Plans: random small plans; the laws must hold when the checker accepts.
   int accepted = 0;

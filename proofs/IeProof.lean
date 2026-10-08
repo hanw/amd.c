@@ -488,4 +488,131 @@ theorem q4k_dot : Laws.q4k_dot := by
   grind
 
 
+
+-- 7. The Q6_K path (MAT_Q6K)
+
+theorem q6k_unpack : Laws.q6k_unpack := by
+  intro a0 a1 a2 a3 b0 b1 b2 b3 c0 c1 c2 c3 d0 d1 d2 d3 e
+  simp only [law_q6k_unpack, ie_q6k_q, ie_q4_nib, ie_pack4, ie_q6k_hpack, ie_q6k_h2]; bv_decide
+
+theorem vw_byte (W H h k i : U32) (hh : h < 2#32) (hk : k < 4#32) (hi : i < 4#32) :
+    ie_byte (ie_q6k_vw W H h k) i = ie_q6k_q W H (16#32 * h + 4#32 * k + i) := by
+  simp only [ie_byte, ie_q6k_vw, ie_q6k_q, ie_q4_nib]; bv_decide
+
+
+theorem q6k_dot : Laws.q6k_dot := by
+  intro qw qb hw hb aw ab h
+  unfold law_q6k_dot
+  cases hh : BitVec.ult h 2#32 <;> simp only [Bool.not_false, Bool.true_or, Bool.not_true, Bool.false_or, beq_iff_eq]
+  have hh' : h = 0#32 ∨ h = 1#32 := by have := BitVec.ult_iff_lt.mp hh; bv_omega
+  rcases hh' with rfl | rfl
+  all_goals
+    have one : ∀ i : U32, i < 4#32 → ie_sext8 (ie_byte 16843009#32 i) = 1#32 := by
+      intro i hi; simp only [ie_sext8, ie_byte]; bv_decide
+    simp only [ie_q6k_dot, ie_dot4_us, ie_dot4_ss, ie_q8_hsum, ie_q6k_spec, BitVec.toNat_ofNat, Nat.reduceMod]
+    simp (disch := decide) only [one, BitVec.mul_one]
+    simp (disch := decide) only [vw_byte, BitVec.reduceMul, BitVec.reduceAdd]
+    simp only [ie_q6k_spec.go, ie_q6k_term, ie_q4_word_of, BitVec.reduceULT, BitVec.reduceAdd, BitVec.reduceSub,
+      BitVec.reduceAnd, BitVec.reduceMul, BitVec.reduceHShiftRight, Bool.cond_true, Bool.cond_false, BitVec.add_zero,
+      BitVec.zero_add, BitVec.zero_mul, BitVec.mul_zero]
+    simp only [BitVec.add_assoc, BitVec.reduceAdd]
+    generalize Mem.load qw qb = w0
+    generalize Mem.load qw (qb + 1#32) = w1
+    generalize Mem.load qw (qb + 2#32) = w2
+    generalize Mem.load qw (qb + 3#32) = w3
+    generalize Mem.load hw hb = hh
+    generalize Mem.load aw ab = x0
+    generalize Mem.load aw (ab + 1#32) = x1
+    generalize Mem.load aw (ab + 2#32) = x2
+    generalize Mem.load aw (ab + 3#32) = x3
+    generalize Mem.load aw (ab + 4#32) = x4
+    generalize Mem.load aw (ab + 5#32) = x5
+    generalize Mem.load aw (ab + 6#32) = x6
+    generalize Mem.load aw (ab + 7#32) = x7
+    grind
+theorem q6k_addr : Laws.q6k_addr := by
+  intro rows nb r b w h j
+  unfold law_q6k_addr
+  cases hs : ie_q4k_sizes_ok rows nb <;> cases hr : BitVec.ult r rows <;> cases hb : BitVec.ult b nb <;>
+    cases hw : BitVec.ult w 4#32 <;> cases hh : BitVec.ult h 2#32 <;> cases hj : BitVec.ult j 32#32 <;>
+    simp only [Bool.false_and, Bool.and_false, Bool.not_false, Bool.true_or, Bool.true_and, Bool.not_true, Bool.false_or]
+  simp only [ie_q4k_sizes_ok, Bool.and_eq_true, BitVec.ult_iff_lt, beq_iff_eq] at hs hr hb hw hh hj
+  have ⟨q1, q2⟩ := rows_nb8 rows nb hs.1.1.1 hs.1.1.2 hs.1.2
+  have ⟨p1, p2⟩ := r_nb8 rows nb r hs.1.1.1 hs.1.1.2 hs.1.2 hr
+  have h8 : nb.toNat % 8 = 0 := by
+    have := congrArg BitVec.toNat hs.2
+    simpa [BitVec.toNat_umod] using this
+  have hb' : b.toNat < nb.toNat := hb
+  have hw' : w.toNat < 4 := hw
+  have hh' : h.toNat < 2 := hh
+  have hj' : j.toNat < 32 := hj
+  have hr' : r.toNat + 1 ≤ rows.toNat := by bv_omega
+  have m1 : r.toNat * (nb.toNat / 8) + nb.toNat / 8 ≤ rows.toNat * (nb.toNat / 8) := by
+    rw [← Nat.succ_mul]; exact Nat.mul_le_mul_right _ hr'
+  have m2 : rows.toNat * nb.toNat = 8 * (rows.toNat * (nb.toNat / 8)) := by
+    have e : nb.toNat = 8 * (nb.toNat / 8) := by omega
+    conv => lhs; rw [e]
+    rw [Nat.mul_left_comm]
+  have m3 : r.toNat * nb.toNat = 8 * (r.toNat * (nb.toNat / 8)) := by
+    have e : nb.toNat = 8 * (nb.toNat / 8) := by omega
+    conv => lhs; rw [e]
+    rw [Nat.mul_left_comm]
+  simp only [ie_q4_dst_word, ie_q6k_hw, ie_q6k_qw_n, ie_q6k_sc, ie_q6k_d, ie_q6k_qs_n, ie_q6k_src_ql, ie_q6k_src_qh,
+    ie_q6k_src_sc, ie_q6k_src_d, ie_q6k_src_blk, Bool.and_eq_true, decide_eq_true_eq,
+    BitVec.ult_iff_lt, BitVec.ule_iff_le, BitVec.le_def, BitVec.lt_def, BitVec.toNat_add, BitVec.toNat_mul, BitVec.toNat_udiv,
+    BitVec.toNat_umod, BitVec.toNat_ofNat, p1, q1]
+  generalize r.toNat * (nb.toNat / 8) = a at *
+  generalize rows.toNat * (nb.toNat / 8) = c at *
+  generalize r.toNat * nb.toNat = pn at *
+  generalize rows.toNat * nb.toNat = qn at *
+  simp (disch := omega) only [Nat.mod_eq_of_lt]
+
+  omega
+
+
+theorem sw_byte (W H h k i : U32) (hh : h < 2#32) (hk : k < 4#32) (hi : i < 4#32) :
+    ie_sext8 (ie_byte (ie_q6k_sw W H h k) i) = ie_q6k_q W H (16#32 * h + 4#32 * k + i) - 32#32 := by
+  simp only [ie_sext8, ie_byte, ie_q6k_sw, ie_q6k_vw, ie_q6k_q, ie_q4_nib]; bv_decide
+
+theorem q6k_dots : Laws.q6k_dots := by
+  intro qw qb hw hb aw ab h
+  unfold law_q6k_dots
+  cases hh : BitVec.ult h 2#32 <;> simp only [Bool.not_false, Bool.true_or, Bool.not_true, Bool.false_or, beq_iff_eq]
+  have hh' : h = 0#32 ∨ h = 1#32 := by have := BitVec.ult_iff_lt.mp hh; bv_omega
+  rcases hh' with rfl | rfl
+  all_goals
+    simp only [ie_q6k_dots, ie_dot4_ss, ie_q6k_spec, BitVec.toNat_ofNat, Nat.reduceMod]
+    simp (disch := decide) only [sw_byte, BitVec.reduceMul, BitVec.reduceAdd]
+    simp only [ie_q6k_spec.go, ie_q6k_term, ie_q4_word_of, BitVec.reduceULT, BitVec.reduceAdd, BitVec.reduceSub,
+      BitVec.reduceAnd, BitVec.reduceMul, BitVec.reduceHShiftRight, Bool.cond_true, Bool.cond_false, BitVec.add_zero,
+      BitVec.zero_add, BitVec.zero_mul, BitVec.mul_zero]
+    simp only [BitVec.add_assoc, BitVec.reduceAdd]
+
+theorem q4k_dot_u : Laws.q4k_dot_u := by
+  intro qw qb u ub aw ab
+  unfold law_q4k_dot_u
+  by_cases h : (u.load ub == ie_q4k_lo (qw.load qb) && u.load (ub + 1#32) == ie_q4k_hi (qw.load qb) &&
+           u.load (ub + 2#32) == ie_q4k_lo (qw.load (qb + 1#32)) && u.load (ub + 3#32) == ie_q4k_hi (qw.load (qb + 1#32)) &&
+           u.load (ub + 4#32) == ie_q4k_lo (qw.load (qb + 2#32)) && u.load (ub + 5#32) == ie_q4k_hi (qw.load (qb + 2#32)) &&
+           u.load (ub + 6#32) == ie_q4k_lo (qw.load (qb + 3#32)) && u.load (ub + 7#32) == ie_q4k_hi (qw.load (qb + 3#32))) = true
+  · simp only [Bool.and_eq_true, beq_iff_eq] at h
+    obtain ⟨⟨⟨⟨⟨⟨⟨h0, h1⟩, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩ := h
+    simp only [ie_q4k_dot_u, ie_q4k_dot, ie_q4q8_word, h0, h1, h2, h3, h4, h5, h6, h7, ie_q4k_lo, ie_q4k_hi,
+      Bool.and_self, Bool.not_true, Bool.false_or, beq_self_eq_true]
+  · simp only [Bool.not_eq_true] at h
+    simp only [h, Bool.not_false, Bool.true_or]
+
+theorem q6k_dots_s : Laws.q6k_dots_s := by
+  intro qw qb hw hb sw sb aw ab h
+  unfold law_q6k_dots_s
+  by_cases hc : (sw.load sb == ie_q6k_sw (qw.load qb) (hw.load hb) h 0#32 &&
+           sw.load (sb + 1#32) == ie_q6k_sw (qw.load (qb + 1#32)) (hw.load hb) h 1#32 &&
+           sw.load (sb + 2#32) == ie_q6k_sw (qw.load (qb + 2#32)) (hw.load hb) h 2#32 &&
+           sw.load (sb + 3#32) == ie_q6k_sw (qw.load (qb + 3#32)) (hw.load hb) h 3#32) = true
+  · simp only [Bool.and_eq_true, beq_iff_eq] at hc
+    obtain ⟨⟨⟨h0, h1⟩, h2⟩, h3⟩ := hc
+    simp only [ie_q6k_dots_s, ie_q6k_dots, h0, h1, h2, h3, Bool.and_self, Bool.not_true, Bool.false_or, beq_self_eq_true]
+  · simp only [Bool.not_eq_true] at hc
+    simp only [hc, Bool.not_false, Bool.true_or]
+
 end Proof

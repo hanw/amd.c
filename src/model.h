@@ -12,7 +12,7 @@ enum { ARCH_LLAMA = 0, ARCH_QWEN2 = 1, ARCH_QWEN35 = 2 };
 enum { ROPE_NORM = 0, ROPE_NEOX = 1 }; /* NORM: pairs (2i, 2i+1); NEOX: (i, i + hd/2) */
 
 /* A weight matrix: rows x cols, y = W x. */
-enum { MAT_Q4 = 0, MAT_F32 = 1, MAT_Q8 = 2, MAT_Q4K = 3 };
+enum { MAT_Q4 = 0, MAT_F32 = 1, MAT_Q8 = 2, MAT_Q4K = 3, MAT_Q6K = 4 };
 typedef struct {
   int kind;
   uint32_t rows, cols, nb; /* nb = cols / 32 (Q4 and Q8) */
@@ -27,6 +27,9 @@ typedef struct {
    * Q4_0 order, values 0..15); qs: rows*nb u16 (6-bit scale | 6-bit min << 8)
    * of each sub-block, then rows*(nb/8)*2 u16 (f16 d, f16 dmin) of each
    * super-block. Weight = d*sc*q - dmin*mn (as ggml). Index maps: ie_q4k_* in core/ie_core.h. */
+  /* MAT_Q6K (GGUF Q6_K): qw = the low 4 bits as MAT_Q4 nibble words, then
+   * 2 words of high bits per sub-block (ie_q6k_hw); qs = (sc0 | sc1 << 8)
+   * (int8) per sub-block, then f16 d per super-block (ie_q6k_sc, ie_q6k_d). */
   /* MAT_F32: rows*cols floats (dequantized from F32/F16, or Q8_0 for the embedding). */
   float *f;
   /* Streaming load (ie_mat_sink set): the device copies of qw and qs (or
@@ -126,6 +129,7 @@ enum {
   OP_QUANT,   /* b = Q8(a) */
   OP_GEMV_Q4, /* b = W a (a is a Q8 buffer) */
   OP_GEMV_Q4K, /* the same for a MAT_Q4K matrix */
+  OP_GEMV_Q6K, /* the same for a MAT_Q6K matrix */
   OP_GEMV_F32,/* b = W a (a is f32) */
   OP_GEMV_Q8, /* b = W a, W is Q8_0 (a is a Q8 buffer) */
   OP_BIAS,    /* a += w */

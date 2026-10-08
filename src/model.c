@@ -205,6 +205,31 @@ static void repack_q4k(mat *w, const uint8_t *src) {
     }
 }
 
+/* Repack a GGUF Q6_K matrix into MAT_Q6K (model.h; index maps and the
+ * packing: core/ie_core.h, laws q6k_addr, q6k_unpack). */
+static void repack_q6k(mat *w, const uint8_t *src) {
+  const uint32_t rows = w->rows, nb = w->nb;
+  w->qw = ie_alloc((size_t)ie_q6k_qw_n(rows, nb) * 4);
+  w->qs = ie_alloc((size_t)ie_q6k_qs_n(rows, nb) * 2);
+  for (uint32_t r = 0; r < rows; r++)
+    for (uint32_t b = 0; b < nb; b++) {
+      uint32_t q[32];
+      for (uint32_t j = 0; j < 32; j++) q[j] = ie_q6k_src_q(src[ie_q6k_src_ql(r, b, j, nb)], src[ie_q6k_src_qh(r, b, j, nb)], b);
+      for (uint32_t wd = 0; wd < 4; wd++) {
+        uint32_t by[4];
+        for (uint32_t i = 0; i < 4; i++) by[i] = (q[4 * wd + i] & 15u) | ((q[4 * wd + i + 16] & 15u) << 4);
+        w->qw[ie_q4_dst_word(r, b, wd, nb)] = ie_pack4(by[0], by[1], by[2], by[3]);
+      }
+      for (uint32_t h = 0; h < 2; h++) {
+        const uint32_t *p = q + 16 * h;
+        w->qw[ie_q6k_hw(rows, r, b, h, nb)] =
+            ie_q6k_hpack(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+      }
+      w->qs[ie_q6k_sc(r, b, nb)] = (uint16_t)(src[ie_q6k_src_sc(r, b, 0, nb)] | (src[ie_q6k_src_sc(r, b, 1, nb)] << 8));
+      if (b % 8 == 0) memcpy(&w->qs[ie_q6k_d(rows, r, b, nb)], src + ie_q6k_src_d(r, b, nb), 2);
+    }
+}
+
 /* GGUF Q8_0 bytes of n floats (n % 32 == 0), as ggml's quantize_row_q8_0:
  * d = amax / 127 (stored as f16), q = round(x / d). */
 static void quant_q8_0_bytes(const float *x, uint64_t n, uint8_t *out) {
@@ -260,6 +285,11 @@ static void load_mat(mat *w, gguf_file *g, const char *name, uint32_t rows, uint
     w->nb = cols / 32;
     repack_q4k(w, t->data);
     *bytes += (uint64_t)rows * w->nb * 18;
+  } else if (t->type == GGML_Q6_K && !emb && cols % 256 == 0 && ie_q4k_sizes_ok(rows, cols / 32) && !getenv("IE_Q6K_AS_Q8")) {
+    w->kind = MAT_Q6K;
+    w->nb = cols / 32;
+    repack_q6k(w, t->data);
+    *bytes += (uint64_t)rows * w->nb * 210 / 8;
   } else if ((t->type == GGML_Q6_K || t->type == GGML_Q5_K || t->type == GGML_Q4_K) && q8_ok &&
              ie_q8_sizes_ok(rows, cols / 32)) {
     /* Q6_K, Q5_K (and a Q4_K embedding): no integer kernel; requantize to
@@ -304,6 +334,25 @@ static int concat_mats(mat *dst, mat *const *src, int n) {
   const int kind = src[0]->kind;
   const uint32_t cols = src[0]->cols, nb = src[0]->nb;
   if (kind == MAT_Q4 && !ie_sizes_ok(rows, nb)) return 0;
+  if (kind == MAT_Q6K) { /* two sections in qw and in qs: concatenate each */
+    if (!ie_q4k_sizes_ok(rows, nb)) return 0;
+    memset(dst, 0, sizeof *dst);
+    dst->kind = kind, dst->rows = rows, dst->cols = src[0]->cols, dst->nb = nb;
+    dst->qw = ie_alloc((size_t)ie_q6k_qw_n(rows, nb) * 4);
+    dst->qs = ie_alloc((size_t)ie_q6k_qs_n(rows, nb) * 2);
+    size_t r0 = 0;
+    for (int i = 0; i < n; i++) {
+      mat *w = src[i];
+      memcpy(dst->qw + ie_q4_dst_word((uint32_t)r0, 0, 0, nb), w->qw, (size_t)w->rows * nb * 16);
+      memcpy(dst->qw + ie_q6k_hw(rows, (uint32_t)r0, 0, 0, nb), w->qw + ie_q6k_hw(w->rows, 0, 0, 0, nb), (size_t)w->rows * nb * 8);
+      memcpy(dst->qs + ie_q6k_sc((uint32_t)r0, 0, nb), w->qs, (size_t)w->rows * nb * 2);
+      memcpy(dst->qs + ie_q6k_d(rows, (uint32_t)r0, 0, nb), w->qs + ie_q6k_d(w->rows, 0, 0, nb), (size_t)w->rows * (nb / 8) * 2);
+      r0 += w->rows;
+      free(w->qw), free(w->qs);
+      w->qw = NULL, w->qs = NULL;
+    }
+    return 1;
+  }
   if (kind == MAT_Q4K) { /* two sections in qs: concatenate each */
     if (!ie_q4k_sizes_ok(rows, nb)) return 0;
     memset(dst, 0, sizeof *dst);
@@ -777,8 +826,9 @@ static void use_last(gb *B, int id) {
 static int matvec_into(gb *B, const mat *w, int xf, int xq, int into, uint32_t off, const char *name, const vec *bias,
                        int res) {
   int y = into >= 0 ? into : new_buf(B->g, name, w->rows * 4);
-  const int quant_in = w->kind == MAT_Q4 || w->kind == MAT_Q8 || w->kind == MAT_Q4K;
-  op *o = emit(B, w->kind == MAT_Q4 ? OP_GEMV_Q4 : w->kind == MAT_Q8 ? OP_GEMV_Q8 : w->kind == MAT_Q4K ? OP_GEMV_Q4K : OP_GEMV_F32,
+  const int quant_in = w->kind == MAT_Q4 || w->kind == MAT_Q8 || w->kind == MAT_Q4K || w->kind == MAT_Q6K;
+  op *o = emit(B, w->kind == MAT_Q4 ? OP_GEMV_Q4 : w->kind == MAT_Q8 ? OP_GEMV_Q8 : w->kind == MAT_Q4K ? OP_GEMV_Q4K
+                   : w->kind == MAT_Q6K ? OP_GEMV_Q6K : OP_GEMV_F32,
                quant_in ? xq : xf, y, -1);
   o->w = w;
   o->n = w->cols;
@@ -1002,6 +1052,7 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx, uint32_t T, int mtp) 
     const op *p = &g->ops[i];
     if (p->kind == OP_GEMV_Q4) wb += (uint64_t)p->w->rows * p->w->nb * 18;
     if (p->kind == OP_GEMV_Q4K) wb += (uint64_t)p->w->rows * p->w->nb * 18;
+    if (p->kind == OP_GEMV_Q6K) wb += (uint64_t)p->w->rows * p->w->nb * 210 / 8;
     if (p->kind == OP_GEMV_F32) wb += (uint64_t)p->w->rows * p->w->cols * 4;
     if (p->kind == OP_GEMV_Q8) wb += (uint64_t)p->w->rows * p->w->nb * 34;
   }

@@ -87,14 +87,14 @@ class Mat:
             self.d = raw[:, :2].copy().view(np.float16).astype(np.float64).reshape(rows, nb)
             q = np.concatenate([raw[:, 2:] & 15, raw[:, 2:] >> 4], axis=1).astype(np.int64) - 8
             self.q = q.reshape(rows, nb, 32)
-        elif tt == Q4_K and t.name != "token_embd.weight":
+        elif tt in (Q4_K, Q6_K) and t.name != "token_embd.weight":
             # the engine keeps Q4_K (exact weights): q8 mode multiplies the
             # exact weights by the quantized activations
             self.q = self.w.reshape(rows, nb, 32)
             self.d = np.ones((rows, nb))
             self.qint = True
         elif tt in (Q5_K, Q6_K):
-            # the engine requantizes Q6_K and Q5_K to Q8_0 at load (ggml's
+            # the engine requantizes Q5_K (and a Q6_K embedding) to Q8_0 at load (ggml's
             # quantize_row_q8_0: d = amax/127 in float32, stored as f16;
             # q = round half away from zero of x * (1/d)); in q8 mode the
             # reference uses the same Q8_0 weights

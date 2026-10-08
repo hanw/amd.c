@@ -46,6 +46,7 @@ void gpu_stream_init(void);
 void cpu_quant_q8(const float *x, uint8_t *q, uint32_t nb);
 void cpu_gemv_q4(const mat *w, const uint8_t *xq, float *y);
 void cpu_gemv_q4k(const mat *w, const uint8_t *xq, float *y);
+void cpu_gemv_q6k(const mat *w, const uint8_t *xq, float *y);
 void cpu_gemv_q8(const mat *w, const uint8_t *xq, float *y);
 
 #endif

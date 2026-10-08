@@ -219,3 +219,72 @@ constexpr auto law_q4k_nibble(u32 l0, u32 l1, u32 l2, u32 l3, u32 h0, u32 h1, u3
 constexpr auto law_q4k_dot(Mem qw, u32 qb, Mem aw, u32 ab) -> bool {
   return ie_q4k_dot(qw, qb, aw, ab) == ie_q4k_spec(32u, qw, qb, aw, ab, 0u);
 }
+
+// ---------------------------------------------------------------------
+// 7. The Q6_K path (MAT_Q6K)
+// ---------------------------------------------------------------------
+
+// LAW q6k_addr: every address of the MAT_Q6K layout and of the GGUF Q6_K
+// source is inside its array (rows*nb*6 words; ie_q6k_qs_n u16; the source
+// tensor has rows*(nb/8)*210 bytes).
+constexpr auto law_q6k_addr(u32 rows, u32 nb, u32 r, u32 b, u32 w, u32 h, u32 j) -> bool {
+  return !(ie_q4k_sizes_ok(rows, nb) && r < rows && b < nb && w < 4u && h < 2u && j < 32u) ||
+         (ie_q4_dst_word(r, b, w, nb) < rows * nb * 4u && ie_q6k_hw(rows, r, b, h, nb) < ie_q6k_qw_n(rows, nb) &&
+          rows * nb * 4u <= ie_q6k_hw(rows, r, b, h, nb) && ie_q6k_sc(r, b, nb) < rows * nb &&
+          ie_q6k_d(rows, r, b, nb) < ie_q6k_qs_n(rows, nb) && ie_q6k_src_ql(r, b, j, nb) < rows * (nb / 8u) * 210u &&
+          ie_q6k_src_qh(r, b, j, nb) < rows * (nb / 8u) * 210u && ie_q6k_src_sc(r, b, h, nb) < rows * (nb / 8u) * 210u &&
+          ie_q6k_src_d(r, b, nb) + 1u < rows * (nb / 8u) * 210u);
+}
+
+// LAW q6k_unpack: q of weight j of a sub-block, read from the packed words
+// (low nibbles as Q4_0: byte e of nibble word gets q_e and q_(e+16); high
+// bits by ie_q6k_hpack of the 16 q of the half) is the q it was packed from.
+constexpr auto law_q6k_unpack(u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1, u32 b2, u32 b3, u32 c0, u32 c1, u32 c2,
+                              u32 c3, u32 d0, u32 d1, u32 d2, u32 d3, u32 e) -> bool {
+  // the 16 q of one half, weights 4k + i: a (k = 0), b, c, d (k = 3); the
+  // nibble word k holds weights 4k + i (low nibbles); e < 16
+  return !(e < 16u) ||
+         ie_q6k_q(ie_pack4(e / 4u == 0u ? a0 & 15u : e / 4u == 1u ? b0 & 15u : e / 4u == 2u ? c0 & 15u : d0 & 15u,
+                           e / 4u == 0u ? a1 & 15u : e / 4u == 1u ? b1 & 15u : e / 4u == 2u ? c1 & 15u : d1 & 15u,
+                           e / 4u == 0u ? a2 & 15u : e / 4u == 1u ? b2 & 15u : e / 4u == 2u ? c2 & 15u : d2 & 15u,
+                           e / 4u == 0u ? a3 & 15u : e / 4u == 1u ? b3 & 15u : e / 4u == 2u ? c3 & 15u : d3 & 15u),
+                  ie_q6k_hpack(a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, d0, d1, d2, d3), e) ==
+             ((e / 4u == 0u ? (e % 4u == 0u ? a0 : e % 4u == 1u ? a1 : e % 4u == 2u ? a2 : a3)
+               : e / 4u == 1u ? (e % 4u == 0u ? b0 : e % 4u == 1u ? b1 : e % 4u == 2u ? b2 : b3)
+               : e / 4u == 2u ? (e % 4u == 0u ? c0 : e % 4u == 1u ? c1 : e % 4u == 2u ? c2 : c3)
+                              : (e % 4u == 0u ? d0 : e % 4u == 1u ? d1 : e % 4u == 2u ? d2 : d3)) & 63u);
+}
+
+// LAW q6k_dot: the kernels' half dot product (4 dot4 of the q bytes minus
+// 32 times the half sum of the activations) is the spec: the sum over the
+// 16 weights of half h of (q - 32) a.
+constexpr auto law_q6k_dot(Mem qw, u32 qb, Mem hw, u32 hb, Mem aw, u32 ab, u32 h) -> bool {
+  return !(h < 2u) ||
+         ie_q6k_dot(qw, qb, hw, hb, aw, ab, h, ie_q8_hsum(aw, ab, h)) == ie_q6k_spec(16u, qw, qb, hw, hb, aw, ab, 16u * h, 16u * h + 16u);
+}
+
+// LAW q6k_dots: the signed form (the q - 32 bytes, 4 signed dot4) is the
+// same spec.
+constexpr auto law_q6k_dots(Mem qw, u32 qb, Mem hw, u32 hb, Mem aw, u32 ab, u32 h) -> bool {
+  return !(h < 2u) || ie_q6k_dots(qw, qb, hw, hb, aw, ab, h) == ie_q6k_spec(16u, qw, qb, hw, hb, aw, ab, 16u * h, 16u * h + 16u);
+}
+
+// LAW q4k_dot_u: with the nibbles split once (u = lo, hi of each word),
+// the dot product is ie_q4k_dot.
+constexpr auto law_q4k_dot_u(Mem qw, u32 qb, Mem u, u32 ub, Mem aw, u32 ab) -> bool {
+  return !(IE_LOAD(u, ub) == ie_q4k_lo(IE_LOAD(qw, qb)) && IE_LOAD(u, ub + 1u) == ie_q4k_hi(IE_LOAD(qw, qb)) &&
+           IE_LOAD(u, ub + 2u) == ie_q4k_lo(IE_LOAD(qw, qb + 1u)) && IE_LOAD(u, ub + 3u) == ie_q4k_hi(IE_LOAD(qw, qb + 1u)) &&
+           IE_LOAD(u, ub + 4u) == ie_q4k_lo(IE_LOAD(qw, qb + 2u)) && IE_LOAD(u, ub + 5u) == ie_q4k_hi(IE_LOAD(qw, qb + 2u)) &&
+           IE_LOAD(u, ub + 6u) == ie_q4k_lo(IE_LOAD(qw, qb + 3u)) && IE_LOAD(u, ub + 7u) == ie_q4k_hi(IE_LOAD(qw, qb + 3u))) ||
+         ie_q4k_dot_u(u, ub, aw, ab) == ie_q4k_dot(qw, qb, aw, ab);
+}
+
+// LAW q6k_dots_s: with the q - 32 words made once, the half dot product is
+// ie_q6k_dots.
+constexpr auto law_q6k_dots_s(Mem qw, u32 qb, Mem hw, u32 hb, Mem sw, u32 sb, Mem aw, u32 ab, u32 h) -> bool {
+  return !(IE_LOAD(sw, sb) == ie_q6k_sw(IE_LOAD(qw, qb), IE_LOAD(hw, hb), h, 0u) &&
+           IE_LOAD(sw, sb + 1u) == ie_q6k_sw(IE_LOAD(qw, qb + 1u), IE_LOAD(hw, hb), h, 1u) &&
+           IE_LOAD(sw, sb + 2u) == ie_q6k_sw(IE_LOAD(qw, qb + 2u), IE_LOAD(hw, hb), h, 2u) &&
+           IE_LOAD(sw, sb + 3u) == ie_q6k_sw(IE_LOAD(qw, qb + 3u), IE_LOAD(hw, hb), h, 3u)) ||
+         ie_q6k_dots_s(sw, sb, aw, ab, h) == ie_q6k_dots(qw, qb, hw, hb, aw, ab, h);
+}

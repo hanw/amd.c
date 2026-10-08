@@ -141,4 +141,34 @@ def q4k_dot : Prop :=
   forall (qw : C.Mem) (qb : C.U32) (aw : C.Mem) (ab : C.U32),
     C.law_q4k_dot qw qb aw ab = true
 
+/-- C++: law_q6k_addr -/
+def q6k_addr : Prop :=
+  forall (rows : C.U32) (nb : C.U32) (r : C.U32) (b : C.U32) (w : C.U32) (h : C.U32) (j : C.U32),
+    C.law_q6k_addr rows nb r b w h j = true
+
+/-- C++: law_q6k_unpack -/
+def q6k_unpack : Prop :=
+  forall (a0 : C.U32) (a1 : C.U32) (a2 : C.U32) (a3 : C.U32) (b0 : C.U32) (b1 : C.U32) (b2 : C.U32) (b3 : C.U32) (c0 : C.U32) (c1 : C.U32) (c2 : C.U32) (c3 : C.U32) (d0 : C.U32) (d1 : C.U32) (d2 : C.U32) (d3 : C.U32) (e : C.U32),
+    C.law_q6k_unpack a0 a1 a2 a3 b0 b1 b2 b3 c0 c1 c2 c3 d0 d1 d2 d3 e = true
+
+/-- C++: law_q6k_dot -/
+def q6k_dot : Prop :=
+  forall (qw : C.Mem) (qb : C.U32) (hw : C.Mem) (hb : C.U32) (aw : C.Mem) (ab : C.U32) (h : C.U32),
+    C.law_q6k_dot qw qb hw hb aw ab h = true
+
+/-- C++: law_q6k_dots -/
+def q6k_dots : Prop :=
+  forall (qw : C.Mem) (qb : C.U32) (hw : C.Mem) (hb : C.U32) (aw : C.Mem) (ab : C.U32) (h : C.U32),
+    C.law_q6k_dots qw qb hw hb aw ab h = true
+
+/-- C++: law_q4k_dot_u -/
+def q4k_dot_u : Prop :=
+  forall (qw : C.Mem) (qb : C.U32) (u : C.Mem) (ub : C.U32) (aw : C.Mem) (ab : C.U32),
+    C.law_q4k_dot_u qw qb u ub aw ab = true
+
+/-- C++: law_q6k_dots_s -/
+def q6k_dots_s : Prop :=
+  forall (qw : C.Mem) (qb : C.U32) (hw : C.Mem) (hb : C.U32) (sw : C.Mem) (sb : C.U32) (aw : C.Mem) (ab : C.U32) (h : C.U32),
+    C.law_q6k_dots_s qw qb hw hb sw sb aw ab h = true
+
 end Laws

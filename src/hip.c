@@ -77,11 +77,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 /* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
  * linear layer are gpu_backend.ns: at least the tokens of a verify run */
@@ -166,6 +166,9 @@ static void upload_mat(gpu_backend *b, const mat *w, void **w0, void **w1) {
   } else if (w->kind == MAT_Q4K) {
     *w0 = upload(b, w->qw, (size_t)w->rows * w->nb * 16);
     *w1 = upload(b, w->qs, (size_t)ie_q4k_qs_n(w->rows, w->nb) * 2);
+  } else if (w->kind == MAT_Q6K) {
+    *w0 = upload(b, w->qw, (size_t)ie_q6k_qw_n(w->rows, w->nb) * 4);
+    *w1 = upload(b, w->qs, (size_t)ie_q6k_qs_n(w->rows, w->nb) * 2);
   } else if (w->kind == MAT_Q8) {
     *w0 = upload(b, w->qw, (size_t)w->rows * w->nb * 32);
     *w1 = upload(b, w->qs, (size_t)w->rows * w->nb * 2);
@@ -208,8 +211,10 @@ static void gpu_sink(mat *w) {
     w->d0 = sdev_put(w->f, (size_t)w->rows * w->cols * 4), w->f = NULL;
   } else {
     if (!w->qw) return;
-    const size_t words = w->kind == MAT_Q4 || w->kind == MAT_Q4K ? 16 : 32;
-    const size_t qsn = w->kind == MAT_Q4K ? (size_t)ie_q4k_qs_n(w->rows, w->nb) : (size_t)w->rows * w->nb;
+    const size_t words = w->kind == MAT_Q4 || w->kind == MAT_Q4K ? 16 : w->kind == MAT_Q6K ? 24 : 32;
+    const size_t qsn = w->kind == MAT_Q4K   ? (size_t)ie_q4k_qs_n(w->rows, w->nb)
+                       : w->kind == MAT_Q6K ? (size_t)ie_q6k_qs_n(w->rows, w->nb)
+                                            : (size_t)w->rows * w->nb;
     w->d0 = sdev_put(w->qw, (size_t)w->rows * w->nb * words), w->qw = NULL;
     w->d1 = sdev_put(w->qs, qsn * 2), w->qs = NULL;
   }
@@ -394,6 +399,33 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         u32 rows = o->w->rows, nb = o->w->nb;
         void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R, &NW, &NY, &NQ, &eps, &b->gm_count};
         launch(b, K_GEMV_Q4, gemv_groups(rows), args);
+        break;
+      }
+      case OP_GEMV_Q6K: {
+        u32 rows = o->w->rows, nb = o->w->nb;
+        if (T > 1) { /* all tokens: 8 at a time (8 rows per wave) or 16 at a time */
+          if (NW) ie_die("a GEMV with a fused norm (IE_NORM_FUSE) cannot do several tokens");
+          u32 xs = g->bufs[o->a].stride, ys = g->bufs[o->b].stride / 4u, rs = o->res >= 0 ? g->bufs[o->res].stride / 4u : 0u;
+          static int gmin6 = -1;
+          if (gmin6 < 0) gmin6 = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
+          if ((int)T >= gmin6 && nb % 8u == 0u) { /* WMMA */
+            void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R, &T, &xs, &ys, &rs};
+            launch(b, K_GEMM_Q6KR, ((rows + 127u) / 128u) * ((T + 63u) / 64u), args); /* GK_R x GK_T */
+            break;
+          }
+          const u32 step = T <= 8u ? 8u : 16u; /* <= 8 tokens (verify): 8 rows per wave */
+          for (u32 t0 = 0; t0 < T; t0 += step) {
+            u32 tn = T - t0 < step ? T - t0 : step;
+            void *Ab = (char *)A + (size_t)t0 * xs, *Bb = (char *)B + (size_t)t0 * ys * 4u;
+            const void *Rb = R ? (const char *)R + (size_t)t0 * rs * 4u : NULL;
+            void *ta[] = {&w0, &w1, &Ab, &Bb, &rows, &nb, &bias, &Rb, &tn, &xs, &ys, &rs};
+            const u32 g8 = step == 8u ? (rows + 63u) / 64u : (rows + 31u) / 32u;
+            launch(b, step == 8u ? K_GEMV_Q6K_TR8 : K_GEMV_Q6K_TR, g8 >= 253u && g8 <= 256u ? 257u : g8, ta);
+          }
+          break;
+        }
+        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R, &NW, &NY, &NQ, &eps, &b->gm_count};
+        launch(b, K_GEMV_Q6K, gemv_groups(rows), args);
         break;
       }
       case OP_GEMV_Q4K: {
@@ -712,7 +744,7 @@ static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u
      * read once), and the per-token kernels with a token grid dimension */
     static int gmin = -1;
     if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
-    const int all = k == OP_GDN || ((k == OP_GEMV_Q8 || k == OP_GEMV_Q4K || k == OP_GEMV_F32) && !nobatch) || k == OP_RMSNORM || k == OP_QUANT || k == OP_SWIGLU ||
+    const int all = k == OP_GDN || ((k == OP_GEMV_Q8 || k == OP_GEMV_Q4K || k == OP_GEMV_Q6K || k == OP_GEMV_F32) && !nobatch) || k == OP_RMSNORM || k == OP_QUANT || k == OP_SWIGLU ||
                     k == OP_QKN_ROPE_KV || (k == OP_ATTN && (int)T >= gmin); /* the fast (not bitwise) prefill path */
     if (all) launch_op(b, i, 0, toks[0], pos, T, slot, wfrom);
     else
@@ -803,6 +835,7 @@ static int op_kernel(const gpu_backend *b, const op *o) {
     case OP_QUANT: return K_QUANT;
     case OP_GEMV_Q4: return K_GEMV_Q4;
     case OP_GEMV_Q4K: return K_GEMV_Q4K;
+    case OP_GEMV_Q6K: return K_GEMV_Q6K;
     case OP_GEMV_Q8: return K_GEMV_Q8;
     case OP_GEMV_F32: return K_GEMV_F32;
     case OP_BIAS: return K_BIAS;
@@ -819,6 +852,7 @@ static int op_kernel(const gpu_backend *b, const op *o) {
 /* Weight bytes that op o reads (0 if it reads no weight matrix). */
 static double op_wbytes(const op *o) {
   if (o->kind == OP_GEMV_Q4 || o->kind == OP_GEMV_Q4K) return (double)o->w->rows * o->w->nb * 18.0;
+  if (o->kind == OP_GEMV_Q6K) return (double)o->w->rows * o->w->nb * 26.25;
   if (o->kind == OP_GEMV_Q8) return (double)o->w->rows * o->w->nb * 34.0;
   if (o->kind == OP_GEMV_F32) return (double)o->w->rows * o->w->cols * 4.0;
   return 0;
@@ -835,7 +869,7 @@ static void prof_report(gpu_backend *b) {
   for (uint32_t i = 0; i < g->n_main; i++) {
     const op *o = &g->ops[i];
     int k = op_kernel(b, o);
-    u32 rows = o->w && (o->kind == OP_GEMV_Q4 || o->kind == OP_GEMV_Q4K || o->kind == OP_GEMV_Q8 || o->kind == OP_GEMV_F32) ? o->w->rows : 0;
+    u32 rows = o->w && (o->kind == OP_GEMV_Q4 || o->kind == OP_GEMV_Q4K || o->kind == OP_GEMV_Q6K || o->kind == OP_GEMV_Q8 || o->kind == OP_GEMV_F32) ? o->w->rows : 0;
     u32 cols = rows ? o->w->cols : 0;
     int j = 0;
     while (j < nr && !(r[j].k == k && r[j].rows == rows && r[j].cols == cols)) j++;
@@ -900,7 +934,7 @@ static void prof_layers(gpu_backend *b) {
     }
     uint32_t l = (uint32_t)o->layer;
     ms[l] += t, cnt[l]++, by[l] += op_wbytes(o);
-    if (o->kind == OP_GEMV_Q4 || o->kind == OP_GEMV_Q4K || o->kind == OP_GEMV_Q8 || o->kind == OP_GEMV_F32) gemv[l] += t;
+    if (o->kind == OP_GEMV_Q4 || o->kind == OP_GEMV_Q4K || o->kind == OP_GEMV_Q6K || o->kind == OP_GEMV_Q8 || o->kind == OP_GEMV_F32) gemv[l] += t;
     if (!half[l]) att[l] += t;
     if (o->kind == OP_ADD) half[l] = 1; /* the first add ends the attention half */
     in_layers += t;
@@ -922,7 +956,7 @@ static void prof_layers(gpu_backend *b) {
     fprintf(f, "op,layer,kernel,rows,cols,ms_per_token,weight_bytes\n");
     for (uint32_t i = 0; i < g->n_main; i++) {
       const op *o = &g->ops[i];
-      int mat = o->kind == OP_GEMV_Q4 || o->kind == OP_GEMV_Q4K || o->kind == OP_GEMV_Q8 || o->kind == OP_GEMV_F32;
+      int mat = o->kind == OP_GEMV_Q4 || o->kind == OP_GEMV_Q4K || o->kind == OP_GEMV_Q6K || o->kind == OP_GEMV_Q8 || o->kind == OP_GEMV_F32;
       fprintf(f, "%u,%d,%s,%u,%u,%.6f,%.0f\n", i, o->layer, kname[op_kernel(b, o)], mat ? o->w->rows : 0,
               mat ? o->w->cols : 0, b->pms[i] / b->psteps, op_wbytes(o));
     }

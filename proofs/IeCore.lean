@@ -228,6 +228,18 @@ def ie_q4k_pack (lo : U32) (hi : U32) (b : U32) : U32 :=
 def ie_q4k_dot (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) : U32 :=
   (ie_q4q8_word (ie_q4q8_word (ie_q4q8_word (ie_q4q8_word 0#32 (Mem.load qw qb) (Mem.load aw ab) (Mem.load aw (ab + 4#32))) (Mem.load qw (qb + 1#32)) (Mem.load aw (ab + 1#32)) (Mem.load aw (ab + 5#32))) (Mem.load qw (qb + 2#32)) (Mem.load aw (ab + 2#32)) (Mem.load aw (ab + 6#32))) (Mem.load qw (qb + 3#32)) (Mem.load aw (ab + 3#32)) (Mem.load aw (ab + 7#32)))
 
+/-- C++: ie_q4k_lo -/
+def ie_q4k_lo (wq : U32) : U32 :=
+  (wq &&& 252645135#32)
+
+/-- C++: ie_q4k_hi -/
+def ie_q4k_hi (wq : U32) : U32 :=
+  ((wq >>> 4) &&& 252645135#32)
+
+/-- C++: ie_q4k_dot_u -/
+def ie_q4k_dot_u (u : Mem) (ub : U32) (aw : Mem) (ab : U32) : U32 :=
+  (ie_dot4_us (ie_dot4_us (ie_dot4_us (ie_dot4_us (ie_dot4_us (ie_dot4_us (ie_dot4_us (ie_dot4_us 0#32 (Mem.load u ub) (Mem.load aw ab)) (Mem.load u (ub + 1#32)) (Mem.load aw (ab + 4#32))) (Mem.load u (ub + 2#32)) (Mem.load aw (ab + 1#32))) (Mem.load u (ub + 3#32)) (Mem.load aw (ab + 5#32))) (Mem.load u (ub + 4#32)) (Mem.load aw (ab + 2#32))) (Mem.load u (ub + 5#32)) (Mem.load aw (ab + 6#32))) (Mem.load u (ub + 6#32)) (Mem.load aw (ab + 3#32))) (Mem.load u (ub + 7#32)) (Mem.load aw (ab + 7#32)))
+
 /-- C++: ie_q4k_term -/
 def ie_q4k_term (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) (j : U32) : U32 :=
   ((ie_q4_nib (Mem.load qw (qb + (ie_q4_word_of j))) j) * (ie_sext8 (ie_byte (Mem.load aw (ab + (j >>> 2))) (j &&& 3#32))))
@@ -243,6 +255,102 @@ def ie_q4k_spec.go (fuel : Nat) (n : U32) (qw : Mem) (qb : U32) (aw : Mem) (ab :
 /-- C++: ie_q4k_spec -/
 def ie_q4k_spec (n : U32) (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) (j : U32) : U32 :=
   ie_q4k_spec.go n.toNat n qw qb aw ab j
+
+/-- C++: ie_q6k_hw -/
+def ie_q6k_hw (rows : U32) (r : U32) (b : U32) (h : U32) (nb : U32) : U32 :=
+  ((((rows * nb) * 4#32) + (((r * nb) + b) * 2#32)) + h)
+
+/-- C++: ie_q6k_qw_n -/
+def ie_q6k_qw_n (rows : U32) (nb : U32) : U32 :=
+  ((rows * nb) * 6#32)
+
+/-- C++: ie_q6k_sc -/
+def ie_q6k_sc (r : U32) (b : U32) (nb : U32) : U32 :=
+  ((r * nb) + b)
+
+/-- C++: ie_q6k_d -/
+def ie_q6k_d (rows : U32) (r : U32) (b : U32) (nb : U32) : U32 :=
+  (((rows * nb) + (r * (nb / 8#32))) + (b / 8#32))
+
+/-- C++: ie_q6k_qs_n -/
+def ie_q6k_qs_n (rows : U32) (nb : U32) : U32 :=
+  ((rows * nb) + (rows * (nb / 8#32)))
+
+/-- C++: ie_q6k_src_blk -/
+def ie_q6k_src_blk (r : U32) (b : U32) (nb : U32) : U32 :=
+  (((r * (nb / 8#32)) + (b / 8#32)) * 210#32)
+
+/-- C++: ie_q6k_src_ql -/
+def ie_q6k_src_ql (r : U32) (b : U32) (j : U32) (nb : U32) : U32 :=
+  ((((ie_q6k_src_blk r b nb) + (64#32 * ((b % 8#32) / 4#32))) + (32#32 * ((b % 8#32) % 2#32))) + j)
+
+/-- C++: ie_q6k_src_qh -/
+def ie_q6k_src_qh (r : U32) (b : U32) (j : U32) (nb : U32) : U32 :=
+  ((((ie_q6k_src_blk r b nb) + 128#32) + (32#32 * ((b % 8#32) / 4#32))) + j)
+
+/-- C++: ie_q6k_src_sc -/
+def ie_q6k_src_sc (r : U32) (b : U32) (h : U32) (nb : U32) : U32 :=
+  ((((ie_q6k_src_blk r b nb) + 192#32) + (2#32 * (b % 8#32))) + h)
+
+/-- C++: ie_q6k_src_d -/
+def ie_q6k_src_d (r : U32) (b : U32) (nb : U32) : U32 :=
+  ((ie_q6k_src_blk r b nb) + 208#32)
+
+/-- C++: ie_q6k_src_q -/
+def ie_q6k_src_q (ql : U32) (qh : U32) (b : U32) : U32 :=
+  ((bif (BitVec.ult ((b % 8#32) % 4#32) 2#32) then (ql &&& 15#32) else ((ql &&& 255#32) >>> 4)) ||| ((((qh &&& 255#32) >>> (2#32 * ((b % 8#32) % 4#32))) &&& 3#32) <<< 4))
+
+/-- C++: ie_q6k_h2 -/
+def ie_q6k_h2 (q : U32) (e : U32) : U32 :=
+  (((q >>> 4) &&& 3#32) <<< ((8#32 * (e % 4#32)) + (2#32 * (e / 4#32))))
+
+/-- C++: ie_q6k_hpack -/
+def ie_q6k_hpack (q0 : U32) (q1 : U32) (q2 : U32) (q3 : U32) (q4 : U32) (q5 : U32) (q6 : U32) (q7 : U32) (q8 : U32) (q9 : U32) (q10 : U32) (q11 : U32) (q12 : U32) (q13 : U32) (q14 : U32) (q15 : U32) : U32 :=
+  ((((((((((((((((ie_q6k_h2 q0 0#32) ||| (ie_q6k_h2 q1 1#32)) ||| (ie_q6k_h2 q2 2#32)) ||| (ie_q6k_h2 q3 3#32)) ||| (ie_q6k_h2 q4 4#32)) ||| (ie_q6k_h2 q5 5#32)) ||| (ie_q6k_h2 q6 6#32)) ||| (ie_q6k_h2 q7 7#32)) ||| (ie_q6k_h2 q8 8#32)) ||| (ie_q6k_h2 q9 9#32)) ||| (ie_q6k_h2 q10 10#32)) ||| (ie_q6k_h2 q11 11#32)) ||| (ie_q6k_h2 q12 12#32)) ||| (ie_q6k_h2 q13 13#32)) ||| (ie_q6k_h2 q14 14#32)) ||| (ie_q6k_h2 q15 15#32))
+
+/-- C++: ie_q6k_q -/
+def ie_q6k_q (nibword : U32) (hword : U32) (j : U32) : U32 :=
+  ((ie_q4_nib nibword j) ||| (((hword >>> ((8#32 * (j % 4#32)) + (2#32 * ((j % 16#32) / 4#32)))) &&& 3#32) <<< 4))
+
+/-- C++: ie_q6k_vw -/
+def ie_q6k_vw (nibword : U32) (hword : U32) (h : U32) (k : U32) : U32 :=
+  ((bif (h == 0#32) then (nibword &&& 252645135#32) else ((nibword >>> 4) &&& 252645135#32)) ||| (((hword >>> (2#32 * k)) &&& 50529027#32) <<< 4))
+
+/-- C++: ie_q8_hsum -/
+def ie_q8_hsum (aw : Mem) (ab : U32) (h : U32) : U32 :=
+  (ie_dot4_ss (ie_dot4_ss (ie_dot4_ss (ie_dot4_ss 0#32 (Mem.load aw (ab + (4#32 * h))) 16843009#32) (Mem.load aw ((ab + (4#32 * h)) + 1#32)) 16843009#32) (Mem.load aw ((ab + (4#32 * h)) + 2#32)) 16843009#32) (Mem.load aw ((ab + (4#32 * h)) + 3#32)) 16843009#32)
+
+/-- C++: ie_q6k_dot -/
+def ie_q6k_dot (qw : Mem) (qb : U32) (hw : Mem) (hb : U32) (aw : Mem) (ab : U32) (h : U32) (hs : U32) : U32 :=
+  ((ie_dot4_us (ie_dot4_us (ie_dot4_us (ie_dot4_us 0#32 (ie_q6k_vw (Mem.load qw qb) (Mem.load hw hb) h 0#32) (Mem.load aw (ab + (4#32 * h)))) (ie_q6k_vw (Mem.load qw (qb + 1#32)) (Mem.load hw hb) h 1#32) (Mem.load aw ((ab + (4#32 * h)) + 1#32))) (ie_q6k_vw (Mem.load qw (qb + 2#32)) (Mem.load hw hb) h 2#32) (Mem.load aw ((ab + (4#32 * h)) + 2#32))) (ie_q6k_vw (Mem.load qw (qb + 3#32)) (Mem.load hw hb) h 3#32) (Mem.load aw ((ab + (4#32 * h)) + 3#32))) - (32#32 * hs))
+
+/-- C++: ie_q6k_sw -/
+def ie_q6k_sw (nibword : U32) (hword : U32) (h : U32) (k : U32) : U32 :=
+  ((((ie_q6k_vw nibword hword h k) ||| 2155905152#32) - 538976288#32) ^^^ 2155905152#32)
+
+/-- C++: ie_q6k_dots -/
+def ie_q6k_dots (qw : Mem) (qb : U32) (hw : Mem) (hb : U32) (aw : Mem) (ab : U32) (h : U32) : U32 :=
+  (ie_dot4_ss (ie_dot4_ss (ie_dot4_ss (ie_dot4_ss 0#32 (ie_q6k_sw (Mem.load qw qb) (Mem.load hw hb) h 0#32) (Mem.load aw (ab + (4#32 * h)))) (ie_q6k_sw (Mem.load qw (qb + 1#32)) (Mem.load hw hb) h 1#32) (Mem.load aw ((ab + (4#32 * h)) + 1#32))) (ie_q6k_sw (Mem.load qw (qb + 2#32)) (Mem.load hw hb) h 2#32) (Mem.load aw ((ab + (4#32 * h)) + 2#32))) (ie_q6k_sw (Mem.load qw (qb + 3#32)) (Mem.load hw hb) h 3#32) (Mem.load aw ((ab + (4#32 * h)) + 3#32)))
+
+/-- C++: ie_q6k_dots_s -/
+def ie_q6k_dots_s (sw : Mem) (sb : U32) (aw : Mem) (ab : U32) (h : U32) : U32 :=
+  (ie_dot4_ss (ie_dot4_ss (ie_dot4_ss (ie_dot4_ss 0#32 (Mem.load sw sb) (Mem.load aw (ab + (4#32 * h)))) (Mem.load sw (sb + 1#32)) (Mem.load aw ((ab + (4#32 * h)) + 1#32))) (Mem.load sw (sb + 2#32)) (Mem.load aw ((ab + (4#32 * h)) + 2#32))) (Mem.load sw (sb + 3#32)) (Mem.load aw ((ab + (4#32 * h)) + 3#32)))
+
+/-- C++: ie_q6k_term -/
+def ie_q6k_term (qw : Mem) (qb : U32) (hw : Mem) (hb : U32) (aw : Mem) (ab : U32) (j : U32) : U32 :=
+  (((ie_q6k_q (Mem.load qw (qb + (ie_q4_word_of j))) (Mem.load hw hb) j) - 32#32) * (ie_sext8 (ie_byte (Mem.load aw (ab + (j >>> 2))) (j &&& 3#32))))
+
+/-- C++: ie_q6k_spec (recursive: fuel counts down with n) -/
+def ie_q6k_spec.go (fuel : Nat) (n : U32) (qw : Mem) (qb : U32) (hw : Mem) (hb : U32) (aw : Mem) (ab : U32) (j : U32) (hi : U32) : U32 :=
+  match fuel with
+  | 0 =>
+    0#32
+  | fuel' + 1 =>
+    (bif (BitVec.ult j hi) then ((ie_q6k_term qw qb hw hb aw ab j) + (ie_q6k_spec.go fuel' (n - 1#32) qw qb hw hb aw ab (j + 1#32) hi)) else 0#32)
+
+/-- C++: ie_q6k_spec -/
+def ie_q6k_spec (n : U32) (qw : Mem) (qb : U32) (hw : Mem) (hb : U32) (aw : Mem) (ab : U32) (j : U32) (hi : U32) : U32 :=
+  ie_q6k_spec.go n.toNat n qw qb hw hb aw ab j hi
 
 /-- C++: ie_gemv_ngroups -/
 def ie_gemv_ngroups (rows : U32) : U32 :=
@@ -487,5 +595,29 @@ def law_q4k_nibble (l0 : U32) (l1 : U32) (l2 : U32) (l3 : U32) (h0 : U32) (h1 : 
 /-- C++: law_q4k_dot -/
 def law_q4k_dot (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) : Bool :=
   ((ie_q4k_dot qw qb aw ab) == (ie_q4k_spec 32#32 qw qb aw ab 0#32))
+
+/-- C++: law_q6k_addr -/
+def law_q6k_addr (rows : U32) (nb : U32) (r : U32) (b : U32) (w : U32) (h : U32) (j : U32) : Bool :=
+  ((!((((((ie_q4k_sizes_ok rows nb) && (BitVec.ult r rows)) && (BitVec.ult b nb)) && (BitVec.ult w 4#32)) && (BitVec.ult h 2#32)) && (BitVec.ult j 32#32))) || (((((((((BitVec.ult (ie_q4_dst_word r b w nb) ((rows * nb) * 4#32)) && (BitVec.ult (ie_q6k_hw rows r b h nb) (ie_q6k_qw_n rows nb))) && (BitVec.ule ((rows * nb) * 4#32) (ie_q6k_hw rows r b h nb))) && (BitVec.ult (ie_q6k_sc r b nb) (rows * nb))) && (BitVec.ult (ie_q6k_d rows r b nb) (ie_q6k_qs_n rows nb))) && (BitVec.ult (ie_q6k_src_ql r b j nb) ((rows * (nb / 8#32)) * 210#32))) && (BitVec.ult (ie_q6k_src_qh r b j nb) ((rows * (nb / 8#32)) * 210#32))) && (BitVec.ult (ie_q6k_src_sc r b h nb) ((rows * (nb / 8#32)) * 210#32))) && (BitVec.ult ((ie_q6k_src_d r b nb) + 1#32) ((rows * (nb / 8#32)) * 210#32))))
+
+/-- C++: law_q6k_unpack -/
+def law_q6k_unpack (a0 : U32) (a1 : U32) (a2 : U32) (a3 : U32) (b0 : U32) (b1 : U32) (b2 : U32) (b3 : U32) (c0 : U32) (c1 : U32) (c2 : U32) (c3 : U32) (d0 : U32) (d1 : U32) (d2 : U32) (d3 : U32) (e : U32) : Bool :=
+  ((!(BitVec.ult e 16#32)) || ((ie_q6k_q (ie_pack4 (bif ((e / 4#32) == 0#32) then (a0 &&& 15#32) else (bif ((e / 4#32) == 1#32) then (b0 &&& 15#32) else (bif ((e / 4#32) == 2#32) then (c0 &&& 15#32) else (d0 &&& 15#32)))) (bif ((e / 4#32) == 0#32) then (a1 &&& 15#32) else (bif ((e / 4#32) == 1#32) then (b1 &&& 15#32) else (bif ((e / 4#32) == 2#32) then (c1 &&& 15#32) else (d1 &&& 15#32)))) (bif ((e / 4#32) == 0#32) then (a2 &&& 15#32) else (bif ((e / 4#32) == 1#32) then (b2 &&& 15#32) else (bif ((e / 4#32) == 2#32) then (c2 &&& 15#32) else (d2 &&& 15#32)))) (bif ((e / 4#32) == 0#32) then (a3 &&& 15#32) else (bif ((e / 4#32) == 1#32) then (b3 &&& 15#32) else (bif ((e / 4#32) == 2#32) then (c3 &&& 15#32) else (d3 &&& 15#32))))) (ie_q6k_hpack a0 a1 a2 a3 b0 b1 b2 b3 c0 c1 c2 c3 d0 d1 d2 d3) e) == ((bif ((e / 4#32) == 0#32) then (bif ((e % 4#32) == 0#32) then a0 else (bif ((e % 4#32) == 1#32) then a1 else (bif ((e % 4#32) == 2#32) then a2 else a3))) else (bif ((e / 4#32) == 1#32) then (bif ((e % 4#32) == 0#32) then b0 else (bif ((e % 4#32) == 1#32) then b1 else (bif ((e % 4#32) == 2#32) then b2 else b3))) else (bif ((e / 4#32) == 2#32) then (bif ((e % 4#32) == 0#32) then c0 else (bif ((e % 4#32) == 1#32) then c1 else (bif ((e % 4#32) == 2#32) then c2 else c3))) else (bif ((e % 4#32) == 0#32) then d0 else (bif ((e % 4#32) == 1#32) then d1 else (bif ((e % 4#32) == 2#32) then d2 else d3)))))) &&& 63#32)))
+
+/-- C++: law_q6k_dot -/
+def law_q6k_dot (qw : Mem) (qb : U32) (hw : Mem) (hb : U32) (aw : Mem) (ab : U32) (h : U32) : Bool :=
+  ((!(BitVec.ult h 2#32)) || ((ie_q6k_dot qw qb hw hb aw ab h (ie_q8_hsum aw ab h)) == (ie_q6k_spec 16#32 qw qb hw hb aw ab (16#32 * h) ((16#32 * h) + 16#32))))
+
+/-- C++: law_q6k_dots -/
+def law_q6k_dots (qw : Mem) (qb : U32) (hw : Mem) (hb : U32) (aw : Mem) (ab : U32) (h : U32) : Bool :=
+  ((!(BitVec.ult h 2#32)) || ((ie_q6k_dots qw qb hw hb aw ab h) == (ie_q6k_spec 16#32 qw qb hw hb aw ab (16#32 * h) ((16#32 * h) + 16#32))))
+
+/-- C++: law_q4k_dot_u -/
+def law_q4k_dot_u (qw : Mem) (qb : U32) (u : Mem) (ub : U32) (aw : Mem) (ab : U32) : Bool :=
+  ((!(((((((((Mem.load u ub) == (ie_q4k_lo (Mem.load qw qb))) && ((Mem.load u (ub + 1#32)) == (ie_q4k_hi (Mem.load qw qb)))) && ((Mem.load u (ub + 2#32)) == (ie_q4k_lo (Mem.load qw (qb + 1#32))))) && ((Mem.load u (ub + 3#32)) == (ie_q4k_hi (Mem.load qw (qb + 1#32))))) && ((Mem.load u (ub + 4#32)) == (ie_q4k_lo (Mem.load qw (qb + 2#32))))) && ((Mem.load u (ub + 5#32)) == (ie_q4k_hi (Mem.load qw (qb + 2#32))))) && ((Mem.load u (ub + 6#32)) == (ie_q4k_lo (Mem.load qw (qb + 3#32))))) && ((Mem.load u (ub + 7#32)) == (ie_q4k_hi (Mem.load qw (qb + 3#32)))))) || ((ie_q4k_dot_u u ub aw ab) == (ie_q4k_dot qw qb aw ab)))
+
+/-- C++: law_q6k_dots_s -/
+def law_q6k_dots_s (qw : Mem) (qb : U32) (hw : Mem) (hb : U32) (sw : Mem) (sb : U32) (aw : Mem) (ab : U32) (h : U32) : Bool :=
+  ((!(((((Mem.load sw sb) == (ie_q6k_sw (Mem.load qw qb) (Mem.load hw hb) h 0#32)) && ((Mem.load sw (sb + 1#32)) == (ie_q6k_sw (Mem.load qw (qb + 1#32)) (Mem.load hw hb) h 1#32))) && ((Mem.load sw (sb + 2#32)) == (ie_q6k_sw (Mem.load qw (qb + 2#32)) (Mem.load hw hb) h 2#32))) && ((Mem.load sw (sb + 3#32)) == (ie_q6k_sw (Mem.load qw (qb + 3#32)) (Mem.load hw hb) h 3#32)))) || ((ie_q6k_dots_s sw sb aw ab h) == (ie_q6k_dots qw qb hw hb aw ab h)))
 
 end C

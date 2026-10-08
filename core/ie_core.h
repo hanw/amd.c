@@ -284,12 +284,125 @@ IE_FN(u32, ie_q4k_dot, (Mem qw, u32 qb, Mem aw, u32 ab)) {
                                    IE_LOAD(qw, qb + 2u), IE_LOAD(aw, ab + 2u), IE_LOAD(aw, ab + 6u)),
                       IE_LOAD(qw, qb + 3u), IE_LOAD(aw, ab + 3u), IE_LOAD(aw, ab + 7u));
 }
+/* ie_q4k_dot with the nibbles already split (u: for k < 4, word 2k = the
+ * low nibbles of word k, 2k + 1 = the high nibbles), as the multi-token
+ * kernels do once per weight block and use for every token. */
+IE_FN(u32, ie_q4k_lo, (u32 wq)) { return wq & 0x0F0F0F0Fu; }
+IE_FN(u32, ie_q4k_hi, (u32 wq)) { return (wq >> 4u) & 0x0F0F0F0Fu; }
+IE_FN(u32, ie_q4k_dot_u, (Mem u, u32 ub, Mem aw, u32 ab)) {
+  return ie_dot4_us(ie_dot4_us(ie_dot4_us(ie_dot4_us(ie_dot4_us(ie_dot4_us(ie_dot4_us(ie_dot4_us(0u, IE_LOAD(u, ub), IE_LOAD(aw, ab)),
+      IE_LOAD(u, ub + 1u), IE_LOAD(aw, ab + 4u)), IE_LOAD(u, ub + 2u), IE_LOAD(aw, ab + 1u)), IE_LOAD(u, ub + 3u), IE_LOAD(aw, ab + 5u)),
+      IE_LOAD(u, ub + 4u), IE_LOAD(aw, ab + 2u)), IE_LOAD(u, ub + 5u), IE_LOAD(aw, ab + 6u)),
+      IE_LOAD(u, ub + 6u), IE_LOAD(aw, ab + 3u)), IE_LOAD(u, ub + 7u), IE_LOAD(aw, ab + 7u));
+}
 /* The spec: the sum over j < 32 of nibble j * activation j. n is the fuel. */
 IE_FN(u32, ie_q4k_term, (Mem qw, u32 qb, Mem aw, u32 ab, u32 j)) {
   return ie_q4_nib(IE_LOAD(qw, qb + ie_q4_word_of(j)), j) * ie_sext8(ie_byte(IE_LOAD(aw, ab + (j >> 2u)), j & 3u));
 }
 IE_FN(u32, ie_q4k_spec, (u32 n, Mem qw, u32 qb, Mem aw, u32 ab, u32 j)) {
   return n == 0u ? 0u : j < 32u ? ie_q4k_term(qw, qb, aw, ab, j) + ie_q4k_spec(n - 1u, qw, qb, aw, ab, j + 1u) : 0u;
+}
+
+/* ======================================================================
+ * 2d. Q6_K weights (MAT_Q6K) x Q8 activations
+ * ==================================================================== */
+
+/* GGUF Q6_K: super-blocks of 256 weights, 210 bytes: ql[128] (low 4 bits),
+ * qh[64] (high 2 bits), int8 scales[16] (one per 16 weights), f16 d.
+ * Weight e of a super-block (e = 128 n + 32 m + l): low bits = nibble
+ * (m < 2: low, else high) of ql[64 n + 32 (m & 1) + l], high bits =
+ * (qh[32 n + l] >> 2m) & 3; value = d * sc[e / 16] * (q - 32), q = 0..63.
+ * MAT_Q6K (GPU), sub-block b (32 weights) of row r:
+ *  - qw words 0 .. rows*nb*4: the low 4 bits as a Q4_0 block (ie_q4_dst_word);
+ *  - qw words rows*nb*4 + ie_q6k_hw: 2 words of high bits, word h for the
+ *    weights 16h .. 16h + 15; weight 16h + 4k + i at bits 8i + 2k (so word k
+ *    of the activations lines up after a shift by 2k);
+ *  - qs (u16): (sc0 | sc1 << 8) (int8 scales of the two halves) at
+ *    ie_q6k_sc, then f16 d of each super-block at ie_q6k_d.
+ * Sizes: as Q4_K (ie_q4k_sizes_ok). */
+IE_FN(u32, ie_q6k_hw, (u32 rows, u32 r, u32 b, u32 h, u32 nb)) { return rows * nb * 4u + (r * nb + b) * 2u + h; }
+IE_FN(u32, ie_q6k_qw_n, (u32 rows, u32 nb)) { return rows * nb * 6u; }
+IE_FN(u32, ie_q6k_sc, (u32 r, u32 b, u32 nb)) { return r * nb + b; }
+IE_FN(u32, ie_q6k_d, (u32 rows, u32 r, u32 b, u32 nb)) { return rows * nb + r * (nb / 8u) + b / 8u; }
+IE_FN(u32, ie_q6k_qs_n, (u32 rows, u32 nb)) { return rows * nb + rows * (nb / 8u); }
+
+/* GGUF Q6_K source bytes of weight j (j < 32) of sub-block b of row r. */
+IE_FN(u32, ie_q6k_src_blk, (u32 r, u32 b, u32 nb)) { return (r * (nb / 8u) + b / 8u) * 210u; }
+IE_FN(u32, ie_q6k_src_ql, (u32 r, u32 b, u32 j, u32 nb)) {
+  return ie_q6k_src_blk(r, b, nb) + 64u * ((b % 8u) / 4u) + 32u * ((b % 8u) % 2u) + j;
+}
+IE_FN(u32, ie_q6k_src_qh, (u32 r, u32 b, u32 j, u32 nb)) { return ie_q6k_src_blk(r, b, nb) + 128u + 32u * ((b % 8u) / 4u) + j; }
+IE_FN(u32, ie_q6k_src_sc, (u32 r, u32 b, u32 h, u32 nb)) { return ie_q6k_src_blk(r, b, nb) + 192u + 2u * (b % 8u) + h; }
+IE_FN(u32, ie_q6k_src_d, (u32 r, u32 b, u32 nb)) { return ie_q6k_src_blk(r, b, nb) + 208u; }
+/* The 6-bit q of a weight of sub-block b from its ql and qh bytes. */
+IE_FN(u32, ie_q6k_src_q, (u32 ql, u32 qh, u32 b)) {
+  return (((b % 8u) % 4u < 2u ? ql & 15u : (ql & 255u) >> 4u) | ((((qh & 255u) >> (2u * ((b % 8u) % 4u))) & 3u) << 4u));
+}
+
+/* The high-bits word of 16 weights (q0 .. q15: weight 4k + i at bits 8i + 2k). */
+IE_FN(u32, ie_q6k_h2, (u32 q, u32 e)) { return ((q >> 4u) & 3u) << (8u * (e % 4u) + 2u * (e / 4u)); }
+IE_FN(u32, ie_q6k_hpack, (u32 q0, u32 q1, u32 q2, u32 q3, u32 q4, u32 q5, u32 q6, u32 q7, u32 q8, u32 q9, u32 q10,
+                          u32 q11, u32 q12, u32 q13, u32 q14, u32 q15)) {
+  return ie_q6k_h2(q0, 0u) | ie_q6k_h2(q1, 1u) | ie_q6k_h2(q2, 2u) | ie_q6k_h2(q3, 3u) | ie_q6k_h2(q4, 4u) |
+         ie_q6k_h2(q5, 5u) | ie_q6k_h2(q6, 6u) | ie_q6k_h2(q7, 7u) | ie_q6k_h2(q8, 8u) | ie_q6k_h2(q9, 9u) |
+         ie_q6k_h2(q10, 10u) | ie_q6k_h2(q11, 11u) | ie_q6k_h2(q12, 12u) | ie_q6k_h2(q13, 13u) | ie_q6k_h2(q14, 14u) |
+         ie_q6k_h2(q15, 15u);
+}
+/* q of weight j (j < 32) from the nibble words (Q4_0 order) and the
+ * high-bits word of its half. */
+IE_FN(u32, ie_q6k_q, (u32 nibword, u32 hword, u32 j)) {
+  return ie_q4_nib(nibword, j) | (((hword >> (8u * (j % 4u) + 2u * ((j % 16u) / 4u))) & 3u) << 4u);
+}
+/* The 4 values of q (bytes) of word k (k < 4) of half h: weights
+ * 16h + 4k .. 16h + 4k + 3, from nibble word k and the high-bits word h. */
+IE_FN(u32, ie_q6k_vw, (u32 nibword, u32 hword, u32 h, u32 k)) {
+  return (h == 0u ? nibword & 0x0F0F0F0Fu : (nibword >> 4u) & 0x0F0F0F0Fu) | (((hword >> (2u * k)) & 0x03030303u) << 4u);
+}
+/* The sum of the 16 activations of half h of the Q8 block at word ab: 4
+ * dot4 with the bytes 1, 1, 1, 1 (0x01010101). */
+IE_FN(u32, ie_q8_hsum, (Mem aw, u32 ab, u32 h)) {
+  return ie_dot4_ss(ie_dot4_ss(ie_dot4_ss(ie_dot4_ss(0u, IE_LOAD(aw, ab + 4u * h), 0x01010101u), IE_LOAD(aw, ab + 4u * h + 1u), 0x01010101u),
+                               IE_LOAD(aw, ab + 4u * h + 2u), 0x01010101u),
+                    IE_LOAD(aw, ab + 4u * h + 3u), 0x01010101u);
+}
+/* The integer dot product of half h of a MAT_Q6K sub-block (nibble words at
+ * qb of qw, high-bits word at hb of hw) and the Q8 block at ab:
+ * sum over the 16 weights of (q - 32) a, as the kernels compute it: 4 dot4
+ * of the q bytes, minus 32 times the half sum hs (ie_q8_hsum). */
+IE_FN(u32, ie_q6k_dot, (Mem qw, u32 qb, Mem hw, u32 hb, Mem aw, u32 ab, u32 h, u32 hs)) {
+  return ie_dot4_us(ie_dot4_us(ie_dot4_us(ie_dot4_us(0u, ie_q6k_vw(IE_LOAD(qw, qb), IE_LOAD(hw, hb), h, 0u), IE_LOAD(aw, ab + 4u * h)),
+                                          ie_q6k_vw(IE_LOAD(qw, qb + 1u), IE_LOAD(hw, hb), h, 1u), IE_LOAD(aw, ab + 4u * h + 1u)),
+                               ie_q6k_vw(IE_LOAD(qw, qb + 2u), IE_LOAD(hw, hb), h, 2u), IE_LOAD(aw, ab + 4u * h + 2u)),
+                    ie_q6k_vw(IE_LOAD(qw, qb + 3u), IE_LOAD(hw, hb), h, 3u), IE_LOAD(aw, ab + 4u * h + 3u)) -
+         32u * hs;
+}
+/* The same 4 bytes as signed q - 32 (int8): (v | 0x80) - 0x20 has no borrow
+ * between bytes (each byte >= 0x80), and ^ 0x80 gives v - 32 mod 256. */
+IE_FN(u32, ie_q6k_sw, (u32 nibword, u32 hword, u32 h, u32 k)) {
+  return ((ie_q6k_vw(nibword, hword, h, k) | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+}
+/* Half h by 4 signed dot4 of the q - 32 bytes (no activation sum needed). */
+IE_FN(u32, ie_q6k_dots, (Mem qw, u32 qb, Mem hw, u32 hb, Mem aw, u32 ab, u32 h)) {
+  return ie_dot4_ss(ie_dot4_ss(ie_dot4_ss(ie_dot4_ss(0u, ie_q6k_sw(IE_LOAD(qw, qb), IE_LOAD(hw, hb), h, 0u), IE_LOAD(aw, ab + 4u * h)),
+                                          ie_q6k_sw(IE_LOAD(qw, qb + 1u), IE_LOAD(hw, hb), h, 1u), IE_LOAD(aw, ab + 4u * h + 1u)),
+                               ie_q6k_sw(IE_LOAD(qw, qb + 2u), IE_LOAD(hw, hb), h, 2u), IE_LOAD(aw, ab + 4u * h + 2u)),
+                    ie_q6k_sw(IE_LOAD(qw, qb + 3u), IE_LOAD(hw, hb), h, 3u), IE_LOAD(aw, ab + 4u * h + 3u));
+}
+/* ie_q6k_dots with the q - 32 words already made (s: word k = ie_q6k_sw of
+ * nibble word k and the high-bits word h), as the multi-token kernels do. */
+IE_FN(u32, ie_q6k_dots_s, (Mem sw, u32 sb, Mem aw, u32 ab, u32 h)) {
+  return ie_dot4_ss(ie_dot4_ss(ie_dot4_ss(ie_dot4_ss(0u, IE_LOAD(sw, sb), IE_LOAD(aw, ab + 4u * h)), IE_LOAD(sw, sb + 1u),
+                                          IE_LOAD(aw, ab + 4u * h + 1u)),
+                               IE_LOAD(sw, sb + 2u), IE_LOAD(aw, ab + 4u * h + 2u)),
+                    IE_LOAD(sw, sb + 3u), IE_LOAD(aw, ab + 4u * h + 3u));
+}
+/* The spec: the sum over the weights j = 16h .. 16h + 15 of (q_j - 32) a_j. */
+IE_FN(u32, ie_q6k_term, (Mem qw, u32 qb, Mem hw, u32 hb, Mem aw, u32 ab, u32 j)) {
+  return (ie_q6k_q(IE_LOAD(qw, qb + ie_q4_word_of(j)), IE_LOAD(hw, hb), j) - 32u) *
+         ie_sext8(ie_byte(IE_LOAD(aw, ab + (j >> 2u)), j & 3u));
+}
+IE_FN(u32, ie_q6k_spec, (u32 n, Mem qw, u32 qb, Mem hw, u32 hb, Mem aw, u32 ab, u32 j, u32 hi)) {
+  return n == 0u ? 0u : j < hi ? ie_q6k_term(qw, qb, hw, hb, aw, ab, j) + ie_q6k_spec(n - 1u, qw, qb, hw, hb, aw, ab, j + 1u, hi) : 0u;
 }
 
 /* ======================================================================
