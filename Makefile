@@ -16,16 +16,32 @@ GPU_ARCH   ?= gfx1201
 GPU_CFLAGS = -x c -std=c11 -Wall -Wextra --target=amdgcn-amd-amdhsa -mcpu=$(GPU_ARCH) -nogpulib -O3
 
 B = build
-SRC = src/common.c src/gguf.c src/model.c src/plan.c src/cpu.c src/hip.c src/main.c
-HDR = src/common.h src/gguf.h src/model.h src/backend.h core/ie_core.h
+ENGINE_SRC = src/common.c src/gguf.c src/model.c src/plan.c src/cpu.c src/hip.c src/gen.c
+SRC = $(ENGINE_SRC) src/main.c
+HDR = src/common.h src/gguf.h src/model.h src/backend.h src/gen.h core/ie_core.h
 
-all: $(B)/ie-run $(B)/ie_kernels.hsaco
+all: $(B)/ie-run $(B)/ie-serve $(B)/ie_kernels.hsaco
 
 $(B):
 	mkdir -p $(B)
 
 $(B)/ie-run: $(SRC) $(HDR) | $(B)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
+
+# ie-serve: the OpenAI-compatible HTTP server (SERVE.md)
+SERVE_SRC = $(ENGINE_SRC) src/tok.c src/json.c src/serve.c
+SERVE_HDR = $(HDR) src/tok.h src/tok_unicode.h src/json.h
+$(B)/ie-serve: $(SERVE_SRC) $(SERVE_HDR) | $(B)
+	$(CC) $(CFLAGS) -o $@ $(SERVE_SRC) $(LDLIBS) -lpthread
+
+# The tokenizer against llama.cpp's tokenizer tests (needs a llama.cpp checkout):
+#   make tokcheck LLAMA_CPP=../llama.cpp
+LLAMA_CPP ?= ../llama.cpp
+$(B)/tok_check: tools/tok_check.c src/tok.c src/gguf.c src/common.c src/tok.h src/tok_unicode.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tools/tok_check.c src/tok.c src/gguf.c src/common.c $(LDLIBS)
+tokcheck: $(B)/tok_check
+	./$(B)/tok_check $(LLAMA_CPP)/models/ggml-vocab-qwen2.gguf $(LLAMA_CPP)/models/ggml-vocab-qwen2.gguf.inp $(LLAMA_CPP)/models/ggml-vocab-qwen2.gguf.out
+	./$(B)/tok_check $(LLAMA_CPP)/models/ggml-vocab-qwen35.gguf $(LLAMA_CPP)/models/ggml-vocab-qwen35.gguf.inp $(LLAMA_CPP)/models/ggml-vocab-qwen35.gguf.out
 
 # GPU kernels: C -> LLVM IR. clang 18 does not accept the attribute
 # amdgpu_flat_work_group_size in C, so the IR gets
@@ -82,4 +98,4 @@ proofs:
 clean:
 	rm -rf $(B) tools/__pycache__
 
-.PHONY: all test proofs clean
+.PHONY: all test proofs clean tokcheck

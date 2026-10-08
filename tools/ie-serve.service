@@ -1,0 +1,20 @@
+# systemd unit for ie-serve (SERVE.md). Change the paths and the user, then:
+#   sudo cp tools/ie-serve.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ie-serve
+#   journalctl -u ie-serve -f          (the log)
+[Unit]
+Description=amd-infer OpenAI-compatible server (ie-serve)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hanwang
+WorkingDirectory=/home/hanwang/amd.c
+# Only Open WebUI on this host talks to ie-serve, so it listens on 127.0.0.1.
+ExecStart=/home/hanwang/amd.c/build/ie-serve /home/hanwang/models/q4/Qwen3.8-27B-Q4_K_M.gguf \
+    --host 127.0.0.1 --port 8000 --ctx 8192 --draft 3
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -28,6 +28,8 @@
 | `src/cpu.c` | CPU 后端。算法和工作划分与 GPU 内核相同。 |
 | `src/hip.c` | GPU 后端。运行时用 dlopen 加载 `libamdhip64.so`。 |
 | `src/main.c` | 命令行工具 `ie-run`。 |
+| `src/gen.c/.h` | 采样、预填充、MTP 推测解码（`ie-run` 和 `ie-serve` 共用）。 |
+| `src/serve.c`、`src/tok.c`、`src/json.c` | HTTP 服务 `ie-serve`（OpenAI 兼容接口）、分词器、JSON。见 `SERVE.md`。 |
 | `kernels/ie_kernels.c` | GPU 内核，用 C 写（不是 HIP C++），由 clang 编译到 amdgcn。 |
 | `tools/make_tiny_gguf.py` | 生成小的随机模型（GGUF v3），两种架构都有。 |
 | `tools/ref_forward.py` | 独立的 numpy float64 参考前向计算。 |
