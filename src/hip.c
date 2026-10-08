@@ -83,7 +83,9 @@ static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "i
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
                                  "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
-enum { GDN_RING = 32, GDN_SLOTS = 4 }; /* as in ie_kernels.c */
+/* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
+ * linear layer are gpu_backend.ns: at least the tokens of a verify run */
+enum { GDN_RING = 32 };
 /* The argmax kernel: workgroups, and its device scratch (partial results and
  * the counter of finished workgroups). */
 enum { ARGMAX_GROUPS = 128 };
@@ -106,6 +108,7 @@ typedef struct {
   u32 *at_count;           /* ie_attn_split: finished workgroups per head (device) */
   u32 *gm_count;           /* GEMV with a fused RMSNorm: finished workgroups (device) */
   u32 slot;                /* ie_gdn: the state slot that holds the current state */
+  u32 ns;                  /* ie_gdn: state slots per linear layer (4, or 8 for more than 3 drafts) */
   int attn_split;          /* use ie_attn_split (hd <= IE_ATT_MAX_HD, and not IE_ATTN=old) */
   /* IE_ATTN=check: after each ie_attn_split, also run ie_attn into chk and
    * compare the two outputs on the host (max |a - b| / max |a|). */
@@ -167,7 +170,8 @@ static void upload_mat(gpu_backend *b, const mat *w, void **w0, void **w1) {
 }
 
 static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits, double *ms);
-static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out);
+static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out,
+                    float *prob);
 static void gpu_accept(backend *bk, uint32_t k);
 static void gpu_read_rows(backend *bk, int id, uint32_t r0, uint32_t n, float *dst);
 static void gpu_copy_rows(backend *bk, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n);
@@ -242,7 +246,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
 
   HIP(H.Malloc((void **)&b->arena, g->arena));
   HIP(H.Memset(b->arena, 0, g->arena));
-  HIP(H.Malloc((void **)&b->am_part, ARGMAX_GROUPS * 8u));
+  HIP(H.Malloc((void **)&b->am_part, ARGMAX_GROUPS * 12u));
+  b->ns = g->T > 4u && g->mtp_h >= 0 ? 8u : 4u; /* a verify run of up to 8 tokens needs 8 states */
   HIP(H.Malloc((void **)&b->am_count, 4u));
   HIP(H.Memset(b->am_count, 0, 4u)); /* the kernel sets it back to 0 */
   HIP(H.Malloc((void **)&b->gm_count, 4u));
@@ -261,7 +266,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   HIP(H.Malloc((void **)&b->kc, kv));
   HIP(H.Malloc((void **)&b->vc, kv));
   const size_t rbytes = (size_t)m->n_rec * GDN_RING * m->conv_dim * 4 + 4,
-               sbytes = (size_t)m->n_rec * GDN_SLOTS * m->n_vh * m->sd * m->sd * 4 + 4;
+               sbytes = (size_t)m->n_rec * b->ns * m->n_vh * m->sd * m->sd * 4 + 4;
   HIP(H.Malloc((void **)&b->ring, rbytes));
   HIP(H.Malloc((void **)&b->st, sbytes));
   const size_t rt = (size_t)g->n_ctx * (m->n_rot / 2) * 4;
@@ -486,15 +491,16 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
       case OP_GDN: {
         const layer *L = &m->l[o->layer];
         float *ring = b->ring + (size_t)L->sti * GDN_RING * m->conv_dim;
-        float *st = b->st + (size_t)L->sti * GDN_SLOTS * m->n_vh * m->sd * m->sd;
+        float *st = b->st + (size_t)L->sti * b->ns * m->n_vh * m->sd * m->sd;
+        u32 ns = b->ns;
         void *cw = b->d[i].w0, *dtb = b->d[i].w1, *sa = b->d[i].bias, *nw = b->d[i].nw;
         u32 cd = m->conv_dim, nk = m->n_kh, nv = m->n_vh;
         u32 is = g->bufs[o->a].stride / 4u, os = g->bufs[o->b].stride / 4u, qs = o->qo >= 0 ? g->bufs[o->qo].stride : 0u;
         /* a prompt chunk (wfrom > 0) may have more tokens than the ring has
          * slots: ie_gdn does not write the ring, ie_ring_store does after it */
         u32 rw = wfrom == 0;
-        if (T <= 4u) { /* decode and verify: one kernel, the norm fused */
-          void *a1[] = {&A, &B, &Q, &ring, &st, &cw, &dtb, &sa, &nw, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &qs, &slot, &wfrom, &rw};
+        if (T <= 8u) { /* decode and verify: one kernel, the norm fused */
+          void *a1[] = {&A, &B, &Q, &ring, &st, &cw, &dtb, &sa, &nw, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &qs, &slot, &wfrom, &rw, &ns};
           launch(b, K_GDN1, nv, a1);
           if (!rw) {
             void *a2[] = {&A, &ring, &pos, &T, &cd, &is};
@@ -502,7 +508,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           }
           break;
         }
-        void *args[] = {&A, &B, &ring, &st, &cw, &dtb, &sa, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &slot, &wfrom, &rw};
+        void *args[] = {&A, &B, &ring, &st, &cw, &dtb, &sa, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &slot, &wfrom, &rw, &ns};
         launch(b, K_GDN, nv * 4u, args); /* prompt chunks: 4 workgroups per value head (GD_SPLIT) */
         if (!rw) {
           void *a2[] = {&A, &ring, &pos, &T, &cd, &is};
@@ -633,7 +639,8 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   return r;
 }
 
-static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out) {
+static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out,
+                    float *prob) {
   gpu_backend *b = (gpu_backend *)bk;
   const graph *g = b->g;
   if (sec == 1 && g->mtp_argmax < 0) ie_die("the graph has no MTP ops");
@@ -642,13 +649,16 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
   u32 *tmp = malloc((size_t)T * am->stride);
   if (!tmp) ie_die("out of memory");
   HIP(H.Memcpy(tmp, b->arena + am->off, (size_t)T * am->stride, hipMemcpyDeviceToHost));
-  for (u32 t = 0; t < T; t++) out[t] = tmp[t * am->stride / 4u];
+  for (u32 t = 0; t < T; t++) {
+    out[t] = tmp[t * am->stride / 4u];
+    if (prob) memcpy(&prob[t], &tmp[t * am->stride / 4u + 1u], 4);
+  }
   free(tmp);
 }
 
 static void gpu_accept(backend *bk, uint32_t k) {
   gpu_backend *b = (gpu_backend *)bk;
-  b->slot = (b->slot + k) % GDN_SLOTS;
+  b->slot = (b->slot + k) % b->ns;
 }
 
 static void gpu_read_rows(backend *bk, int id, uint32_t r0, uint32_t n, float *dst) {

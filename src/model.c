@@ -786,7 +786,7 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx, uint32_t T, int mtp) 
   B.layer = -1;
   g->i_head = g->n_ops; /* the output matrix and the argmax: ops i_head .. n_main - 1 */
   g->logits = matvec(&B, &m->out, xn, xq, "logits", NULL, -1);
-  g->argmax = new_buf(g, "argmax", 4);
+  g->argmax = new_buf(g, "argmax", 8); /* [index, probability (float bits)] */
   emit(&B, OP_ARGMAX, g->logits, g->argmax, -1)->n = m->vocab;
   g->h_out = xn;
   g->n_main = g->n_ops;
@@ -813,7 +813,7 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx, uint32_t T, int mtp) 
     B.layer = -1;
     g->i_mtp_head = g->n_ops;
     g->mtp_logits = matvec(&B, &m->out, g->mtp_g, gq2, "mtp_logits", NULL, -1);
-    g->mtp_argmax = new_buf(g, "mtp_argmax", 4);
+    g->mtp_argmax = new_buf(g, "mtp_argmax", 8);
     emit(&B, OP_ARGMAX, g->mtp_logits, g->mtp_argmax, -1)->n = m->vocab;
   }
   /* The host reads (or copies) these buffers between runs: they live

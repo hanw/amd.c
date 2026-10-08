@@ -121,7 +121,7 @@ static uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32
   if (mtp) b->copy_rows(b, g->mtp_h, 0, -1, 0, 1); /* h(-1) = 0 */
   for (uint32_t p0 = 0; p0 < n; p0 += T) {
     T = n - p0 < chunk ? n - p0 : chunk;
-    b->run(b, 0, toks + p0, T, p0, 1, a);
+    b->run(b, 0, toks + p0, T, p0, 1, a, NULL);
     b->accept(b, T - 1);
     last = a[T - 1];
     if (lg) {
@@ -132,7 +132,7 @@ static uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32
     }
     if (mtp) { /* MTP positions p0 .. p0+T-1: h rows [h(p0-1) (row 0, from before), h(p0) .. h(p0+T-2)] */
       if (T > 1) b->copy_rows(b, g->mtp_h, 1, g->h_out, 0, T - 1);
-      b->run(b, 1, toks + p0, T, p0, 1, d); /* KV catch-up only: its drafts are not used */
+      b->run(b, 1, toks + p0, T, p0, 1, d, NULL); /* KV catch-up only: its drafts are not used */
       b->copy_rows(b, g->mtp_h, 0, g->h_out, T - 1, 1);
     }
   }
@@ -154,7 +154,7 @@ static uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32
  * is the prompt; returns the number of tokens in out. */
 static uint32_t spec_generate(backend *b, const graph *g, uint32_t *out, uint32_t n_prompt, uint32_t total, uint32_t D,
                               int64_t eos, int stop, uint32_t first, uint32_t hrow, sampler *sp, uint32_t V, double *gen_ms,
-                              uint32_t *n_steps, uint32_t *n_acc) {
+                              uint32_t *n_steps, uint32_t *n_acc, float pmin, uint32_t *n_drafted) {
   /* With sampling (temp > 0): the model samples its token a_j after each
    * of t(P), d1, .., dD from its own logits, and d_(j+1) is accepted while
    * it equals a_j ("sample and match"). The drafts are fixed (the MTP
@@ -167,40 +167,45 @@ static uint32_t spec_generate(backend *b, const graph *g, uint32_t *out, uint32_
   uint32_t P = n_prompt, n = n_prompt, k = 0, tP = first;
   out[n++] = tP;
   const double t0 = now_ms();
-  *n_steps = 0, *n_acc = 0;
+  *n_steps = 0, *n_acc = 0, *n_drafted = 0;
   while (n < total && !(stop && (int64_t)out[n - 1] == eos)) {
-    /* (1) catch up positions P-k .. P-1 and draft at P: tokens out[P-k .. P] */
+    /* (1) catch up positions P-k .. P-1 and draft at P: tokens out[P-k .. P].
+     * A draft is kept only while the MTP head's probability of it is at
+     * least pmin: nd drafts (0 .. D) this step. */
+    float pr[16];
+    uint32_t nd = 0;
     b->copy_rows(b, g->mtp_h, 0, g->h_out, hrow, k + 1);
     hrow = 0;
-    b->run(b, 1, &out[P - k], k + 1, P - k, 0, tk);
-    d[1] = tk[k];
-    for (uint32_t j = 2; j <= D; j++) { /* (2) */
+    b->run(b, 1, &out[P - k], k + 1, P - k, 0, tk, pr);
+    if (pr[k] >= pmin) d[1] = tk[k], nd = 1;
+    for (uint32_t j = 2; j <= D && nd == j - 1; j++) { /* (2) */
       b->copy_rows(b, g->mtp_h, 0, g->mtp_g, j == 2 ? k : 0, 1);
-      b->run(b, 1, &d[j - 1], 1, P + j - 1, 0, tk);
-      d[j] = tk[0];
+      b->run(b, 1, &d[j - 1], 1, P + j - 1, 0, tk, pr);
+      if (pr[0] >= pmin) d[j] = tk[0], nd = j;
     }
     /* (3) verify */
     tk[0] = tP;
-    for (uint32_t j = 1; j <= D; j++) tk[j] = d[j];
-    b->run(b, 0, tk, D + 1, P, 0, a);
+    for (uint32_t j = 1; j <= nd; j++) tk[j] = d[j];
+    b->run(b, 0, tk, nd + 1, P, 0, a, NULL);
     if (lg) { /* sample instead of the argmax; only the tokens up to the first mismatch matter */
-      b->read_rows(b, g->logits, 0, D + 1, lg);
+      b->read_rows(b, g->logits, 0, nd + 1, lg);
       const uint32_t st = g->bufs[g->logits].stride / 4u;
-      for (uint32_t j = 0; j <= D; j++) {
+      for (uint32_t j = 0; j <= nd; j++) {
         a[j] = sample(sp, lg + (size_t)j * st, V);
-        if (j < D && a[j] != d[j + 1]) break;
+        if (j < nd && a[j] != d[j + 1]) break;
       }
     }
     /* (4) accept */
     k = 0;
-    while (k < D && d[k + 1] == a[k]) k++;
+    while (k < nd && d[k + 1] == a[k]) k++;
     if (getenv("IE_SPEC_TRACE")) {
       fprintf(stderr, "step P=%u t=%u drafts", P, tP);
-      for (uint32_t j = 1; j <= D; j++) fprintf(stderr, " %u", d[j]);
+      for (uint32_t j = 1; j <= nd; j++) fprintf(stderr, " %u", d[j]);
       fprintf(stderr, " model");
-      for (uint32_t j = 0; j <= D; j++) fprintf(stderr, " %u", a[j]);
+      for (uint32_t j = 0; j <= nd; j++) fprintf(stderr, " %u", a[j]);
       fprintf(stderr, " -> k=%u\n", k);
     }
+    *n_drafted += nd;
     for (uint32_t j = 1; j <= k && n < total; j++) out[n++] = d[j];
     if (n < total) out[n++] = a[k];
     b->accept(b, k); /* the linear attention state after token k */
@@ -221,9 +226,10 @@ static void usage(void) {
           "usage: ie-run MODEL.gguf [--backend cpu|gpu] [--tokens 1,2,3] [--n 32] [--ctx N]\n"
           "              [--dump-logits FILE] [--hsaco build/ie_kernels.hsaco] [--info]\n"
           "              [--tokens-file FILE] [--ppl [--ppl-first N]] [--stop]\n"
-          "              [--draft D [--mtp FILE]] [--chunk N]\n"
+          "              [--draft D [--mtp FILE] [--draft-pmin P]] [--chunk N]\n"
           "  --stop: end the generation at the end-of-sequence token\n"
-          "  --draft D: speculative decoding with the model's MTP head, D = 1 to 3 drafts per step (GPU);\n"
+          "  --draft D: speculative decoding with the model's MTP head, up to D = 1 to 7 drafts per step (GPU);\n"
+          "             --draft-pmin P: stop drafting when the MTP probability of a draft is below P (default 0.6);\n"
           "             --mtp FILE: the MTP head from FILE (default: the model file)\n"
           "  --chunk N: GPU, the prompt in chunks of up to N tokens (1 to 512, default 256)\n"
           "  --temp T [--top-k K] [--top-p P] [--seed S]: sampling (default: greedy)\n");
@@ -233,7 +239,7 @@ static void usage(void) {
 int main(int argc, char **argv) {
   const char *mtp_path = NULL;
   uint32_t draft = 0, chunk = 256, top_k = 0;
-  float temp = 0.0f, top_p = 1.0f;
+  float temp = 0.0f, top_p = 1.0f, pmin = 0.6f;
   uint64_t seed = 1;
   const char *path = NULL, *be = "cpu", *toks = "1", *dump = NULL, *hsaco = "build/ie_kernels.hsaco", *tfile = NULL;
   int n_gen = 32, info = 0, ppl = 0, stop = 0;
@@ -253,6 +259,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--draft") && i + 1 < argc) draft = (uint32_t)atoi(argv[++i]);
     else if (!strcmp(argv[i], "--mtp") && i + 1 < argc) mtp_path = argv[++i];
     else if (!strcmp(argv[i], "--chunk") && i + 1 < argc) chunk = (uint32_t)atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--draft-pmin") && i + 1 < argc) pmin = (float)atof(argv[++i]);
     else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = (float)atof(argv[++i]);
     else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) top_k = (uint32_t)atoi(argv[++i]);
     else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = (float)atof(argv[++i]);
@@ -306,7 +313,7 @@ int main(int argc, char **argv) {
   model_load(&m, &g);
   gguf_file g2;
   if (draft) {
-    if (draft > 3 || ppl || dump || strcmp(be, "gpu")) ie_die("--draft: 1 to 3, GPU only, not with --ppl or --dump-logits");
+    if (draft > 7 || ppl || dump || strcmp(be, "gpu")) ie_die("--draft: 1 to 7, GPU only, not with --ppl or --dump-logits");
     if (mtp_path) gguf_open(&g2, mtp_path);
     if (!model_load_mtp(&m, mtp_path ? &g2 : &g)) ie_die("no MTP head (blk.N.nextn.*) in %s", mtp_path ? mtp_path : path);
   }
@@ -361,11 +368,12 @@ int main(int argc, char **argv) {
   }
   if (draft && start < total) {
     double gms = 0;
-    uint32_t steps = 0, acc = 0;
-    total = spec_generate(b, &gr, out, n_prompt, total, draft, eos_v, stop, tok, hrow, &sp, m.vocab, &gms, &steps, &acc);
+    uint32_t steps = 0, acc = 0, drafted = 0;
+    total = spec_generate(b, &gr, out, n_prompt, total, draft, eos_v, stop, tok, hrow, &sp, m.vocab, &gms, &steps, &acc,
+                          pmin, &drafted);
     const uint32_t gen = total - n_prompt - 1; /* the tokens after the first */
-    fprintf(stderr, "mtp: %u steps, %u drafts accepted of %u (%.1f%%), %.2f tokens per step\n", steps, acc, steps * draft,
-            steps ? 100.0 * acc / (steps * draft) : 0.0, steps ? (double)gen / steps : 0.0);
+    fprintf(stderr, "mtp: %u steps, %u drafts accepted of %u (%.1f%%), %.2f tokens per step\n", steps, acc, drafted,
+            drafted ? 100.0 * acc / drafted : 0.0, steps ? (double)gen / steps : 0.0);
     if (gen) fprintf(stderr, "gpu: %u tokens in %.1f ms, %.3f ms/token, %.1f tokens/s (speculative, %u drafts)\n", gen, gms,
                      gms / gen, 1e3 * gen / gms, draft);
   }

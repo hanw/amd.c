@@ -15,7 +15,8 @@ struct backend {
    * 1. The linear attention state after each token t is kept (or, if
    * last_only, after the last token only) until accept. out: the T argmax
    * tokens. */
-  void (*run)(backend *b, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out);
+  void (*run)(backend *b, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out,
+              float *prob); /* prob (or NULL): the softmax probability of each argmax token */
   /* The tokens 0 .. k of the last model run are final: later runs continue
    * from the linear attention state after token k. (A one-token step needs
    * no accept.) */

@@ -960,14 +960,13 @@ KERNEL ie_qkn_rope_kv(const G float *qkv, G float *qo, G float *kc, G float *vc,
  * head kh = h % nk), state dims 128 x 128. Token t: in + t * is = [q k v (cd)
  * | z (inner) | beta (nv) | alpha (nv)], inner = nv * 128; output at out +
  * t * os, its Q8 copy at oq + t * qs. ring: the conv inputs of the last 32
- * positions [slot][cd] (slot = position % 32). S: GDN_SLOTS (4) state slots [slot][h][i][j]
+ * positions [slot][cd] (slot = position % 32). S: ns (4 or 8) state slots [slot][h][i][j]
  * (i: key dim, j: value dim); the state is read from slot c and the state
- * after token t is written to slot (c + t) % 4 (only for t >= wfrom: a prompt chunk keeps only its last state), so that a speculative step
+ * after token t is written to slot (c + t) % ns (only for t >= wfrom: a prompt chunk keeps only its last state), so that a speculative step
  * can go back to the state after any of its tokens. Each thread reads and
  * writes only its own state values, so slot c can be overwritten. Thread t:
  * value dim j = t % 128, key dims i of half t / 128. The CPU backend (cpu.c,
  * gdn) does the same arithmetic for one token (slot c = 0). */
-#define GDN_SLOTS 4u
 #define GDN_RING 32u
 static LDS float gd_q[128], gd_k[128], gd_r[8];
 /* conv input of channel c at token u of this launch, or (before the launch)
@@ -995,7 +994,7 @@ static inline float conv_ch(const G float *in, u32 is, G float *ring, const G fl
 static LDS float gd1_v[128], gd1_p[2][128];
 KERNEL ie_gdn1(const G float *in, G float *out, G u8 *oq, G float *ring, G float *S, const G float *cw, const G float *dtb,
                const G float *sa, const G float *nw, u32 pos, u32 cd, u32 nk, u32 nv, float eps, u32 T, u32 is, u32 os,
-               u32 qs, u32 c, u32 wfrom, u32 rw) {
+               u32 qs, u32 c, u32 wfrom, u32 rw, u32 ns) {
   const u32 h = wgid(), t0 = tid(), j = t0 & 127u, half = t0 >> 7, kh = h % nk, w = t0 >> 5, inner = nv * 128u;
   const unsigned long slot = (unsigned long)nv * 16384u, own = (unsigned long)h * 16384u + half * 64u * 128u + j;
   float st[64];
@@ -1026,7 +1025,7 @@ KERNEL ie_gdn1(const G float *in, G float *out, G u8 *oq, G float *ring, G float
     const float delta = (gd1_v[j] - (gd1_p[0][j] + gd1_p[1][j])) * beta;
     barrier();
     float po = 0.0f;
-    G float *Sw = S + ((c + t) % GDN_SLOTS) * slot + own;
+    G float *Sw = S + ((c + t) % ns) * slot + own;
     for (u32 ii = 0; ii < 64u; ii++) {
       st[ii] += gd_k[half * 64u + ii] * delta;
       if (t >= wfrom) Sw[ii * 128u] = st[ii]; /* uniform */
@@ -1060,7 +1059,7 @@ KERNEL ie_gdn1(const G float *in, G float *out, G u8 *oq, G float *ring, G float
 static LDS float gd_p8[8][32], gd_v32[32];
 KERNEL ie_gdn(const G float *in, G float *out, G float *ring, G float *S, const G float *cw, const G float *dtb,
               const G float *sa, u32 pos, u32 cd, u32 nk, u32 nv, float eps, u32 T, u32 is, u32 os, u32 c, u32 wfrom,
-              u32 rw) {
+              u32 rw, u32 ns) {
   const u32 h = wgid() / GD_SPLIT, cq = wgid() % GD_SPLIT, t0 = tid(), w = t0 >> 5, l = lane(), kh = h % nk;
   const u32 j128 = t0 & 127u, half = t0 >> 7, inner = nv * 128u;
   const unsigned long slot = (unsigned long)nv * 16384u, own = (unsigned long)h * 16384u + (16u * w) * 128u + 32u * cq + l;
@@ -1102,7 +1101,7 @@ KERNEL ie_gdn(const G float *in, G float *out, G float *ring, G float *S, const 
     const float delta = (gd_v32[l] - kv) * beta;
     barrier();
     float po = 0.0f;
-    G float *Sw = S + ((c + t) % GDN_SLOTS) * slot + own;
+    G float *Sw = S + ((c + t) % ns) * slot + own;
     for (u32 ii = 0; ii < 16u; ii++) {
       st[ii] += gd_k[16u * w + ii] * delta;
       if (t >= wfrom) Sw[ii * 128u] = st[ii]; /* uniform */
@@ -1313,15 +1312,23 @@ static inline void wg_best(float *bv, u32 *bi) {
   *bi = am_i[0];
   barrier();
 }
+/* out[0] = the first index of the largest x; out[1] (float bits) = its
+ * softmax probability 1 / sum_i exp(x_i - max) (the MTP draft confidence).
+ * part: 3 words per workgroup (max, index, sum of exp(x - max) over its
+ * elements). The argmax itself is as before (the sums do not change it). */
 KERNEL ie_argmax(const G float *x, u32 n, G u32 *out, G u32 *part, G u32 *count, u32 ng) {
   float bv = -__builtin_inff();
   u32 bi = 0xFFFFFFFFu;
   for (u32 i = wgid() * NT + tid(); i < n; i += ng * NT)
     if (better(x[i], i, bv, bi)) bv = x[i], bi = i;
   wg_best(&bv, &bi);
+  float se = 0.0f;
+  for (u32 i = wgid() * NT + tid(); i < n; i += ng * NT) se += __builtin_expf(x[i] - bv);
+  se = wg_sum(se);
   if (tid() == 0u) {
-    part[2u * wgid()] = __builtin_bit_cast(u32, bv);
-    part[2u * wgid() + 1u] = bi;
+    part[3u * wgid()] = __builtin_bit_cast(u32, bv);
+    part[3u * wgid() + 1u] = bi;
+    part[3u * wgid() + 2u] = __builtin_bit_cast(u32, se);
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     am_last = __atomic_fetch_add(count, 1u, __ATOMIC_ACQ_REL) == ng - 1u;
   }
@@ -1330,13 +1337,21 @@ KERNEL ie_argmax(const G float *x, u32 n, G u32 *out, G u32 *part, G u32 *count,
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
   bv = -__builtin_inff(), bi = 0xFFFFFFFFu;
   for (u32 g = tid(); g < ng; g += NT) {
-    const float v = __builtin_bit_cast(float, __atomic_load_n(&part[2u * g], __ATOMIC_RELAXED));
-    const u32 i = __atomic_load_n(&part[2u * g + 1u], __ATOMIC_RELAXED);
+    const float v = __builtin_bit_cast(float, __atomic_load_n(&part[3u * g], __ATOMIC_RELAXED));
+    const u32 i = __atomic_load_n(&part[3u * g + 1u], __ATOMIC_RELAXED);
     if (better(v, i, bv, bi)) bv = v, bi = i;
   }
   wg_best(&bv, &bi);
+  float S = 0.0f;
+  for (u32 g = tid(); g < ng; g += NT) {
+    const float v = __builtin_bit_cast(float, __atomic_load_n(&part[3u * g], __ATOMIC_RELAXED));
+    const float sg = __builtin_bit_cast(float, __atomic_load_n(&part[3u * g + 2u], __ATOMIC_RELAXED));
+    if (sg > 0.0f) S += sg * __builtin_expf(v - bv);
+  }
+  S = wg_sum(S);
   if (tid() == 0u) {
     out[0] = bi;
+    out[1] = __builtin_bit_cast(u32, 1.0f / S);
     *count = 0u;
   }
 }
