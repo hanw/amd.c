@@ -243,7 +243,10 @@ static void quant_q8_0_bytes(const float *x, uint64_t n, uint8_t *out) {
   }
 }
 
-/* qwen35: Q4_0 matrices (in Q4_K_M files: the MTP layer) are loaded as Q8_0. */
+/* qwen35: Q4_0 matrices of the main layers are loaded as Q8_0 (the Q8_0
+ * kernels have the multi-token paths). The MTP layer keeps Q4_0 (MAT_Q4,
+ * half the bytes): it runs one token at a time (drafts, and the last token
+ * of a verify), and its results only choose the drafts, not the output. */
 static int q4_as_q8;
 
 /* Load matrix `name` of rows x cols (GGUF ne = [cols, rows]). A Q8_0 matrix
@@ -609,6 +612,8 @@ int model_load_mtp(model *m, gguf_file *g) {
   load_vec(&m->head_norm, g, NAME("nextn.shared_head_norm.weight"), m->dim, 1);
   if (!m->head_norm.n) load_vec(&m->head_norm, g, "output_norm.weight", m->dim, 0);
   uint64_t wb = 0; /* the MTP weights are not in weight_bytes (the bytes of one model step) */
+  const int q4q8 = q4_as_q8;
+  q4_as_q8 = getenv("IE_MTP_Q8") != NULL; /* IE_MTP_Q8=1: Q4_0 as Q8_0 here too (as before) */
   load_mat(&m->eh, g, NAME("nextn.eh_proj.weight"), m->dim, 2 * m->dim, &wb, 1);
   if (ie_mat_sink) ie_mat_sink(&m->eh);
   load_vec(&L->attn_norm, g, NAME("attn_norm.weight"), m->dim, 0);
@@ -623,6 +628,7 @@ int model_load_mtp(model *m, gguf_file *g) {
   load_mat(&L->wup, g, NAME("ffn_up.weight"), m->ffn, m->dim, &wb, 1);
   load_mat(&L->wdown, g, NAME("ffn_down.weight"), m->dim, m->ffn, &wb, 1);
 #undef NAME
+  q4_as_q8 = q4q8;
   mat *qkv[3] = {&L->wq, &L->wk, &L->wv};
   concat_mats(&L->wqkv, qkv, 3);
   mat *gu[2] = {&L->wgate, &L->wup};
