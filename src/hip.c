@@ -595,6 +595,10 @@ static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u
       continue;
     }
     if (chunk && g->mtp_logits >= 0 && i >= g->i_mtp_head) continue;
+    if (T > 1 && g->mtp_logits >= 0 && i >= g->i_mtp_head) { /* MTP catch-up: only the last token's draft is used */
+      launch_op(b, i, T - 1, toks[T - 1], pos + T - 1, 1, slot, wfrom);
+      continue;
+    }
     static int nobatch = -1;
     if (nobatch < 0) nobatch = getenv("IE_GEMV_NOBATCH") != NULL; /* debug: one GEMV launch per token */
     /* one launch for all tokens: GDN (sequential inside), Q8 GEMV (weights

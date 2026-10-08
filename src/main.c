@@ -316,6 +316,8 @@ int main(int argc, char **argv) {
     if (draft > 7 || ppl || dump || strcmp(be, "gpu")) ie_die("--draft: 1 to 7, GPU only, not with --ppl or --dump-logits");
     if (mtp_path) gguf_open(&g2, mtp_path);
     if (!model_load_mtp(&m, mtp_path ? &g2 : &g)) ie_die("no MTP head (blk.N.nextn.*) in %s", mtp_path ? mtp_path : path);
+    const char *dh = getenv("IE_DRAFT_HEAD"); /* q8: the drafts use the Q8_0 output matrix */
+    if (!(dh && !strcmp(dh, "q8"))) model_make_draft_head(&m, &g);
   }
   uint32_t need = n_prompt + (uint32_t)n_gen + draft;
   if (n_ctx == 0) n_ctx = need;

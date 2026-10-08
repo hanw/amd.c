@@ -463,7 +463,47 @@ int model_load_mtp(model *m, gguf_file *g) {
   return 1;
 }
 
+/* GGUF Q4_0 bytes of n floats, as ggml's quantize_row_q4_0_ref: d =
+ * (the value of largest magnitude) / -8, q = min(15, (int8)(x / d + 8.5)). */
+static void quant_q4_0_bytes(const float *x, uint64_t n, uint8_t *out) {
+  for (uint64_t b = 0; b < n / 32; b++) {
+    float amax = 0.0f, mx = 0.0f;
+    for (int j = 0; j < 32; j++) {
+      const float v = x[32 * b + j];
+      if (fabsf(v) > amax) amax = fabsf(v), mx = v;
+    }
+    const float d = mx / -8.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+    const uint16_t h = ie_f32_to_f16(d);
+    memcpy(out + 18 * b, &h, 2);
+    for (int j = 0; j < 16; j++) {
+      int q0 = (int)(int8_t)(x[32 * b + j] * id + 8.5f), q1 = (int)(int8_t)(x[32 * b + 16 + j] * id + 8.5f);
+      q0 = q0 > 15 ? 15 : q0, q1 = q1 > 15 ? 15 : q1;
+      out[18 * b + 2 + j] = (uint8_t)(q0 | (q1 << 4));
+    }
+  }
+}
+
+void model_make_draft_head(model *m, gguf_file *g) {
+  const gguf_tensor *t = gguf_tensor_find(g, "output.weight");
+  if (!t) t = need_tensor(g, "token_embd.weight"); /* tied */
+  mat *w = &m->out_draft;
+  memset(w, 0, sizeof *w);
+  w->kind = MAT_Q4, w->rows = m->vocab, w->cols = m->dim, w->nb = m->dim / 32;
+  if (!ie_sizes_ok(w->rows, w->nb)) { memset(w, 0, sizeof *w); return; }
+  float *row = ie_alloc((size_t)m->dim * 4);
+  uint8_t *q4 = ie_alloc((size_t)w->rows * w->nb * 18);
+  for (uint32_t r = 0; r < w->rows; r++) {
+    dequant(t, (uint64_t)r * m->dim, m->dim, row);
+    quant_q4_0_bytes(row, m->dim, q4 + (size_t)r * w->nb * 18);
+  }
+  repack_q4(w, q4);
+  free(row), free(q4);
+  if (ie_mat_sink) ie_mat_sink(w);
+  fprintf(stderr, "mtp: draft head Q4_0 (%.2f MB)\n", (double)w->rows * w->nb * 18 / 1e6);
+}
+
 void model_free(model *m) {
+  free_mat(&m->out_draft);
   if (m->has_mtp) {
     m->n_layer++; /* free the MTP layer with the others */
     free_mat(&m->eh), free(m->enorm.f), free(m->hnorm.f), free(m->head_norm.f);
@@ -812,7 +852,7 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx, uint32_t T, int mtp) 
     int gq2 = m->out.kind != MAT_F32 ? fuse_quant(&B, dim, "mtp_g_q8") : -1;
     B.layer = -1;
     g->i_mtp_head = g->n_ops;
-    g->mtp_logits = matvec(&B, &m->out, g->mtp_g, gq2, "mtp_logits", NULL, -1);
+    g->mtp_logits = matvec(&B, m->out_draft.rows ? &m->out_draft : &m->out, g->mtp_g, gq2, "mtp_logits", NULL, -1);
     g->mtp_argmax = new_buf(g, "mtp_argmax", 8);
     emit(&B, OP_ARGMAX, g->mtp_logits, g->mtp_argmax, -1)->n = m->vocab;
   }
