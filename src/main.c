@@ -28,6 +28,8 @@ typedef struct {
   uint64_t rng;
   uint32_t *idx; /* scratch: candidate ids */
   float *pr;     /* scratch: their weights */
+  float *cv;     /* the GPU top K: values (16 rows x 64) */
+  uint32_t *ci;  /* and ids */
 } sampler;
 static double rng_u01(sampler *sp) { /* xorshift64*, 53 bits */
   sp->rng ^= sp->rng >> 12, sp->rng ^= sp->rng << 25, sp->rng ^= sp->rng >> 27;
@@ -39,10 +41,42 @@ static uint32_t sample_argmax(const float *lg, uint32_t V) {
     if (lg[i] > lg[best]) best = i;
   return best;
 }
+/* The number of candidates: top_k, or (top_p < 1) the 1000 largest, or all. */
+static uint32_t sample_k(const sampler *sp, uint32_t V) {
+  uint32_t K = sp->top_k ? sp->top_k : (sp->top_p < 1.0f ? 1000u : V);
+  return K > V ? V : K;
+}
+/* Sample from n candidates (values v, ids id) in the order value
+ * descending, equal values smaller id first: weights exp((v - v[0]) /
+ * temp), the nucleus top_p, one draw. v may alias sp->pr. */
+static uint32_t sample_cands(sampler *sp, const float *v, const uint32_t *id, uint32_t n) {
+  const float mx = v[0];
+  double z = 0;
+  for (uint32_t i = 0; i < n; i++) z += (sp->pr[i] = expf((v[i] - mx) / sp->temp));
+  if (sp->top_p < 1.0f && n > 1) { /* the weights are already descending: keep the nucleus */
+    double c = 0;
+    uint32_t m = 0;
+    while (m < n && c < sp->top_p * z) c += sp->pr[m++];
+    n = m, z = c;
+  }
+  double u = rng_u01(sp) * z;
+  for (uint32_t i = 0; i < n; i++) {
+    u -= sp->pr[i];
+    if (u <= 0) return id[i];
+  }
+  return id[n - 1];
+}
+/* The candidates of rows r0 .. r0 + n - 1 of the logits on the GPU (top K):
+ * 1 if done (cv, ci: n * K entries), 0 if the backend cannot (then the
+ * host reads the rows and selects). */
+static int gpu_cands(const sampler *sp, backend *b, const graph *g, uint32_t r0, uint32_t n, uint32_t V, float *cv, uint32_t *ci) {
+  const uint32_t K = sample_k(sp, V);
+  if (!b->topk || K >= V || getenv("IE_HOST_TOPK")) return 0;
+  return b->topk(b, g->logits, r0, n, V, K, cv, ci);
+}
 static uint32_t sample(sampler *sp, const float *lg, uint32_t V) {
   if (sp->temp <= 0.0f) return sample_argmax(lg, V);
-  uint32_t K = sp->top_k ? sp->top_k : (sp->top_p < 1.0f ? 1000u : V);
-  if (K > V) K = V;
+  const uint32_t K = sample_k(sp, V);
   uint32_t n = 0;
   if (K == V) {
     for (uint32_t i = 0; i < V; i++) sp->idx[n++] = i;
@@ -68,6 +102,17 @@ static uint32_t sample(sampler *sp, const float *lg, uint32_t V) {
         }
       }
     }
+  }
+  if (K < V) { /* the candidates in the order of the GPU top K: value descending, equal values smaller index first */
+    for (uint32_t i = 0; i < n; i++) sp->pr[i] = lg[sp->idx[i]];
+    for (uint32_t i = 1; i < n; i++) { /* insertion sort: n <= K */
+      const float v = sp->pr[i];
+      const uint32_t id = sp->idx[i];
+      uint32_t j = i;
+      while (j && (sp->pr[j - 1] < v || (sp->pr[j - 1] == v && sp->idx[j - 1] > id))) sp->pr[j] = sp->pr[j - 1], sp->idx[j] = sp->idx[j - 1], j--;
+      sp->pr[j] = v, sp->idx[j] = id;
+    }
+    return sample_cands(sp, sp->pr, sp->idx, n);
   }
   float mx = lg[sp->idx[0]];
   for (uint32_t i = 1; i < n; i++) mx = lg[sp->idx[i]] > mx ? lg[sp->idx[i]] : mx;
@@ -161,6 +206,7 @@ static uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32
    * argmax), so each emitted token is a sample of the model's distribution
    * given the tokens before it: the output distribution is the model's. */
   float *lg = sp->temp > 0.0f ? malloc((size_t)(D + 1) * g->bufs[g->logits].stride) : NULL;
+  double sample_ms = 0; /* host time of the sampling (with the reads of the logits or of the top K) */
   uint32_t a[16], d[16], tk[16];
   /* the prompt is done (prefill): the model and the MTP KV cache for
    * positions < P; first: the greedy token at P; h(P-1) in h_out row hrow */
@@ -187,14 +233,24 @@ static uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32
     tk[0] = tP;
     for (uint32_t j = 1; j <= nd; j++) tk[j] = d[j];
     b->run(b, 0, tk, nd + 1, P, 0, a, NULL);
+    const double ts0 = now_ms();
     if (lg) { /* sample instead of the argmax; only the tokens up to the first mismatch matter */
-      b->read_rows(b, g->logits, 0, nd + 1, lg);
-      const uint32_t st = g->bufs[g->logits].stride / 4u;
-      for (uint32_t j = 0; j <= nd; j++) {
-        a[j] = sample(sp, lg + (size_t)j * st, V);
-        if (j < nd && a[j] != d[j + 1]) break;
+      const uint32_t K = sample_k(sp, V);
+      if (gpu_cands(sp, b, g, 0, nd + 1, V, sp->cv, sp->ci)) {
+        for (uint32_t j = 0; j <= nd; j++) {
+          a[j] = sample_cands(sp, sp->cv + (size_t)j * K, sp->ci + (size_t)j * K, K);
+          if (j < nd && a[j] != d[j + 1]) break;
+        }
+      } else {
+        b->read_rows(b, g->logits, 0, nd + 1, lg);
+        const uint32_t st = g->bufs[g->logits].stride / 4u;
+        for (uint32_t j = 0; j <= nd; j++) {
+          a[j] = sample(sp, lg + (size_t)j * st, V);
+          if (j < nd && a[j] != d[j + 1]) break;
+        }
       }
     }
+    sample_ms += now_ms() - ts0;
     /* (4) accept */
     k = 0;
     while (k < nd && d[k + 1] == a[k]) k++;
@@ -217,6 +273,7 @@ static uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32
         if ((int64_t)out[j] == eos) { n = j + 1; break; }
   }
   *gen_ms = now_ms() - t0;
+  if (lg) fprintf(stderr, "sampling: %.1f ms in all (%.3f ms per step)\n", sample_ms, *n_steps ? sample_ms / *n_steps : 0.0);
   free(lg);
   return n;
 }
@@ -347,7 +404,8 @@ int main(int argc, char **argv) {
   double ms_sum = 0, ms_gen = 0, nll = 0;
   uint32_t n_nll = 0;
   uint32_t n_timed = 0;
-  sampler sp = {temp, top_p, top_k, seed * 0x9E3779B97F4A7C15ull + 1, malloc((size_t)m.vocab * 4), malloc((size_t)m.vocab * 4)};
+  sampler sp = {temp, top_p, top_k, seed * 0x9E3779B97F4A7C15ull + 1, malloc((size_t)m.vocab * 4), malloc((size_t)m.vocab * 4),
+                malloc(16 * 64 * 4), malloc(16 * 64 * 4)};
   if (temp > 0.0f && (ppl || dump)) ie_die("--temp: not with --ppl or --dump-logits");
   uint32_t start = 0, hrow = 0;
   if (use_pf) { /* the prompt in chunks (prefill), then one token per step */
@@ -355,10 +413,14 @@ int main(int argc, char **argv) {
     const double t0 = now_ms();
     uint32_t first = prefill(b, &gr, m.vocab, prompt, n_prompt, chunk, draft > 0, &pa, &hrow);
     if (temp > 0.0f) { /* sample the first token from the last prompt row */
-      float *lg = malloc(gr.bufs[gr.logits].stride);
-      b->read_rows(b, gr.logits, hrow, 1, lg);
-      first = sample(&sp, lg, m.vocab);
-      free(lg);
+      if (gpu_cands(&sp, b, &gr, hrow, 1, m.vocab, sp.cv, sp.ci)) {
+        first = sample_cands(&sp, sp.cv, sp.ci, sample_k(&sp, m.vocab));
+      } else {
+        float *lg = malloc(gr.bufs[gr.logits].stride);
+        b->read_rows(b, gr.logits, hrow, 1, lg);
+        first = sample(&sp, lg, m.vocab);
+        free(lg);
+      }
     }
     const double pms = now_ms() - t0;
     fprintf(stderr, "prefill: %u tokens in %.1f ms, %.1f tokens/s (chunks of up to %u)\n", n_prompt, pms,
@@ -379,12 +441,21 @@ int main(int argc, char **argv) {
     if (gen) fprintf(stderr, "gpu: %u tokens in %.1f ms, %.3f ms/token, %.1f tokens/s (speculative, %u drafts)\n", gen, gms,
                      gms / gen, 1e3 * gen / gms, draft);
   }
+  const double tw0 = now_ms();
+  const uint32_t pw0 = start;
   for (uint32_t pos = start; !draft && pos < total; pos++) {
     double ms = 0;
     out[pos] = tok;
     if (pos + 1 == total) break; /* the last token needs no step */
-    uint32_t next = b->step(b, tok, pos, (df || ppl || temp > 0.0f) ? logits : NULL, &ms);
-    if (temp > 0.0f && pos + 1 >= n_prompt) next = sample(&sp, logits, m.vocab);
+    const int gk = temp > 0.0f && !df && !ppl && b->topk && sample_k(&sp, m.vocab) <= 64u && !getenv("IE_HOST_TOPK");
+    uint32_t next = b->step(b, tok, pos, (df || ppl || (temp > 0.0f && !gk)) ? logits : NULL, &ms);
+    if (temp > 0.0f && pos + 1 >= n_prompt) {
+      if (gk && gpu_cands(&sp, b, &gr, 0, 1, m.vocab, sp.cv, sp.ci)) next = sample_cands(&sp, sp.cv, sp.ci, sample_k(&sp, m.vocab));
+      else {
+        if (gk) b->read_rows(b, gr.logits, 0, 1, logits);
+        next = sample(&sp, logits, m.vocab);
+      }
+    }
     if (ppl && pos >= ppl_first && pos + 1 < n_prompt) { /* -log p(prompt[pos + 1]) */
       double mx = logits[0], z = 0;
       for (uint32_t i = 1; i < m.vocab; i++) mx = logits[i] > mx ? logits[i] : mx;
@@ -407,6 +478,8 @@ int main(int argc, char **argv) {
     }
   }
   if (df) fclose(df);
+  if (!draft && temp > 0.0f && total > pw0 + 1) /* the host's view: steps and sampling */
+    fprintf(stderr, "wall: %.3f ms/token with sampling\n", (now_ms() - tw0) / (total - pw0 - 1));
 
   printf("ids:");
   for (uint32_t i = 0; i < total; i++) printf(" %u", out[i]);
@@ -428,7 +501,7 @@ int main(int argc, char **argv) {
   (void)ms_sum;
   free(tbuf);
   b->close(b);
-  free(logits), free(out), free(prompt), free(sp.idx), free(sp.pr);
+  free(logits), free(out), free(prompt), free(sp.idx), free(sp.pr), free(sp.cv), free(sp.ci);
   graph_free(&gr);
   model_free(&m);
   gguf_close(&g);

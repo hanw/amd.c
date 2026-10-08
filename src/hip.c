@@ -90,11 +90,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 /* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
  * linear layer are gpu_backend.ns: at least the tokens of a verify run */
@@ -120,6 +120,7 @@ typedef struct {
   u32 *am_part, *am_count; /* argmax scratch (device) */
   u32 *at_count;           /* ie_attn_split: finished workgroups per head (device); ie_attn_split_t: per token too */
   float *at_part;          /* ie_attn_split_t: the partial results, at_pstride floats per token */
+  float *tk_buf;           /* top K: candidates (TK_ROWS x TK_NG x TK_MAX values, then indices), results */
   u32 at_pstride, at_tmax;
   u32 *gm_count;           /* GEMV with a fused RMSNorm: finished workgroups (device) */
   u32 slot;                /* ie_gdn: the state slot that holds the current state */
@@ -198,6 +199,7 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
                     float *prob);
 static void gpu_accept(backend *bk, uint32_t k);
 static void gpu_read_rows(backend *bk, int id, uint32_t r0, uint32_t n, float *dst);
+static int gpu_topk(backend *bk, int id, uint32_t r0, uint32_t n, uint32_t nv, uint32_t K, float *val, uint32_t *idx);
 static void gpu_copy_rows(backend *bk, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n);
 static void gpu_close(backend *bk);
 
@@ -264,6 +266,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   b->base.copy_rows = gpu_copy_rows;
   b->base.accept = gpu_accept;
   b->base.read_rows = gpu_read_rows;
+  b->base.topk = gpu_topk;
   b->base.close = gpu_close;
   b->m = m;
   b->g = g;
@@ -881,6 +884,29 @@ static void gpu_read_rows(backend *bk, int id, uint32_t r0, uint32_t n, float *d
   HIP(H.Memcpy(dst, b->arena + B->off + (size_t)r0 * B->stride, (size_t)n * B->stride, hipMemcpyDeviceToHost));
 }
 
+/* top K on the GPU (ie_topk_part, ie_topk_merge): see ie_kernels.c */
+enum { TK_MAX = 64, TK_CS = 4096, TK_ROWS = 16, TK_NG = 64 };
+static int gpu_topk(backend *bk, int id, uint32_t r0, uint32_t n, uint32_t nv, uint32_t K, float *val, uint32_t *idx) {
+  gpu_backend *b = (gpu_backend *)bk;
+  const u32 ng = (nv + TK_CS - 1u) / TK_CS;
+  if (K == 0u || K > TK_MAX || n > TK_ROWS || ng > TK_NG) return 0;
+  const buf *B = &b->g->bufs[id];
+  if (!b->tk_buf) HIP(H.Malloc((void **)&b->tk_buf, (size_t)TK_ROWS * (TK_NG + 1u) * TK_MAX * 8u));
+  float *cv = b->tk_buf, *ov = cv + (size_t)TK_ROWS * TK_NG * TK_MAX * 2u;
+  u32 *ci = (u32 *)(cv + (size_t)TK_ROWS * TK_NG * TK_MAX), *oi = (u32 *)(ov + (size_t)TK_ROWS * TK_MAX);
+  void *x = b->arena + B->off + (size_t)r0 * B->stride;
+  u32 xs = B->stride / 4u, cs = (nv + ng - 1u) / ng, nc = ng * K;
+  void *a1[] = {&x, &nv, &xs, &K, &cs, (void *)&ng, &cv, &ci};
+  launch_t(b, K_TOPK_PART, ng, n, a1);
+  void *a2[] = {&cv, &ci, &nc, &K, &ov, &oi};
+  launch(b, K_TOPK_MERGE, n, a2);
+  static float tmp[TK_ROWS * TK_MAX * 2]; /* values, then indices: one copy */
+  HIP(H.Memcpy(tmp, ov, sizeof tmp, hipMemcpyDeviceToHost));
+  memcpy(val, tmp, (size_t)n * K * 4u);
+  memcpy(idx, tmp + TK_ROWS * TK_MAX, (size_t)n * K * 4u);
+  return 1;
+}
+
 static void gpu_copy_rows(backend *bk, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n) {
   gpu_backend *b = (gpu_backend *)bk;
   const graph *g = b->g;
@@ -1051,7 +1077,7 @@ static void gpu_close(backend *bk) {
   for (uint32_t i = 0; i < n_sdev; i++) H.Free(sdev[i]);
   free(sdev), sdev = NULL, n_sdev = cap_sdev = 0;
   H.Free(b->arena), H.Free(b->kc), H.Free(b->vc), H.Free(b->ring), H.Free(b->st);
-  H.Free(b->am_part), H.Free(b->am_count), H.Free(b->at_count), H.Free(b->at_part), H.Free(b->gm_count);
+  H.Free(b->am_part), H.Free(b->am_count), H.Free(b->at_count), H.Free(b->at_part), H.Free(b->tk_buf), H.Free(b->gm_count);
   if (b->prof) {
     for (uint32_t i = 0; i < b->g->n_ops; i++) H.EventDestroy(b->pev[i]);
     free(b->pev), free(b->pms);

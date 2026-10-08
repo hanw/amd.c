@@ -27,6 +27,11 @@ struct backend {
   /* Copy n token rows of buffer src (from row r0) to buffer dst (from row
    * d0); src < 0: write zeros. */
   void (*copy_rows)(backend *b, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n);
+  /* GPU only (NULL on the CPU): the K largest values of n rows of buffer
+   * id (from row r0), each row's first nv values (the vocabulary): val and
+   * idx get n * K entries, per row value descending, equal values smaller
+   * index first. Returns 0 (and does nothing) if K is too large. */
+  int (*topk)(backend *b, int id, uint32_t r0, uint32_t n, uint32_t nv, uint32_t K, float *val, uint32_t *idx);
   /* 1: prompt chunks compute the logits of every token (perplexity); 0
    * (default): only of the last token */
   int all_logits;

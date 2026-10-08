@@ -2590,3 +2590,74 @@ KERNEL ie_argmax(const G float *x, u32 n, G u32 *out, G u32 *part, G u32 *count,
     *count = 0u;
   }
 }
+
+/* ------------------------------------------------------------ top K (sampling) */
+
+/* The K largest logits of each row (K <= TK_MAX), for sampling: the host
+ * then needs K (value, index) pairs instead of the whole row. Order: value
+ * descending; equal values: the smaller index first (as the host's
+ * selection). Two launches:
+ *   ie_topk_part (grid ng x rows): workgroup g takes the indices
+ *     [g cs, (g + 1) cs) of its row (cs <= TK_CS), keeps them in LDS and
+ *     takes its K best one at a time (best of the workgroup, then removed);
+ *   ie_topk_merge (grid rows): the ng K candidates of a row, the same way. */
+#define TK_MAX 64u
+#define TK_CS 4096u
+static LDS float tk_v[TK_CS];
+static LDS u32 tk_i[TK_CS];
+static LDS float tk_wv[8];
+static LDS u32 tk_wi[8], tk_wp[8];
+/* (v, i) better than (bv, bi): larger value, or equal value and smaller index; i = ~0: none */
+static inline int tk_better(float v, u32 i, float bv, u32 bi) {
+  return i != 0xFFFFFFFFu && (bi == 0xFFFFFFFFu || v > bv || (v == bv && i < bi));
+}
+/* the best (value, index, LDS position) of the workgroup, in every thread */
+static inline void tk_wg_best(float *bv, u32 *bi, u32 *bp) {
+#pragma unroll
+  for (u32 m = 16u; m > 0u; m >>= 1) {
+    const float ov = shfl_xor_f(*bv, m);
+    const u32 oi = (u32)__builtin_amdgcn_ds_bpermute((int)((lane() ^ m) * 4u), (int)*bi);
+    const u32 op = (u32)__builtin_amdgcn_ds_bpermute((int)((lane() ^ m) * 4u), (int)*bp);
+    if (tk_better(ov, oi, *bv, *bi)) *bv = ov, *bi = oi, *bp = op;
+  }
+  if (lane() == 0u) tk_wv[tid() >> 5] = *bv, tk_wi[tid() >> 5] = *bi, tk_wp[tid() >> 5] = *bp;
+  lbarrier();
+  float v = tk_wv[0];
+  u32 i = tk_wi[0], p = tk_wp[0];
+  for (u32 w = 1; w < 8u; w++)
+    if (tk_better(tk_wv[w], tk_wi[w], v, i)) v = tk_wv[w], i = tk_wi[w], p = tk_wp[w];
+  *bv = v, *bi = i, *bp = p;
+}
+/* the K best of the n (value, index) pairs in tk_v / tk_i, to ov / oi */
+static inline void tk_select(u32 n, u32 K, G float *ov, G u32 *oi) {
+  for (u32 k = 0; k < K; k++) {
+    float bv = -__builtin_inff();
+    u32 bi = 0xFFFFFFFFu, bp = 0u;
+    for (u32 p = tid(); p < n; p += NT)
+      if (tk_better(tk_v[p], tk_i[p], bv, bi)) bv = tk_v[p], bi = tk_i[p], bp = p;
+    tk_wg_best(&bv, &bi, &bp);
+    if (tid() == 0u) {
+      ov[k] = bv, oi[k] = bi;
+      if (bi != 0xFFFFFFFFu) tk_i[bp] = 0xFFFFFFFFu; /* taken */
+    }
+    lbarrier(); /* the removal is visible; tk_wv free again */
+  }
+}
+KERNEL ie_topk_part(const G float *x, u32 n, u32 xs, u32 K, u32 cs, u32 ng, G float *cv, G u32 *ci) {
+  const u32 r = __builtin_amdgcn_workgroup_id_y(), g = wgid();
+  const G float *row = x + (unsigned long)r * xs;
+  const u32 i0 = g * cs;
+  for (u32 p = tid(); p < cs; p += NT) {
+    const u32 i = i0 + p;
+    tk_v[p] = i < n ? row[i] : -__builtin_inff();
+    tk_i[p] = i < n ? i : 0xFFFFFFFFu;
+  }
+  lbarrier();
+  tk_select(cs, K, cv + ((unsigned long)r * ng + g) * K, ci + ((unsigned long)r * ng + g) * K);
+}
+KERNEL ie_topk_merge(const G float *cv, const G u32 *ci, u32 nc, u32 K, G float *ov, G u32 *oi) {
+  const u32 r = wgid();
+  for (u32 p = tid(); p < nc; p += NT) tk_v[p] = cv[(unsigned long)r * nc + p], tk_i[p] = ci[(unsigned long)r * nc + p];
+  lbarrier();
+  tk_select(nc, K, ov + (unsigned long)r * K, oi + (unsigned long)r * K);
+}
