@@ -306,15 +306,6 @@ KERNEL ie_gemv_q4q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y
  *   dq = sum q a = ie_q4q8_block + 8 asum,
  *   acc += da * ((d sc) dq - (dmin mn) asum)   (no fused multiply-add).
  * ie_gemv_q4kq8_tr does the same arithmetic in the same order per token. */
-static inline float q4k_term(const G u16 *qs, u32 rows, u32 r, u32 b, u32 nb, int dot, int as, float da) {
-#pragma clang fp contract(off)
-  const u32 sm = qs[r * nb + b];
-  const unsigned long dd = (unsigned long)rows * nb + ((unsigned long)r * (nb >> 3) + (b >> 3)) * 2u;
-  const float d = (float)((const G f16 *)qs)[dd], dmin = (float)((const G f16 *)qs)[dd + 1u];
-  const float sc = d * (float)(sm & 63u), mm = dmin * (float)(sm >> 8);
-  const int dq = dot + 8 * as;
-  return da * (sc * (float)dq - mm * (float)as);
-}
 KERNEL ie_gemv_q4kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                      const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
                      G u32 *count) {
@@ -324,26 +315,36 @@ KERNEL ie_gemv_q4kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *
     const G u32 *aw = (const G u32 *)xq;
     const G float *da = (const G float *)(xq + 32u * nb);
     const G u32 *asum = (const G u32 *)(xq + 36u * nb);
+    const G u16 *smr = qs + (unsigned long)r * nb;
+    const G f16 *ddr = (const G f16 *)qs + (unsigned long)rows * nb + (unsigned long)r * (nb >> 3) * 2u;
     float acc = 0.0f;
     for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
       u32x4 w4[GEMV_U], a0[GEMV_U], a1[GEMV_U];
-      u32 bk[GEMV_U];
+      u32 bk[GEMV_U], sm[GEMV_U], as[GEMV_U];
+      float dv[GEMV_U], mv[GEMV_U], dav[GEMV_U];
       int ok[GEMV_U];
-      for (u32 k = 0; k < GEMV_U; k++) {
+      for (u32 k = 0; k < GEMV_U; k++) { /* all loads of the step first */
         ok[k] = ie_lane_blk(l, t + k) < nb;
         bk[k] = ok[k] ? ie_lane_blk(l, t + k) : ie_lane_blk(l, t);
         w4[k] = *(const G u32x4 *)(qw + ie_q4_dst_word(r, bk[k], 0u, nb));
         a0[k] = *(const G u32x4 *)(aw + bk[k] * 8u);
         a1[k] = *(const G u32x4 *)(aw + bk[k] * 8u + 4u);
+        sm[k] = smr[bk[k]];
+        dv[k] = (float)ddr[(bk[k] >> 3) * 2u], mv[k] = (float)ddr[(bk[k] >> 3) * 2u + 1u];
+        as[k] = asum[bk[k]], dav[k] = da[bk[k]];
       }
       for (u32 k = 0; k < GEMV_U; k++) {
         const u32 wq[4] = {w4[k].x, w4[k].y, w4[k].z, w4[k].w};
         const u32 av[8] = {a0[k].x, a0[k].y, a0[k].z, a0[k].w, a1[k].x, a1[k].y, a1[k].z, a1[k].w};
         const Mem qm = {wq}, am = {av};
-        const u32 as = asum[bk[k]];
-        const int dot = (int)ie_q4q8_block(qm, 0u, am, 0u, as);
-        const float term = q4k_term(qs, rows, r, bk[k], nb, dot, (int)as, da[bk[k]]);
-        acc = acc + (ok[k] ? term : 0.0f);
+        const int dot = (int)ie_q4q8_block(qm, 0u, am, 0u, as[k]);
+        /* the arithmetic of q4k_term */
+        const float sc = dv[k] * (float)(sm[k] & 63u), mm = mv[k] * (float)(sm[k] >> 8);
+        const int dq = dot + 8 * (int)as[k];
+        /* acc = fma(sc dq, da, acc); acc = fma(-mm, da asum, acc) (explicit fma: the same in every Q4K kernel) */
+        const float x = dav[k] * (float)(int)as[k];
+        const float a1 = __builtin_fmaf(sc * (float)dq, dav[k], acc), a2 = __builtin_fmaf(-mm, x, a1);
+        acc = ok[k] ? a2 : acc;
       }
     }
     acc = wave_tree_f(acc);
@@ -354,10 +355,7 @@ KERNEL ie_gemv_q4kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *
 
 /* MAT_Q4K for T <= 16 tokens: 4 rows per wave (as ie_gemv_q8q8_tr); per
  * (row, token) the arithmetic and order of ie_gemv_q4kq8 (bitwise equal). */
-#ifndef Q4K_U
-#define Q4K_U 2u
-#endif
-#define Q4K_TR_BODY(QR, QT) \
+#define Q4K_TR_BODY(QR, QT, QU) \
 _Pragma("clang fp contract(off)") \
   const u32 r0 = (wgid() * 8u + (tid() >> 5)) * QR, l = lane(); \
   if (r0 >= rows) return; \
@@ -366,9 +364,9 @@ _Pragma("unroll") \
   for (u32 q = 0; q < QR; q++) \
 _Pragma("unroll") \
     for (u32 j = 0; j < QT; j++) acc[q][j] = 0.0f; \
-  for (u32 t = 0; ie_lane_blk(l, t) < nb; t += Q4K_U) { \
+  for (u32 t = 0; ie_lane_blk(l, t) < nb; t += QU) { \
 _Pragma("unroll") \
-  for (u32 u = 0; u < Q4K_U; u++) { /* Q4K_U blocks: the loads of all go out first */ \
+  for (u32 u = 0; u < QU; u++) { /* QU blocks: the loads of all go out first */ \
     const int okb = ie_lane_blk(l, t + u) < nb; \
     const u32 b = okb ? ie_lane_blk(l, t + u) : ie_lane_blk(l, t); \
     /* per row, once per block: the 32 weights as int8 words (weight j = \
@@ -396,13 +394,14 @@ _Pragma("unroll") \
         const u32x4 a0 = *(const G u32x4 *)(aw + b * 8u), a1 = *(const G u32x4 *)(aw + b * 8u + 4u); \
         const float da = ((const G float *)(xj + 32u * nb))[b]; \
         const int as = (int)((const G u32 *)(xj + 36u * nb))[b]; \
+        const float xa = da * (float)as; /* per token: shared by the rows */ \
         const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w}; \
 _Pragma("unroll") \
         for (u32 q = 0; q < QR; q++) { \
           int dq = 0; /* sum q a, exact: the same integer as ie_q4q8_block + 8 asum */ \
 _Pragma("unroll") \
           for (u32 k = 0; k < 8u; k++) dq = __builtin_amdgcn_sudot4(true, (int)wv[q][k], true, (int)av[k], dq, false); \
-          acc[q][j] = acc[q][j] + da * (sc[q] * (float)dq - mm[q] * (float)as); \
+          acc[q][j] = __builtin_fmaf(-mm[q], xa, __builtin_fmaf(sc[q] * (float)dq, da, acc[q][j])); \
         } \
       } \
     } \
@@ -421,7 +420,12 @@ _Pragma("unroll") \
   }
 KERNEL ie_gemv_q4kq8_tr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                         const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
-  Q4K_TR_BODY(4u, 16u)
+  Q4K_TR_BODY(4u, 16u, 2u)
+}
+/* T <= 8 (speculative verify): 8 rows per wave, half the activation loads per weight byte */
+KERNEL ie_gemv_q4kq8_tr8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                         const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
+  Q4K_TR_BODY(8u, 8u, 1u)
 }
 
 /* y = W x: W is Q8_0 (GPU layout: 8 int8 words per block in qw, f16 scales
@@ -1148,11 +1152,43 @@ KERNEL ie_gemv_f32(const G float *w, const G float *x, G float *y, u32 rows, u32
   if (r < rows) {
   const G float *row = w + (unsigned long)r * cols;
   float acc = 0.0f;
-  for (u32 t = 0; ie_lane_blk(l, t) < cols; t++) acc += row[ie_lane_blk(l, t)] * x[ie_lane_blk(l, t)];
+  /* 8 loads of each in flight before the sums (small matrices: latency bound); the same order of the sums */
+  u32 t = 0;
+  for (; ie_lane_blk(l, t + 7u) < cols; t += 8u) {
+    float wv[8], xv[8];
+#pragma unroll
+    for (u32 k = 0; k < 8u; k++) wv[k] = row[ie_lane_blk(l, t + k)], xv[k] = x[ie_lane_blk(l, t + k)];
+#pragma unroll
+    for (u32 k = 0; k < 8u; k++) acc += wv[k] * xv[k];
+  }
+  for (; ie_lane_blk(l, t) < cols; t++) acc += row[ie_lane_blk(l, t)] * x[ie_lane_blk(l, t)];
   acc = wave_tree_f(acc);
   if (l == 0u) y[r] = epilogue(acc, r, bias, res);
   }
   if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
+}
+
+/* ie_gemv_f32 for T tokens in one launch (grid y = token; byte strides xs,
+ * ys, rs between tokens): the same arithmetic per token. */
+KERNEL ie_gemv_f32_t(const G float *w, const G float *x, G float *y, u32 rows, u32 cols, const G float *bias,
+                     const G float *res, u32 xs, u32 ys, u32 rs) {
+  x = TOKC(x, xs), y = TOK(y, ys), res = TOK(res, rs);
+  const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
+  if (r >= rows) return;
+  const G float *row = w + (unsigned long)r * cols;
+  float acc = 0.0f;
+  /* 8 loads of each in flight before the sums (small matrices: latency bound); the same order of the sums */
+  u32 t = 0;
+  for (; ie_lane_blk(l, t + 7u) < cols; t += 8u) {
+    float wv[8], xv[8];
+#pragma unroll
+    for (u32 k = 0; k < 8u; k++) wv[k] = row[ie_lane_blk(l, t + k)], xv[k] = x[ie_lane_blk(l, t + k)];
+#pragma unroll
+    for (u32 k = 0; k < 8u; k++) acc += wv[k] * xv[k];
+  }
+  for (; ie_lane_blk(l, t) < cols; t++) acc += row[ie_lane_blk(l, t)] * x[ie_lane_blk(l, t)];
+  acc = wave_tree_f(acc);
+  if (l == 0u) y[r] = epilogue(acc, r, bias, res);
 }
 
 /* ---------------------------------------------------------- elementwise */

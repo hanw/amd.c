@@ -106,7 +106,7 @@ void cpu_gemv_q4k(const mat *w, const uint8_t *xq, float *y) {
           const uint16_t sm = w->qs[ie_q4k_sm(r, b, nb)];
           const uint64_t dd = ie_q4k_dd(w->rows, r, b / 8u, nb);
           const float s = ie_f16_to_f32(w->qs[dd]) * (float)(sm & 63u), mm = ie_f16_to_f32(w->qs[dd + 1]) * (float)(sm >> 8);
-          acc += da[b] * (s * (float)dq - mm * (float)(int)asum[b]);
+          acc = fmaf(-mm, da[b] * (float)(int)asum[b], fmaf(s * (float)dq, da[b], acc)); /* as the GPU kernels */
         }
         lane[l] = acc;
       }
