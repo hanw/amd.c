@@ -48,7 +48,7 @@ TEST_SRC = src/common.c src/gguf.c src/model.c src/cpu.c
 $(B)/kernel_test: tests/kernel_test.c $(TEST_SRC) $(HDR) | $(B)
 	$(CC) $(CFLAGS) -o $@ tests/kernel_test.c $(TEST_SRC) $(LDLIBS)
 
-MODELS = $(B)/tiny-qwen2.gguf $(B)/tiny-llama.gguf
+MODELS = $(B)/tiny-qwen2.gguf $(B)/tiny-llama.gguf $(B)/tiny-llama-k.gguf
 $(MODELS) &: tools/make_tiny_gguf.py | $(B)
 	$(PYTHON) tools/make_tiny_gguf.py $(B)
 
@@ -65,6 +65,10 @@ test: all $(B)/laws_test $(B)/kernel_test $(MODELS)
 	./$(B)/ie-run $(B)/tiny-llama.gguf --tokens 1,300,77,259,3 --n 10 --dump-logits $(B)/llama.logits
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-llama.gguf $(B)/llama.logits --mode q8 --tol-median 1e-5 --tol 2e-3
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-llama.gguf $(B)/llama.logits --mode float --tol 5e-2
+	@echo "== tiny llama-k (Q4_K, Q5_K, Q6_K): CPU backend vs numpy reference"
+	./$(B)/ie-run $(B)/tiny-llama-k.gguf --tokens 1,300,77,259,3 --n 10 --dump-logits $(B)/llamak.logits
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-llama-k.gguf $(B)/llamak.logits --mode q8 --tol-median 1e-5 --tol 2e-3
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-llama-k.gguf $(B)/llamak.logits --mode float --tol 5e-2
 	@echo "== GPU backend without a GPU: must fail with a clear message"
 	! ./$(B)/ie-run $(B)/tiny-qwen2.gguf --backend gpu --hsaco $(B)/ie_kernels.hsaco --n 1 2> $(B)/gpu.err
 	cat $(B)/gpu.err

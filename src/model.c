@@ -17,7 +17,18 @@ static const gguf_tensor *need_tensor(gguf_file *g, const char *name) {
   return t;
 }
 
-/* Dequantize n elements of tensor data (F32 / F16 / Q8_0 / Q4_0) to float. */
+/* The 6-bit scale and min of sub-block j (< 8) of a Q4_K / Q5_K block (as
+ * ggml's get_scale_min_k4). */
+static void q4k_scale_min(int j, const uint8_t *q, uint8_t *sc, uint8_t *m) {
+  if (j < 4) {
+    *sc = q[j] & 63, *m = q[j + 4] & 63;
+  } else {
+    *sc = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+    *m = (uint8_t)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+  }
+}
+
+/* Dequantize n elements of tensor data (F32 / F16 / Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K) to float. */
 static void dequant(const gguf_tensor *t, uint64_t first, uint64_t n, float *out) {
   const uint8_t *p = t->data;
   switch (t->type) {
@@ -82,6 +93,35 @@ static void dequant(const gguf_tensor *t, uint64_t first, uint64_t n, float *out
       }
       break;
     }
+    case GGML_Q4_K:
+    case GGML_Q5_K: {
+      /* blocks of 256 (as ggml's dequantize_row_q4_K / _q5_K): f16 d, f16
+       * dmin, 12 bytes of 6-bit scales and mins, (Q5_K: qh[32]), qs[128] */
+      const int five = t->type == GGML_Q5_K;
+      const uint64_t bs = five ? 176 : 144, b0 = first / 256, b1 = (first + n + 255) / 256;
+      float tmp[256];
+      for (uint64_t bk = b0; bk < b1; bk++) {
+        const uint8_t *blk = p + bk * bs, *sc = blk + 4, *qh = blk + 16, *q = blk + (five ? 48 : 16);
+        uint16_t h0, h1;
+        memcpy(&h0, blk, 2), memcpy(&h1, blk + 2, 2);
+        const float d = ie_f16_to_f32(h0), dmin = ie_f16_to_f32(h1);
+        for (int j = 0, is = 0; j < 256; j += 64, is += 2, q += 32) {
+          uint8_t s0, m0, s1, m1;
+          q4k_scale_min(is, sc, &s0, &m0), q4k_scale_min(is + 1, sc, &s1, &m1);
+          const float d1 = d * s0, mm1 = dmin * m0, d2 = d * s1, mm2 = dmin * m1;
+          for (int l = 0; l < 32; l++) {
+            const int h1b = five ? ((qh[l] >> (j / 32)) & 1) << 4 : 0, h2b = five ? ((qh[l] >> (j / 32 + 1)) & 1) << 4 : 0;
+            tmp[j + l] = d1 * (float)((q[l] & 0xF) + h1b) - mm1;
+            tmp[j + 32 + l] = d2 * (float)((q[l] >> 4) + h2b) - mm2;
+          }
+        }
+        for (int j = 0; j < 256; j++) {
+          const uint64_t e = bk * 256 + j;
+          if (e >= first && e < first + n) out[e - first] = tmp[j];
+        }
+      }
+      break;
+    }
     default: ie_die("tensor %s: type %s is not supported here", t->name, ggml_type_name(t->type));
   }
 }
@@ -137,6 +177,33 @@ void repack_q8(mat *w, const uint8_t *src) {
     }
 }
 
+/* Repack a GGUF Q4_K matrix into MAT_Q4K (model.h). Sub-block 2k of a
+ * 64-weight group holds the low nibbles of its 32 bytes, sub-block 2k + 1
+ * the high nibbles; each sub-block is stored as a Q4_0 block (byte j: low
+ * nibble = weight j, high nibble = weight j + 16), so the word maps and the
+ * nibble order are those of MAT_Q4. */
+static void repack_q4k(mat *w, const uint8_t *src) {
+  const uint32_t rows = w->rows, nb = w->nb, ns = nb / 8;
+  w->qw = ie_alloc((size_t)rows * nb * 16);
+  w->qs = ie_alloc((size_t)ie_q4k_qs_n(rows, nb) * 2);
+  for (uint32_t r = 0; r < rows; r++)
+    for (uint32_t sb = 0; sb < ns; sb++) {
+      const uint8_t *blk = src + ((size_t)r * ns + sb) * 144, *q = blk + 16;
+      memcpy(&w->qs[ie_q4k_dd(rows, r, sb, nb)], blk, 2);
+      memcpy(&w->qs[ie_q4k_dd(rows, r, sb, nb) + 1], blk + 2, 2);
+      for (uint32_t k = 0; k < 8; k++) {
+        const uint32_t b = sb * 8 + k;
+        uint8_t sc, mn;
+        q4k_scale_min((int)k, blk + 4, &sc, &mn);
+        w->qs[ie_q4k_sm(r, b, nb)] = (uint16_t)(sc | (mn << 8));
+        uint8_t nib[32], by[16];
+        for (int l = 0; l < 32; l++) nib[l] = (k & 1) ? q[32 * (k / 2) + l] >> 4 : q[32 * (k / 2) + l] & 15;
+        for (int j = 0; j < 16; j++) by[j] = (uint8_t)(nib[j] | (nib[j + 16] << 4));
+        for (uint32_t wd = 0; wd < 4; wd++) w->qw[ie_q4_dst_word(r, b, wd, nb)] = ie_pack4(by[4 * wd], by[4 * wd + 1], by[4 * wd + 2], by[4 * wd + 3]);
+      }
+    }
+}
+
 /* GGUF Q8_0 bytes of n floats (n % 32 == 0), as ggml's quantize_row_q8_0:
  * d = amax / 127 (stored as f16), q = round(x / d). */
 static void quant_q8_0_bytes(const float *x, uint64_t n, uint8_t *out) {
@@ -150,6 +217,9 @@ static void quant_q8_0_bytes(const float *x, uint64_t n, uint8_t *out) {
   }
 }
 
+/* qwen35: Q4_0 matrices (in Q4_K_M files: the MTP layer) are loaded as Q8_0. */
+static int q4_as_q8;
+
 /* Load matrix `name` of rows x cols (GGUF ne = [cols, rows]). A Q8_0 matrix
  * keeps its integer form (MAT_Q8) when q8_ok, else it becomes f32. */
 static void load_mat(mat *w, gguf_file *g, const char *name, uint32_t rows, uint32_t cols, uint64_t *bytes, int q8_ok) {
@@ -160,14 +230,40 @@ static void load_mat(mat *w, gguf_file *g, const char *name, uint32_t rows, uint
            (unsigned long long)t->ne[1], cols, rows);
   w->rows = rows;
   w->cols = cols;
-  if (t->type == GGML_Q4_0) {
+  const int emb = strcmp(name, "token_embd.weight") == 0;
+  if (t->type == GGML_Q4_0 && ie_sizes_ok(rows, cols / 32) && !q4_as_q8) {
     w->kind = MAT_Q4;
     w->nb = cols / 32;
     repack_q4(w, t->data);
     *bytes += (uint64_t)rows * w->nb * 18;
-  } else if (t->type == GGML_Q6_K && q8_ok && ie_q8_sizes_ok(rows, cols / 32)) {
-    /* Q6_K: no integer kernel; requantize to Q8_0 at load (an
-     * approximation: Q8_0 has one scale per 32 weights, Q6_K one per 16) */
+  } else if (t->type == GGML_Q4_0 && q8_ok && ie_q8_sizes_ok(rows, cols / 32)) {
+    /* Q4_0 past the Q4 size limit (K > 16352), or q4_as_q8 (qwen35: the
+     * Q8_0 kernels have the multi-token paths): the same weights as Q8_0,
+     * exactly (int8 q - 8, the same scale) */
+    w->kind = MAT_Q8;
+    w->nb = cols / 32;
+    const uint8_t *src = t->data;
+    uint8_t *q8 = ie_alloc((size_t)rows * w->nb * 34);
+    for (size_t k = 0; k < (size_t)rows * w->nb; k++) {
+      memcpy(q8 + 34 * k, src + 18 * k, 2);
+      for (int j = 0; j < 16; j++) {
+        q8[34 * k + 2 + j] = (uint8_t)(int8_t)((src[18 * k + 2 + j] & 15) - 8);
+        q8[34 * k + 18 + j] = (uint8_t)(int8_t)((src[18 * k + 2 + j] >> 4) - 8);
+      }
+    }
+    repack_q8(w, q8);
+    free(q8);
+    *bytes += (uint64_t)rows * w->nb * 34;
+  } else if (t->type == GGML_Q4_K && !emb && cols % 256 == 0 && ie_q8_sizes_ok(rows, cols / 32)) {
+    w->kind = MAT_Q4K;
+    w->nb = cols / 32;
+    repack_q4k(w, t->data);
+    *bytes += (uint64_t)rows * w->nb * 18;
+  } else if ((t->type == GGML_Q6_K || t->type == GGML_Q5_K || t->type == GGML_Q4_K) && q8_ok &&
+             ie_q8_sizes_ok(rows, cols / 32)) {
+    /* Q6_K, Q5_K (and a Q4_K embedding): no integer kernel; requantize to
+     * Q8_0 at load (an approximation: Q8_0 has one scale per 32 weights,
+     * Q6_K one per 16) */
     w->kind = MAT_Q8;
     w->nb = cols / 32;
     float *row = ie_alloc((size_t)cols * 4);
@@ -207,6 +303,24 @@ static int concat_mats(mat *dst, mat *const *src, int n) {
   const int kind = src[0]->kind;
   const uint32_t cols = src[0]->cols, nb = src[0]->nb;
   if (kind == MAT_Q4 && !ie_sizes_ok(rows, nb)) return 0;
+  if (kind == MAT_Q4K) { /* two sections in qs: concatenate each */
+    if (!ie_q8_sizes_ok(rows, nb)) return 0;
+    memset(dst, 0, sizeof *dst);
+    dst->kind = kind, dst->rows = rows, dst->cols = src[0]->cols, dst->nb = nb;
+    dst->qw = ie_alloc((size_t)rows * nb * 16);
+    dst->qs = ie_alloc((size_t)ie_q4k_qs_n(rows, nb) * 2);
+    size_t r0 = 0;
+    for (int i = 0; i < n; i++) {
+      mat *w = src[i];
+      memcpy(dst->qw + r0 * nb * 4, w->qw, (size_t)w->rows * nb * 16);
+      memcpy(dst->qs + ie_q4k_sm((uint32_t)r0, 0, nb), w->qs, (size_t)w->rows * nb * 2);
+      memcpy(dst->qs + ie_q4k_dd(rows, (uint32_t)r0, 0, nb), w->qs + ie_q4k_dd(w->rows, 0, 0, nb), (size_t)w->rows * (nb / 8) * 4);
+      r0 += w->rows;
+      free(w->qw), free(w->qs);
+      w->qw = NULL, w->qs = NULL;
+    }
+    return 1;
+  }
   if (kind == MAT_Q8 && !ie_q8_sizes_ok(rows, nb)) return 0;
   memset(dst, 0, sizeof *dst);
   dst->kind = kind, dst->rows = rows, dst->cols = cols, dst->nb = nb;
@@ -285,6 +399,7 @@ void model_load(model *m, gguf_file *g) {
   else if (strcmp(arch, "qwen35") == 0) m->arch = ARCH_QWEN35, m->rope = ROPE_NEOX;
   else ie_die("architecture %s is not supported (llama, qwen2, qwen35)", arch);
   const int q35 = m->arch == ARCH_QWEN35;
+  q4_as_q8 = q35;
 
   m->n_layer = need_u32(g, arch, "block_count");
   /* qwen35: the last nextn_predict_layers blocks are multi-token prediction
@@ -661,8 +776,9 @@ static void use_last(gb *B, int id) {
 static int matvec_into(gb *B, const mat *w, int xf, int xq, int into, uint32_t off, const char *name, const vec *bias,
                        int res) {
   int y = into >= 0 ? into : new_buf(B->g, name, w->rows * 4);
-  const int quant_in = w->kind == MAT_Q4 || w->kind == MAT_Q8;
-  op *o = emit(B, w->kind == MAT_Q4 ? OP_GEMV_Q4 : w->kind == MAT_Q8 ? OP_GEMV_Q8 : OP_GEMV_F32, quant_in ? xq : xf, y, -1);
+  const int quant_in = w->kind == MAT_Q4 || w->kind == MAT_Q8 || w->kind == MAT_Q4K;
+  op *o = emit(B, w->kind == MAT_Q4 ? OP_GEMV_Q4 : w->kind == MAT_Q8 ? OP_GEMV_Q8 : w->kind == MAT_Q4K ? OP_GEMV_Q4K : OP_GEMV_F32,
+               quant_in ? xq : xf, y, -1);
   o->w = w;
   o->n = w->cols;
   if (bias && bias->n) o->v = bias;
@@ -884,6 +1000,7 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx, uint32_t T, int mtp) 
   for (uint32_t i = 0; i < g->n_main; i++) {
     const op *p = &g->ops[i];
     if (p->kind == OP_GEMV_Q4) wb += (uint64_t)p->w->rows * p->w->nb * 18;
+    if (p->kind == OP_GEMV_Q4K) wb += (uint64_t)p->w->rows * p->w->nb * 18;
     if (p->kind == OP_GEMV_F32) wb += (uint64_t)p->w->rows * p->w->cols * 4;
     if (p->kind == OP_GEMV_Q8) wb += (uint64_t)p->w->rows * p->w->nb * 34;
   }

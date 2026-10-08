@@ -31,7 +31,7 @@ import sys
 import numpy as np
 from gguf import GGUFReader
 
-Q4_0, Q8_0, F16, F32, Q6_K = 2, 8, 1, 0, 14
+Q4_0, Q8_0, F16, F32, Q4_K, Q5_K, Q6_K = 2, 8, 1, 0, 12, 13, 14
 
 
 def field(r, key, default=None):
@@ -59,11 +59,11 @@ def dequant(t):
         b = raw.reshape(-1, 34)
         d = b[:, :2].copy().view(np.float16).astype(np.float64)
         a = (d * b[:, 2:].view(np.int8).astype(np.float64)).reshape(-1)
-    elif tt == Q6_K:
+    elif tt in (Q4_K, Q5_K, Q6_K):
         # the gguf package's own dequantizer (independent of the engine)
         from gguf.quants import dequantize
         from gguf import GGMLQuantizationType
-        a = dequantize(raw, GGMLQuantizationType.Q6_K).astype(np.float64).reshape(-1)
+        a = dequantize(raw, GGMLQuantizationType(tt)).astype(np.float64).reshape(-1)
     elif tt == Q4_0:
         b = raw.reshape(-1, 18)
         d = b[:, :2].copy().view(np.float16).astype(np.float64)
@@ -87,8 +87,14 @@ class Mat:
             self.d = raw[:, :2].copy().view(np.float16).astype(np.float64).reshape(rows, nb)
             q = np.concatenate([raw[:, 2:] & 15, raw[:, 2:] >> 4], axis=1).astype(np.int64) - 8
             self.q = q.reshape(rows, nb, 32)
-        elif tt == Q6_K:
-            # the engine requantizes Q6_K to Q8_0 at load (ggml's
+        elif tt == Q4_K and t.name != "token_embd.weight":
+            # the engine keeps Q4_K (exact weights): q8 mode multiplies the
+            # exact weights by the quantized activations
+            self.q = self.w.reshape(rows, nb, 32)
+            self.d = np.ones((rows, nb))
+            self.qint = True
+        elif tt in (Q5_K, Q6_K):
+            # the engine requantizes Q6_K and Q5_K to Q8_0 at load (ggml's
             # quantize_row_q8_0: d = amax/127 in float32, stored as f16;
             # q = round half away from zero of x * (1/d)); in q8 mode the
             # reference uses the same Q8_0 weights

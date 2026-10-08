@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
   double tot = 0;
   for (unsigned s = 0; s < ns; s++) {
     unsigned rows = argc > 3 ? (unsigned)atoi(argv[3 + 2 * s]) : def[s][0], nb = argc > 3 ? (unsigned)atoi(argv[4 + 2 * s]) : def[s][1];
-    size_t wb = (size_t)rows * nb * 32, sb = (size_t)rows * nb * 2, xs = ((size_t)nb * 40 + 255) & ~(size_t)255;
+    size_t wb = (size_t)rows * nb * 32, sb = (size_t)rows * nb * 4, /* 4: room for the MAT_Q4K scales */ xs = ((size_t)nb * 40 + 255) & ~(size_t)255;
     void *qw, *qs, *xq, *y;
     Malloc(&qw, wb); Malloc(&qs, sb); Malloc(&xq, xs * T); Malloc(&y, (size_t)rows * 4 * T);
     Memset(qw, 0x5A, wb); Memset(qs, 0x11, sb); Memset(xq, 0x03, xs * T);

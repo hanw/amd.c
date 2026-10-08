@@ -12,7 +12,7 @@ enum { ARCH_LLAMA = 0, ARCH_QWEN2 = 1, ARCH_QWEN35 = 2 };
 enum { ROPE_NORM = 0, ROPE_NEOX = 1 }; /* NORM: pairs (2i, 2i+1); NEOX: (i, i + hd/2) */
 
 /* A weight matrix: rows x cols, y = W x. */
-enum { MAT_Q4 = 0, MAT_F32 = 1, MAT_Q8 = 2 };
+enum { MAT_Q4 = 0, MAT_F32 = 1, MAT_Q8 = 2, MAT_Q4K = 3 };
 typedef struct {
   int kind;
   uint32_t rows, cols, nb; /* nb = cols / 32 (Q4 and Q8) */
@@ -22,6 +22,11 @@ typedef struct {
   uint16_t *qs;
   /* MAT_Q8: the verified Q8_0 GPU layout (ie_q8_dst_word, ie_q8_dst_scale):
    * rows*nb*8 int8 words in qw and rows*nb f16 scales in qs. */
+  /* MAT_Q4K (GGUF Q4_K, sub-blocks of 32 in super-blocks of 256): qw as
+   * MAT_Q4 (rows*nb*4 nibble words, the nibbles of each sub-block in the
+   * Q4_0 order, values 0..15); qs: rows*nb u16 (6-bit scale | 6-bit min << 8)
+   * of each sub-block, then rows*(nb/8)*2 u16 (f16 d, f16 dmin) of each
+   * super-block. Weight = d*sc*q - dmin*mn (as ggml). See ie_q4k_* below. */
   /* MAT_F32: rows*cols floats (dequantized from F32/F16, or Q8_0 for the embedding). */
   float *f;
   /* Streaming load (ie_mat_sink set): the device copies of qw and qs (or
@@ -33,6 +38,14 @@ typedef struct {
   uint32_t n;
   float *f;
 } vec;
+
+/* MAT_Q4K index maps: the (scale, min) word of sub-block b of row r, the
+ * (d, dmin) pair of super-block s (both in u16 units of qs). */
+static inline uint64_t ie_q4k_sm(uint32_t r, uint32_t b, uint32_t nb) { return (uint64_t)r * nb + b; }
+static inline uint64_t ie_q4k_dd(uint32_t rows, uint32_t r, uint32_t s, uint32_t nb) {
+  return (uint64_t)rows * nb + ((uint64_t)r * (nb / 8u) + s) * 2u;
+}
+static inline uint64_t ie_q4k_qs_n(uint32_t rows, uint32_t nb) { return (uint64_t)rows * nb + (uint64_t)rows * (nb / 8u) * 2u; }
 
 typedef struct {
   vec attn_norm, ffn_norm;
@@ -119,6 +132,7 @@ enum {
   OP_RMSNORM, /* b = rmsnorm(a) * w */
   OP_QUANT,   /* b = Q8(a) */
   OP_GEMV_Q4, /* b = W a (a is a Q8 buffer) */
+  OP_GEMV_Q4K, /* the same for a MAT_Q4K matrix */
   OP_GEMV_F32,/* b = W a (a is f32) */
   OP_GEMV_Q8, /* b = W a, W is Q8_0 (a is a Q8 buffer) */
   OP_BIAS,    /* a += w */

@@ -83,6 +83,37 @@ void cpu_gemv_q4(const mat *w, const uint8_t *xq, float *y) {
     }
 }
 
+/* MAT_Q4K matrix x Q8 activations: the same grid, lanes and reduction as
+ * Q4. Per sub-block: dq = sum of q * a (q = 0..15, from the Q4_0 block dot
+ * plus 8 asum), then acc += da * ((d sc) dq - (dmin mn) asum), in the order
+ * of the GPU kernels (ie_gemv_q4kq8). */
+void cpu_gemv_q4k(const mat *w, const uint8_t *xq, float *y) {
+  const u32 nb = w->nb;
+  const Mem qw = {w->qw}, aw = {(const u32 *)xq};
+  const float *da = (const float *)(xq + 32u * nb);
+  const u32 *asum = (const u32 *)(xq + 36u * nb);
+  const u32 ng = ie_gemv_ngroups(w->rows);
+  for (u32 g = 0; g < ng; g++)
+    for (u32 v = 0; v < ie_rows_per_wg(); v++) {
+      const u32 r = ie_gemv_row(g, v);
+      if (r >= w->rows) continue;
+      float lane[32];
+      for (u32 l = 0; l < ie_wave(); l++) {
+        float acc = 0.0f;
+        for (u32 t = 0; ie_lane_blk(l, t) < nb; t++) {
+          const u32 b = ie_lane_blk(l, t);
+          const int dq = (int)ie_q4q8_block(qw, ie_q4_dst_word(r, b, 0, nb), aw, b * 8u, asum[b]) + 8 * (int)asum[b];
+          const uint16_t sm = w->qs[ie_q4k_sm(r, b, nb)];
+          const uint64_t dd = ie_q4k_dd(w->rows, r, b / 8u, nb);
+          const float s = ie_f16_to_f32(w->qs[dd]) * (float)(sm & 63u), mm = ie_f16_to_f32(w->qs[dd + 1]) * (float)(sm >> 8);
+          acc += da[b] * (s * (float)dq - mm * (float)(int)asum[b]);
+        }
+        lane[l] = acc;
+      }
+      y[r] = wave_tree(lane);
+    }
+}
+
 /* Q8_0 matrix x Q8 activations: the same grid, lanes and reduction as Q4;
  * the block dot product is ie_q8q8_block (law q8q8_block). */
 void cpu_gemv_q8(const mat *w, const uint8_t *xq, float *y) {
@@ -320,9 +351,11 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
         break;
       case OP_QUANT: cpu_quant_q8(a, (uint8_t *)bb, o->n / 32); break;
       case OP_GEMV_Q4:
+      case OP_GEMV_Q4K:
       case OP_GEMV_Q8:
       case OP_GEMV_F32:
         if (o->kind == OP_GEMV_Q4) cpu_gemv_q4(o->w, (const uint8_t *)a, bb);
+        else if (o->kind == OP_GEMV_Q4K) cpu_gemv_q4k(o->w, (const uint8_t *)a, bb);
         else if (o->kind == OP_GEMV_Q8) cpu_gemv_q8(o->w, (const uint8_t *)a, bb);
         else cpu_gemv_f32(o->w, a, bb);
         /* the fused epilogue, in the order of the GPU kernels */

@@ -14,7 +14,7 @@ import sys
 
 import numpy as np
 
-GGML_F32, GGML_F16, GGML_Q4_0, GGML_Q8_0 = 0, 1, 2, 8
+GGML_F32, GGML_F16, GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K = 0, 1, 2, 8, 12, 13, 14
 T_U32, T_I32, T_F32, T_BOOL, T_STR, T_ARR, T_U64, T_F64 = 4, 5, 6, 7, 8, 9, 10, 12
 ALIGN = 32
 
@@ -92,6 +92,23 @@ def q8_0(rng, rows, cols, scale):
     blk[:, :, 0:2] = d.view(np.uint8).reshape(rows, nb, 2)
     blk[:, :, 2:] = q.view(np.uint8)
     return blk.tobytes()
+
+
+def kq(rng, rows, cols, scale, typ):
+    """Random Q4_K / Q5_K / Q6_K matrix (cols % 256 == 0): random bytes with
+    small f16 scales (d, dmin), so the values are exact and bounded."""
+    nsb = rows * cols // 256
+    if typ == GGML_Q6_K:
+        b = rng.integers(0, 256, size=(nsb, 210), dtype=np.uint8)
+        b[:, 192:208] = rng.integers(-40, 40, size=(nsb, 16)).astype(np.int8).view(np.uint8)
+        b[:, 208:210] = np.full(nsb, scale / 32.0 / 40.0 * 4, np.float16).view(np.uint8).reshape(nsb, 2)
+        return b.tobytes()
+    bs = 144 if typ == GGML_Q4_K else 176
+    b = rng.integers(0, 256, size=(nsb, bs), dtype=np.uint8)
+    q = 32.0 if typ == GGML_Q5_K else 16.0
+    b[:, 0:2] = np.full(nsb, scale / q / 63.0 * 4, np.float16).view(np.uint8).reshape(nsb, 2)
+    b[:, 2:4] = np.full(nsb, scale / 63.0 * 2, np.float16).view(np.uint8).reshape(nsb, 2)
+    return b.tobytes()
 
 
 def f32(a):
@@ -191,12 +208,46 @@ def make(path, arch, seed, n_layer, dim, ffn, n_head, n_kv, vocab, ctx, biases, 
     print("wrote", path)
 
 
+def make_k(path, seed, n_layer=2, dim=512, ffn=1536, n_head=8, n_kv=4, vocab=301, ctx=256):
+    """llama with K-quant matrices: Q4_K (embedding too), one Q5_K, Q6_K up
+    and output (gate and up of different kinds: not merged)."""
+    rng = np.random.default_rng(seed)
+    hd = dim // n_head
+    kvd = n_kv * hd
+    arch = "llama"
+    kvs = [("general.architecture", T_STR, arch), ("general.name", T_STR, "tiny-llama-k"), ("general.alignment", T_U32, ALIGN),
+           (arch + ".block_count", T_U32, n_layer), (arch + ".context_length", T_U32, ctx),
+           (arch + ".embedding_length", T_U32, dim), (arch + ".feed_forward_length", T_U32, ffn),
+           (arch + ".attention.head_count", T_U32, n_head), (arch + ".attention.head_count_kv", T_U32, n_kv),
+           (arch + ".attention.layer_norm_rms_epsilon", T_F32, 1e-5), (arch + ".rope.freq_base", T_F32, 10000.0),
+           ("tokenizer.ggml.model", T_STR, "llama"), ("tokenizer.ggml.tokens", T_ARR, (T_STR, spm_vocab(vocab))),
+           ("tokenizer.ggml.scores", T_ARR, (T_F32, [0.0] * vocab)), ("tokenizer.ggml.bos_token_id", T_U32, 1)]
+    sc = lambda k: 0.2 / np.sqrt(k)
+    T = [("token_embd.weight", [dim, vocab], GGML_Q4_K, kq(rng, vocab, dim, 1.0, GGML_Q4_K))]
+    for l in range(n_layer):
+        p = "blk.%d." % l
+        T.append((p + "attn_norm.weight", [dim], GGML_F32, f32(1 + 0.1 * rng.standard_normal(dim))))
+        T.append((p + "attn_q.weight", [dim, dim], GGML_Q4_K, kq(rng, dim, dim, sc(dim), GGML_Q4_K)))
+        T.append((p + "attn_k.weight", [dim, kvd], GGML_Q4_K, kq(rng, kvd, dim, sc(dim), GGML_Q4_K)))
+        T.append((p + "attn_v.weight", [dim, kvd], GGML_Q5_K, kq(rng, kvd, dim, sc(dim), GGML_Q5_K)))
+        T.append((p + "attn_output.weight", [dim, dim], GGML_Q4_K, kq(rng, dim, dim, sc(dim), GGML_Q4_K)))
+        T.append((p + "ffn_norm.weight", [dim], GGML_F32, f32(1 + 0.1 * rng.standard_normal(dim))))
+        T.append((p + "ffn_gate.weight", [dim, ffn], GGML_Q4_K, kq(rng, ffn, dim, sc(dim), GGML_Q4_K)))
+        T.append((p + "ffn_up.weight", [dim, ffn], GGML_Q6_K, kq(rng, ffn, dim, sc(dim), GGML_Q6_K)))
+        T.append((p + "ffn_down.weight", [ffn, dim], GGML_Q4_K, kq(rng, dim, ffn, sc(ffn), GGML_Q4_K)))
+    T.append(("output_norm.weight", [dim], GGML_F32, f32(1 + 0.1 * rng.standard_normal(dim))))
+    T.append(("output.weight", [dim, vocab], GGML_Q6_K, kq(rng, vocab, dim, 4 * sc(dim), GGML_Q6_K)))
+    write_gguf(path, kvs, T)
+    print("wrote", path)
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "build"
     make(out + "/tiny-qwen2.gguf", "qwen2", 1, n_layer=2, dim=96, ffn=352, n_head=6, n_kv=2, vocab=300, ctx=256,
          biases=True, tied=True, embd_type=GGML_Q4_0, q8_layer_v=-1)
     make(out + "/tiny-llama.gguf", "llama", 2, n_layer=2, dim=1152, ffn=1376, n_head=8, n_kv=4, vocab=301, ctx=256,
          biases=False, tied=False, embd_type=GGML_F16, q8_layer_v=1)
+    make_k(out + "/tiny-llama-k.gguf", 4)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@
 
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef unsigned char u8;
+typedef unsigned short u16;
 typedef signed char i8;
 typedef _Float16 f16;
 
@@ -296,6 +297,131 @@ KERNEL ie_gemv_q4q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y
     if (l == 0u) y[r] = epilogue(acc, r, bias, res);
   }
   if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
+}
+
+/* y = W x: W is MAT_Q4K (GGUF Q4_K repacked, src/model.h: the nibbles as
+ * Q4_0 blocks, values 0..15; qs: (scale | min << 8) per sub-block of 32,
+ * then (f16 d, f16 dmin) per super-block of 256), x is Q8. The same grid,
+ * lanes and reduction as ie_gemv_q4q8. Per sub-block b:
+ *   dq = sum q a = ie_q4q8_block + 8 asum,
+ *   acc += da * ((d sc) dq - (dmin mn) asum)   (no fused multiply-add).
+ * ie_gemv_q4kq8_tr does the same arithmetic in the same order per token. */
+static inline float q4k_term(const G u16 *qs, u32 rows, u32 r, u32 b, u32 nb, int dot, int as, float da) {
+#pragma clang fp contract(off)
+  const u32 sm = qs[r * nb + b];
+  const unsigned long dd = (unsigned long)rows * nb + ((unsigned long)r * (nb >> 3) + (b >> 3)) * 2u;
+  const float d = (float)((const G f16 *)qs)[dd], dmin = (float)((const G f16 *)qs)[dd + 1u];
+  const float sc = d * (float)(sm & 63u), mm = dmin * (float)(sm >> 8);
+  const int dq = dot + 8 * as;
+  return da * (sc * (float)dq - mm * (float)as);
+}
+KERNEL ie_gemv_q4kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                     G u32 *count) {
+#pragma clang fp contract(off)
+  const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
+  if (r < rows) {
+    const G u32 *aw = (const G u32 *)xq;
+    const G float *da = (const G float *)(xq + 32u * nb);
+    const G u32 *asum = (const G u32 *)(xq + 36u * nb);
+    float acc = 0.0f;
+    for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
+      u32x4 w4[GEMV_U], a0[GEMV_U], a1[GEMV_U];
+      u32 bk[GEMV_U];
+      int ok[GEMV_U];
+      for (u32 k = 0; k < GEMV_U; k++) {
+        ok[k] = ie_lane_blk(l, t + k) < nb;
+        bk[k] = ok[k] ? ie_lane_blk(l, t + k) : ie_lane_blk(l, t);
+        w4[k] = *(const G u32x4 *)(qw + ie_q4_dst_word(r, bk[k], 0u, nb));
+        a0[k] = *(const G u32x4 *)(aw + bk[k] * 8u);
+        a1[k] = *(const G u32x4 *)(aw + bk[k] * 8u + 4u);
+      }
+      for (u32 k = 0; k < GEMV_U; k++) {
+        const u32 wq[4] = {w4[k].x, w4[k].y, w4[k].z, w4[k].w};
+        const u32 av[8] = {a0[k].x, a0[k].y, a0[k].z, a0[k].w, a1[k].x, a1[k].y, a1[k].z, a1[k].w};
+        const Mem qm = {wq}, am = {av};
+        const u32 as = asum[bk[k]];
+        const int dot = (int)ie_q4q8_block(qm, 0u, am, 0u, as);
+        const float term = q4k_term(qs, rows, r, bk[k], nb, dot, (int)as, da[bk[k]]);
+        acc = acc + (ok[k] ? term : 0.0f);
+      }
+    }
+    acc = wave_tree_f(acc);
+    if (l == 0u) y[r] = epilogue(acc, r, bias, res);
+  }
+  if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
+}
+
+/* MAT_Q4K for T <= 16 tokens: 4 rows per wave (as ie_gemv_q8q8_tr); per
+ * (row, token) the arithmetic and order of ie_gemv_q4kq8 (bitwise equal). */
+#ifndef Q4K_U
+#define Q4K_U 2u
+#endif
+#define Q4K_TR_BODY(QR, QT) \
+_Pragma("clang fp contract(off)") \
+  const u32 r0 = (wgid() * 8u + (tid() >> 5)) * QR, l = lane(); \
+  if (r0 >= rows) return; \
+  float acc[QR][QT]; \
+_Pragma("unroll") \
+  for (u32 q = 0; q < QR; q++) \
+_Pragma("unroll") \
+    for (u32 j = 0; j < QT; j++) acc[q][j] = 0.0f; \
+  for (u32 t = 0; ie_lane_blk(l, t) < nb; t += Q4K_U) { \
+_Pragma("unroll") \
+  for (u32 u = 0; u < Q4K_U; u++) { /* Q4K_U blocks: the loads of all go out first */ \
+    const int okb = ie_lane_blk(l, t + u) < nb; \
+    const u32 b = okb ? ie_lane_blk(l, t + u) : ie_lane_blk(l, t); \
+    /* per row, once per block: the 32 weights as int8 words (weight j = \
+     * byte j % 4 of word j / 4, as the activations) and the two scales */ \
+    u32 wv[QR][8]; \
+    float sc[QR], mm[QR]; \
+    if (!okb) continue; /* past nb (only some lanes, at the end) */ \
+_Pragma("unroll") \
+    for (u32 q = 0; q < QR; q++) { \
+      const u32 r = r0 + q < rows ? r0 + q : r0; /* a row past the end: row r0 again, not stored */ \
+      const u32x4 w4 = __builtin_nontemporal_load((const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb))); \
+      const u32 x4[4] = {w4.x, w4.y, w4.z, w4.w}; \
+_Pragma("unroll") \
+      for (u32 k = 0; k < 4u; k++) wv[q][k] = x4[k] & 0x0F0F0F0Fu, wv[q][k + 4u] = (x4[k] >> 4) & 0x0F0F0F0Fu; \
+      const u32 sm = qs[r * nb + b]; \
+      const unsigned long dd = (unsigned long)rows * nb + ((unsigned long)r * (nb >> 3) + (b >> 3)) * 2u; \
+      sc[q] = (float)((const G f16 *)qs)[dd] * (float)(sm & 63u); \
+      mm[q] = (float)((const G f16 *)qs)[dd + 1u] * (float)(sm >> 8); \
+    } \
+_Pragma("unroll") \
+    for (u32 j = 0; j < QT; j++) { \
+      if (j < T) { /* uniform */ \
+        const G u8 *xj = xq + j * xs; \
+        const G u32 *aw = (const G u32 *)xj; \
+        const u32x4 a0 = *(const G u32x4 *)(aw + b * 8u), a1 = *(const G u32x4 *)(aw + b * 8u + 4u); \
+        const float da = ((const G float *)(xj + 32u * nb))[b]; \
+        const int as = (int)((const G u32 *)(xj + 36u * nb))[b]; \
+        const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w}; \
+_Pragma("unroll") \
+        for (u32 q = 0; q < QR; q++) { \
+          int dq = 0; /* sum q a, exact: the same integer as ie_q4q8_block + 8 asum */ \
+_Pragma("unroll") \
+          for (u32 k = 0; k < 8u; k++) dq = __builtin_amdgcn_sudot4(true, (int)wv[q][k], true, (int)av[k], dq, false); \
+          acc[q][j] = acc[q][j] + da * (sc[q] * (float)dq - mm[q] * (float)as); \
+        } \
+      } \
+    } \
+  } \
+  } \
+_Pragma("unroll") \
+  for (u32 q = 0; q < QR; q++) { \
+    const u32 r = r0 + q; \
+_Pragma("unroll") \
+    for (u32 j = 0; j < QT; j++) { \
+      if (j < T) { \
+        const float v = wave_tree_f(acc[q][j]); \
+        if (l == 0u && r < rows) y[j * ys + r] = epilogue(v, r, bias, res ? res + j * rs : res); \
+      } \
+    } \
+  }
+KERNEL ie_gemv_q4kq8_tr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                        const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
+  Q4K_TR_BODY(4u, 16u)
 }
 
 /* y = W x: W is Q8_0 (GPU layout: 8 int8 words per block in qw, f16 scales
@@ -781,6 +907,162 @@ KERNEL ie_gemm_q8r(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y,
 #undef GR_FETCH_W
 #undef GR_FETCH_X
 #undef GR_STORE_X
+}
+
+/* ie_gemm_q4kr: ie_gemm_q8r for MAT_Q4K weights (nb % 8 == 0). Each lane
+ * reads the whole 16-byte nibble block and takes the low (lane half 0:
+ * weights 0..15) or high nibbles (weights 16..31), values 0..15: the WMMA
+ * gives dq = sum q a exactly; then acc += da ((d sc) dq - (dmin mn) asum).
+ * Not bitwise equal to ie_gemv_q4kq8 (another order of the float sums). */
+#ifndef GK_WI
+#define GK_WI 1u /* row tiles per wave (fewer registers than ie_gemm_q8r: 4 more VALU terms) */
+#endif
+#ifndef GK_T
+#define GK_T 64u
+#endif
+#define GK_KB 4u
+#define GK_R (8u * 16u * GK_WI)
+#define GK_WJ (GK_T / 16u)
+#define GK_LS (GK_KB * 32u + 16u)
+static LDS u8 gk_x[2][GK_T * GK_LS] __attribute__((aligned(16)));
+static LDS float gk_sw[2][GK_KB * GK_R] __attribute__((aligned(32))), gk_sx[2][GK_T * GK_KB];
+static LDS float gk_mw[2][GK_KB * GK_R] __attribute__((aligned(32))), gk_sa[2][GK_T * GK_KB];
+KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G float *bias,
+                   const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
+  /* nb % GK_KB == 0 (src/hip.c checks): no partial K chunk */
+  const u32 ntt = (T + GK_T - 1u) / GK_T, tt = wgid() % ntt, rt = wgid() / ntt, t0 = tid(), w = t0 >> 5, l = lane();
+  const u32 rbase = rt * GK_R, tbase = tt * GK_T, h = l >> 4, wr = 16u * GK_WI * w;
+  f8 acc[GK_WI][GK_WJ];
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++)
+#pragma unroll
+    for (u32 j = 0; j < GK_WJ; j++) acc[i][j] = (f8)(0.0f);
+  /* the addresses of chunk 0 (rows and tokens past the end are clamped:
+   * computed, not stored); chunk kb0 adds kb0 * 32 bytes (scales: kb0) */
+  const G u8 *wp[GK_WI];
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++) {
+    const u32 r = rbase + wr + 16u * i + (l & 15u);
+    wp[i] = (const G u8 *)qw + (unsigned long)(r < rows ? r : rows - 1u) * nb * 16u; /* the whole 16-byte nibble block */
+  }
+  const G u8 *xp[GK_T * 8u / NT];
+#pragma unroll
+  for (u32 i = 0; i < GK_T * 8u / NT; i++) {
+    const u32 p = t0 + NT * i, tk = p >> 3, gt = tbase + tk < T ? tbase + tk : T - 1u;
+    xp[i] = xq + (unsigned long)gt * xs + (p & 7u) * 16u;
+  }
+  const u32 sr = rbase + t0 * 1u; /* scale rows of this thread: 1u consecutive (threads t0 * 1u < GK_R) */
+  const u32 srr = sr < rows ? sr : rows - 1u; /* idle threads: a valid row */
+  const G u16 *swp = qs + (unsigned long)srr * nb;
+  const G f16 *ddp = (const G f16 *)qs + (unsigned long)rows * nb + (unsigned long)srr * (nb >> 3) * 2u;
+  const u32 sxt = tbase + t0 / GK_KB;
+  const G float *sxp = (const G float *)(xq + (unsigned long)(sxt < T ? sxt : T - 1u) * xs + 32u * nb) + t0 % GK_KB;
+  const G int *sap = (const G int *)(xq + (unsigned long)(sxt < T ? sxt : T - 1u) * xs + 36u * nb) + t0 % GK_KB;
+  u32x4 wa[GK_KB][GK_WI], wn[GK_KB][GK_WI]; /* weights: current chunk, next chunk */
+  u32x4 rx[GK_T * 8u / NT];
+  u16 rsw[GK_KB];
+  f16 rdd[2];
+  float rsx, rsa;
+#define GK_FETCH_W(dst_, kb0_)                                                                                  \
+  _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++)                                                             \
+    _Pragma("unroll") for (u32 i = 0; i < GK_WI; i++) dst_[k][i] = *(const G u32x4 *)(wp[i] + ((kb0_) + k) * 16u);
+#define GK_FETCH_X(kb0_)                                                                                        \
+  do {                                                                                                          \
+    _Pragma("unroll") for (u32 i = 0; i < GK_T * 8u / NT; i++) rx[i] = *(const G u32x4 *)(xp[i] + (kb0_) * 32u); \
+    _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) rsw[k] = swp[(kb0_) + k];                                 \
+    rdd[0] = ddp[((kb0_) >> 3) * 2u], rdd[1] = ddp[((kb0_) >> 3) * 2u + 1u]; /* GK_KB divides 8: one super-block */ \
+    rsa = t0 < GK_T * GK_KB ? (float)sap[(kb0_)] : 0.0f;                                                       \
+    rsx = t0 < GK_T * GK_KB ? sxp[(kb0_)] : 0.0f;                                                               \
+  } while (0)
+#define GK_STORE_X(bf_)                                                                                         \
+  do {                                                                                                          \
+    _Pragma("unroll") for (u32 i = 0; i < GK_T * 8u / NT; i++) {                                                \
+      const u32 p = t0 + NT * i;                                                                                \
+      *(LDSP u32x4 *)(gk_x[bf_] + (p >> 3) * GK_LS + (p & 7u) * 16u) = rx[i];                                   \
+    }                                                                                                           \
+    if (t0 < GK_R) _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) {                                       \
+      gk_sw[bf_][k * GK_R + t0] = (float)rdd[0] * (float)(rsw[k] & 63u);                                       \
+      gk_mw[bf_][k * GK_R + t0] = (float)rdd[1] * (float)(rsw[k] >> 8);                                        \
+    }                                                                                                           \
+    if (t0 < GK_T * GK_KB) gk_sa[bf_][t0] = rsa;                                                                \
+    if (t0 < GK_T * GK_KB) gk_sx[bf_][t0] = rsx;                                                                \
+  } while (0)
+  GK_FETCH_W(wa, 0u);
+  GK_FETCH_X(0u);
+  GK_STORE_X(0u);
+  barrier();
+  u32 bf = 0;
+#pragma unroll 1
+  for (u32 kb0 = 0; kb0 < nb; kb0 += GK_KB) {
+    const int more = kb0 + GK_KB < nb;
+    if (more) { /* in flight during the math below */
+      GK_FETCH_W(wn, kb0 + GK_KB);
+      GK_FETCH_X(kb0 + GK_KB);
+    }
+    const LDSP u8 *lx = gk_x[bf];
+    const LDSP float *lsw = gk_sw[bf], *lsx = gk_sx[bf], *lmw = gk_mw[bf], *lsa = gk_sa[bf];
+    const u32 nk = nb - kb0 < GK_KB ? nb - kb0 : GK_KB; /* = GK_KB; the branch keeps the blocks apart for the scheduler */
+#pragma unroll
+    for (u32 k = 0; k < GK_KB; k++) {
+      if (k >= nk) break;
+      u32x4 b[GK_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GK_WJ; j++) b[j] = *(const LDSP u32x4 *)(lx + (16u * j + (l & 15u)) * GK_LS + k * 32u + 16u * h);
+      const v8i zm = (v8i)(0x4B400000); /* see ie_gemm_q8 */
+      float dx[GK_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GK_WJ; j++) dx[j] = lsx[(16u * j + (l & 15u)) * GK_KB + k];
+      float sa[GK_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GK_WJ; j++) sa[j] = lsa[(16u * j + (l & 15u)) * GK_KB + k] * dx[j]; /* da asum */
+#pragma unroll
+      for (u32 i = 0; i < GK_WI; i++) { /* one row tile at a time (fewer registers) */
+        v8i c[GK_WJ];
+        /* lane half h: weights 16 h .. 16 h + 15 = the low (h = 0) or high nibbles of the 16 bytes */
+        const u32x4 nb4 = h ? (wa[k][i] >> 4) & 0x0F0F0F0Fu : wa[k][i] & 0x0F0F0F0Fu;
+        const v2i a0 = {(int)nb4.x, (int)nb4.y}, a1 = {(int)nb4.z, (int)nb4.w};
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) {
+          const v2i b0 = {(int)b[j].x, (int)b[j].y};
+          c[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a0, 1, b0, zm, 0);
+        }
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) {
+          const v2i b1 = {(int)b[j].z, (int)b[j].w};
+          c[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a1, 1, b1, c[j], 0);
+        }
+        const f8 sw = *(const LDSP f8 *)(lsw + k * GK_R + wr + 16u * i + 8u * h);
+        const f8 mw = *(const LDSP f8 *)(lmw + k * GK_R + wr + 16u * i + 8u * h);
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) { /* da ((d sc) dq - (dmin mn) asum) = (da d sc) dq - (da asum) (dmin mn) */
+          acc[i][j] += (sw * dx[j]) * (__builtin_bit_cast(f8, c[j]) - 12582912.0f);
+          acc[i][j] -= mw * sa[j];
+        }
+      }
+      __builtin_amdgcn_sched_barrier(0); /* keep the blocks apart: the scheduler otherwise overlaps them and spills */
+    }
+    if (more) GK_STORE_X(bf ^ 1u); /* nobody reads that buffer in this chunk */
+    lbarrier();
+    bf ^= 1u;
+#pragma unroll
+    for (u32 k = 0; k < GK_KB; k++)
+#pragma unroll
+      for (u32 i = 0; i < GK_WI; i++) wa[k][i] = wn[k][i];
+  }
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++)
+#pragma unroll
+    for (u32 j = 0; j < GK_WJ; j++) {
+      const u32 t = tbase + 16u * j + (l & 15u);
+      if (t >= T) continue;
+      for (u32 v = 0; v < 8u; v++) {
+        const u32 r = rbase + wr + 16u * i + 8u * h + v;
+        if (r < rows) y[t * ys + r] = epilogue(acc[i][j][v], r, bias, res ? res + t * rs : res);
+      }
+    }
+#undef GK_FETCH_W
+#undef GK_FETCH_X
+#undef GK_STORE_X
 }
 
 /* The same product with fp16 WMMA (v_wmma_f32_16x16x16_f16, f32 sums):
