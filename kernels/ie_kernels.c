@@ -1038,6 +1038,14 @@ KERNEL ie_gemm_q8r(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y,
 static LDS u8 gk_x[2][GK_T * GK_LS] __attribute__((aligned(16)));
 static LDS float gk_sw[2][GK_KB * GK_R] __attribute__((aligned(32))), gk_sx[2][GK_T * GK_KB];
 static LDS float gk_mw[2][GK_KB * GK_R] __attribute__((aligned(32))), gk_sa[2][GK_T * GK_KB];
+/* the min term - sum over blocks of (dmin mn) (da asum) is a small matrix
+ * product (K = the blocks): fp16 operands per chunk (row r: -dmin mn of
+ * its GK_KB blocks; token t: da asum), one fp16 WMMA per chunk adds it to
+ * the f32 sums. fp16 rounding: relative 2^-11 on each of the two factors
+ * (far below the 4-bit weight and 8-bit activation rounding). */
+typedef _Float16 hk8 __attribute__((ext_vector_type(8)));
+typedef _Float16 hk4 __attribute__((ext_vector_type(4)));
+static LDS hk4 gk_mh[2][GK_R], gk_sh[2][GK_T];
 KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G float *bias,
                    const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
   /* nb % GK_KB == 0 (src/hip.c checks): no partial K chunk */
@@ -1091,11 +1099,15 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
       const u32 p = t0 + NT * i;                                                                                \
       *(LDSP u32x4 *)(gk_x[bf_] + (p >> 3) * GK_LS + (p & 7u) * 16u) = rx[i];                                   \
     }                                                                                                           \
-    if (t0 < GK_R) _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) {                                       \
-      gk_sw[bf_][k * GK_R + t0] = (float)rdd[0] * (float)(rsw[k] & 63u);                                       \
-      gk_mw[bf_][k * GK_R + t0] = (float)rdd[1] * (float)(rsw[k] >> 8);                                        \
+    if (t0 < GK_R) {                                                                                            \
+      hk4 mh_;                                                                                                  \
+      _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) {                                                       \
+        gk_sw[bf_][k * GK_R + t0] = (float)rdd[0] * (float)(rsw[k] & 63u);                                     \
+        mh_[k] = (f16)(-((float)rdd[1] * (float)(rsw[k] >> 8)));                                                \
+      }                                                                                                         \
+      gk_mh[bf_][t0] = mh_;                                                                                     \
     }                                                                                                           \
-    if (t0 < GK_T * GK_KB) gk_sa[bf_][t0] = rsa;                                                                \
+    if (t0 < GK_T * GK_KB) ((LDSP f16 *)gk_sh[bf_])[t0] = (f16)(rsa * rsx);                                    \
     if (t0 < GK_T * GK_KB) gk_sx[bf_][t0] = rsx;                                                                \
   } while (0)
   GK_FETCH_W(wa, 0u);
@@ -1111,7 +1123,7 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
       GK_FETCH_X(kb0 + GK_KB);
     }
     const LDSP u8 *lx = gk_x[bf];
-    const LDSP float *lsw = gk_sw[bf], *lsx = gk_sx[bf], *lmw = gk_mw[bf], *lsa = gk_sa[bf];
+    const LDSP float *lsw = gk_sw[bf], *lsx = gk_sx[bf];
     const u32 nk = nb - kb0 < GK_KB ? nb - kb0 : GK_KB; /* = GK_KB; the branch keeps the blocks apart for the scheduler */
 #pragma unroll
     for (u32 k = 0; k < GK_KB; k++) {
@@ -1123,9 +1135,6 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
       float dx[GK_WJ];
 #pragma unroll
       for (u32 j = 0; j < GK_WJ; j++) dx[j] = lsx[(16u * j + (l & 15u)) * GK_KB + k];
-      float sa[GK_WJ];
-#pragma unroll
-      for (u32 j = 0; j < GK_WJ; j++) sa[j] = lsa[(16u * j + (l & 15u)) * GK_KB + k] * dx[j]; /* da asum */
 #pragma unroll
       for (u32 i = 0; i < GK_WI; i++) { /* one row tile at a time (fewer registers) */
         v8i c[GK_WJ];
@@ -1143,14 +1152,26 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
           c[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a1, 1, b1, c[j], 0);
         }
         const f8 sw = *(const LDSP f8 *)(lsw + k * GK_R + wr + 16u * i + 8u * h);
-        const f8 mw = *(const LDSP f8 *)(lmw + k * GK_R + wr + 16u * i + 8u * h);
 #pragma unroll
-        for (u32 j = 0; j < GK_WJ; j++) { /* da ((d sc) dq - (dmin mn) asum) = (da d sc) dq - (da asum) (dmin mn) */
-          acc[i][j] += (sw * dx[j]) * (__builtin_bit_cast(f8, c[j]) - 12582912.0f);
-          acc[i][j] -= mw * sa[j];
-        }
+        for (u32 j = 0; j < GK_WJ; j++) acc[i][j] += (sw * dx[j]) * (__builtin_bit_cast(f8, c[j]) - 12582912.0f); /* (da d sc) dq */
       }
       __builtin_amdgcn_sched_barrier(0); /* keep the blocks apart: the scheduler otherwise overlaps them and spills */
+    }
+    { /* the min term of the chunk: lane half 0 holds K = blocks 0 .. GK_KB - 1, half 1 zeros */
+      const hk4 z4 = (hk4)(0.0f);
+      hk8 bm[GK_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GK_WJ; j++) {
+        const hk4 v = h ? z4 : gk_sh[bf][16u * j + (l & 15u)];
+        bm[j] = (hk8){v[0], v[1], v[2], v[3], 0, 0, 0, 0};
+      }
+#pragma unroll
+      for (u32 i = 0; i < GK_WI; i++) {
+        const hk4 v = h ? z4 : gk_mh[bf][wr + 16u * i + (l & 15u)];
+        const hk8 am = {v[0], v[1], v[2], v[3], 0, 0, 0, 0};
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(am, bm[j], acc[i][j]);
+      }
     }
     if (more) GK_STORE_X(bf ^ 1u); /* nobody reads that buffer in this chunk */
     lbarrier();
@@ -1292,8 +1313,9 @@ KERNEL ie_gemm_q6kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
         const f8 s1 = *(const LDSP f8 *)(lmw + k * GK_R + wr + 16u * i + 8u * h);
 #pragma unroll
         for (u32 j = 0; j < GK_WJ; j++) { /* da ((d sc0) d0 + (d sc1) d1) */
-          acc[i][j] += (s0 * dx[j]) * (__builtin_bit_cast(f8, c0[j]) - 12582912.0f);
-          acc[i][j] += (s1 * dx[j]) * (__builtin_bit_cast(f8, c1[j]) - 12582912.0f);
+          f8 in = s0 * (__builtin_bit_cast(f8, c0[j]) - 12582912.0f);
+          in += s1 * (__builtin_bit_cast(f8, c1[j]) - 12582912.0f);
+          acc[i][j] += dx[j] * in;
         }
       }
       __builtin_amdgcn_sched_barrier(0); /* keep the blocks apart: the scheduler otherwise overlaps them and spills */
