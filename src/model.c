@@ -489,11 +489,29 @@ void model_make_draft_head(model *m, gguf_file *g) {
   mat *w = &m->out_draft;
   memset(w, 0, sizeof *w);
   w->kind = MAT_Q4, w->rows = m->vocab, w->cols = m->dim, w->nb = m->dim / 32;
+  /* IE_DRAFT_VOCAB=N (default 131072; 0: all tokens): only the tokens 0 .. N - 1 (BPE ids: roughly the most
+   * frequent first) and the special tokens at the end (token type not 1,
+   * the run up to the last token) can be drafted. The verify step is not
+   * changed, so the output is the same; only fewer drafts may be accepted. */
+  m->dv_n = m->dv_s = 0;
+  const char *dv = getenv("IE_DRAFT_VOCAB");
+  const uint32_t N = dv ? (uint32_t)atoi(dv) : 131072u; /* 27B, 7 drafts: the same acceptance as all tokens, +4 % */
+  const gguf_kv *tt = gguf_find(g, "tokenizer.ggml.token_type");
+  if (N && N < m->vocab && tt && tt->type == GGUF_ARR && tt->arr_type == GGUF_I32 && tt->arr_n <= m->vocab) {
+    uint32_t S = (uint32_t)tt->arr_n;
+    for (int32_t ty; S > N; S--) { /* the file data may be unaligned */
+      memcpy(&ty, tt->arr_data + (size_t)(S - 1) * 4, 4);
+      if (ty == 1) break;
+    }
+    m->dv_n = N, m->dv_s = S;
+    w->rows = N + (uint32_t)tt->arr_n - S;
+    fprintf(stderr, "mtp: draft vocabulary: tokens 0 .. %u and %u .. %u\n", N - 1, S, (uint32_t)tt->arr_n - 1);
+  }
   if (!ie_sizes_ok(w->rows, w->nb)) { memset(w, 0, sizeof *w); return; }
   float *row = ie_alloc((size_t)m->dim * 4);
   uint8_t *q4 = ie_alloc((size_t)w->rows * w->nb * 18);
   for (uint32_t r = 0; r < w->rows; r++) {
-    dequant(t, (uint64_t)r * m->dim, m->dim, row);
+    dequant(t, (uint64_t)model_draft_tok(m, r) * m->dim, m->dim, row);
     quant_q4_0_bytes(row, m->dim, q4 + (size_t)r * w->nb * 18);
   }
   repack_q4(w, q4);
@@ -854,7 +872,7 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx, uint32_t T, int mtp) 
     g->i_mtp_head = g->n_ops;
     g->mtp_logits = matvec(&B, m->out_draft.rows ? &m->out_draft : &m->out, g->mtp_g, gq2, "mtp_logits", NULL, -1);
     g->mtp_argmax = new_buf(g, "mtp_argmax", 8);
-    emit(&B, OP_ARGMAX, g->mtp_logits, g->mtp_argmax, -1)->n = m->vocab;
+    emit(&B, OP_ARGMAX, g->mtp_logits, g->mtp_argmax, -1)->n = m->out_draft.rows ? m->out_draft.rows : m->vocab;
   }
   /* The host reads (or copies) these buffers between runs: they live
    * through the whole op list. */

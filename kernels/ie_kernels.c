@@ -402,6 +402,9 @@ KERNEL ie_gemv_q8q8_t(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float 
 #ifndef GEMV_R
 #define GEMV_R 4u
 #endif
+#ifndef TR_NT
+#define TR_NT 1
+#endif
 KERNEL ie_gemv_q8q8_tr(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                        const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
 #pragma clang fp contract(off) /* no fused multiply-add: the same rounding as ie_gemv_q8q8 */
@@ -420,8 +423,13 @@ KERNEL ie_gemv_q8q8_tr(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float
     for (u32 q = 0; q < GEMV_R; q++) {
       const u32 r = r0 + q < rows ? r0 + q : r0; /* a row past the end: row r0 again, not stored */
       const G u32 *wp = qw + ie_q8_dst_word(r, b, 0u, nb);
-      w0[q] = *(const G u32x4 *)wp;
-      w1[q] = *(const G u32x4 *)(wp + 4u);
+      if (TR_NT) { /* weights are read once: keep them out of the caches the activations live in */
+        w0[q] = __builtin_nontemporal_load((const G u32x4 *)wp);
+        w1[q] = __builtin_nontemporal_load((const G u32x4 *)(wp + 4u));
+      } else {
+        w0[q] = *(const G u32x4 *)wp;
+        w1[q] = *(const G u32x4 *)(wp + 4u);
+      }
       sw[q] = (float)qs[ie_q8_dst_scale(r, b, nb)];
     }
 #pragma unroll
@@ -455,6 +463,7 @@ KERNEL ie_gemv_q8q8_tr(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float
     }
   }
 }
+
 
 /* Prompt chunks of many tokens: Y = W X with the matrix instruction
  * v_wmma_i32_16x16x16_iu8 (int8 x int8 -> int32, 16 x 16 x 16 per wave).

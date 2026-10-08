@@ -152,7 +152,7 @@ static uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32
  * exactly the plain greedy output. The linear attention state after the
  * last accepted token is in slot (slot + k) % 4 (ie_gdn). out[0 .. n_prompt)
  * is the prompt; returns the number of tokens in out. */
-static uint32_t spec_generate(backend *b, const graph *g, uint32_t *out, uint32_t n_prompt, uint32_t total, uint32_t D,
+static uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out, uint32_t n_prompt, uint32_t total, uint32_t D,
                               int64_t eos, int stop, uint32_t first, uint32_t hrow, sampler *sp, uint32_t V, double *gen_ms,
                               uint32_t *n_steps, uint32_t *n_acc, float pmin, uint32_t *n_drafted) {
   /* With sampling (temp > 0): the model samples its token a_j after each
@@ -177,11 +177,11 @@ static uint32_t spec_generate(backend *b, const graph *g, uint32_t *out, uint32_
     b->copy_rows(b, g->mtp_h, 0, g->h_out, hrow, k + 1);
     hrow = 0;
     b->run(b, 1, &out[P - k], k + 1, P - k, 0, tk, pr);
-    if (pr[k] >= pmin) d[1] = tk[k], nd = 1;
+    if (pr[k] >= pmin) d[1] = model_draft_tok(m, tk[k]), nd = 1;
     for (uint32_t j = 2; j <= D && nd == j - 1; j++) { /* (2) */
       b->copy_rows(b, g->mtp_h, 0, g->mtp_g, j == 2 ? k : 0, 1);
       b->run(b, 1, &d[j - 1], 1, P + j - 1, 0, tk, pr);
-      if (pr[0] >= pmin) d[j] = tk[0], nd = j;
+      if (pr[0] >= pmin) d[j] = model_draft_tok(m, tk[0]), nd = j;
     }
     /* (3) verify */
     tk[0] = tP;
@@ -371,7 +371,7 @@ int main(int argc, char **argv) {
   if (draft && start < total) {
     double gms = 0;
     uint32_t steps = 0, acc = 0, drafted = 0;
-    total = spec_generate(b, &gr, out, n_prompt, total, draft, eos_v, stop, tok, hrow, &sp, m.vocab, &gms, &steps, &acc,
+    total = spec_generate(b, &m, &gr, out, n_prompt, total, draft, eos_v, stop, tok, hrow, &sp, m.vocab, &gms, &steps, &acc,
                           pmin, &drafted);
     const uint32_t gen = total - n_prompt - 1; /* the tokens after the first */
     fprintf(stderr, "mtp: %u steps, %u drafts accepted of %u (%.1f%%), %.2f tokens per step\n", steps, acc, drafted,

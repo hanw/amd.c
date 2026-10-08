@@ -83,6 +83,8 @@ typedef struct {
    * 0: the drafts use out). Half the bytes of Q8_0; the verify step still
    * uses out, so the output is unchanged. */
   mat out_draft;
+  /* the draft head's rows: tokens 0 .. dv_n - 1, then dv_s .. (IE_DRAFT_VOCAB; 0: all rows, row = token) */
+  uint32_t dv_n, dv_s;
   vec enorm, hnorm, head_norm;
   /* tokenizer */
   int tok_gpt2; /* 1: GPT2 byte-level, 0: SentencePiece */
@@ -96,6 +98,8 @@ typedef struct {
 int model_load_mtp(model *m, gguf_file *g);
 /* Make m->out_draft from the output matrix of g (the model file). */
 void model_make_draft_head(model *m, gguf_file *g);
+/* The token of row i of the draft head. */
+static inline uint32_t model_draft_tok(const model *m, uint32_t i) { return m->dv_n && i >= m->dv_n ? m->dv_s + (i - m->dv_n) : i; }
 /* If set, model_load gives every finished matrix to this function (for
  * example: copy it to the GPU and free the host arrays), so that the host
  * never holds all the weights at once. */
