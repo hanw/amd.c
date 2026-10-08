@@ -625,6 +625,155 @@ KERNEL ie_gemm_q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, 
 #undef GM_STORE
 }
 
+/* ie_gemm_q8r: the same product, weights straight from memory into the
+ * registers of the wave that uses them (no LDS for W). Each wave owns
+ * GR_WI x 16 rows and all GR_T tokens of the workgroup tile, so no other
+ * wave needs its weights; only the activations (used by all waves) and the
+ * scales go through LDS (double buffered: one barrier per K chunk). The
+ * weights of the next K chunk are loaded into registers during the math of
+ * the current one.
+ * K order inside a 32-byte block: lane half h takes bytes 16 h .. 16 h + 7
+ * for the first WMMA and 16 h + 8 .. + 15 for the second (one 16-byte read
+ * per lane and block). A and B use the same order and each byte is used
+ * once, so the block dot product is the same exact int32. */
+#ifndef GR_WI
+#define GR_WI 2u /* row tiles (16 rows) per wave */
+#endif
+#ifndef GR_T
+#define GR_T 64u /* tokens per workgroup tile (all waves) */
+#endif
+#ifndef GR_KB
+#define GR_KB 4u
+#endif
+#define GR_R (8u * 16u * GR_WI) /* rows per workgroup */
+#define GR_WJ (GR_T / 16u)
+#define GR_SPT (GR_R >= NT ? GR_R / NT : 1u) /* weight scale rows per thread */
+#define GR_LS (GR_KB * 32u + 16u) /* LDS row stride, bytes */
+static LDS u8 gr_x[2][GR_T * GR_LS] __attribute__((aligned(16)));
+static LDS float gr_sw[2][GR_KB * GR_R] __attribute__((aligned(32))), gr_sx[2][GR_T * GR_KB];
+KERNEL ie_gemm_q8r(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G float *bias,
+                   const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
+  /* nb % GR_KB == 0 (src/hip.c checks): no partial K chunk */
+  const u32 ntt = (T + GR_T - 1u) / GR_T, tt = wgid() % ntt, rt = wgid() / ntt, t0 = tid(), w = t0 >> 5, l = lane();
+  const u32 rbase = rt * GR_R, tbase = tt * GR_T, h = l >> 4, wr = 16u * GR_WI * w;
+  f8 acc[GR_WI][GR_WJ];
+#pragma unroll
+  for (u32 i = 0; i < GR_WI; i++)
+#pragma unroll
+    for (u32 j = 0; j < GR_WJ; j++) acc[i][j] = (f8)(0.0f);
+  /* the addresses of chunk 0 (rows and tokens past the end are clamped:
+   * computed, not stored); chunk kb0 adds kb0 * 32 bytes (scales: kb0) */
+  const G u8 *wp[GR_WI];
+#pragma unroll
+  for (u32 i = 0; i < GR_WI; i++) {
+    const u32 r = rbase + wr + 16u * i + (l & 15u);
+    wp[i] = (const G u8 *)qw + (unsigned long)(r < rows ? r : rows - 1u) * nb * 32u + 16u * h;
+  }
+  const G u8 *xp[GR_T * 8u / NT];
+#pragma unroll
+  for (u32 i = 0; i < GR_T * 8u / NT; i++) {
+    const u32 p = t0 + NT * i, tk = p >> 3, gt = tbase + tk < T ? tbase + tk : T - 1u;
+    xp[i] = xq + (unsigned long)gt * xs + (p & 7u) * 16u;
+  }
+  const u32 sr = rbase + t0 * GR_SPT; /* scale rows of this thread: GR_SPT consecutive (threads t0 * GR_SPT < GR_R) */
+  const G f16 *swp = qs + (unsigned long)(sr < rows ? sr : rows - 1u) * nb; /* idle threads: a valid row */
+  const u32 sxt = tbase + t0 / GR_KB;
+  const G float *sxp = (const G float *)(xq + (unsigned long)(sxt < T ? sxt : T - 1u) * xs + 32u * nb) + t0 % GR_KB;
+  u32x4 wa[GR_KB][GR_WI], wn[GR_KB][GR_WI]; /* weights: current chunk, next chunk */
+  u32x4 rx[GR_T * 8u / NT];
+  f16 rsw[GR_SPT][GR_KB];
+  float rsx;
+#define GR_FETCH_W(dst_, kb0_)                                                                                  \
+  _Pragma("unroll") for (u32 k = 0; k < GR_KB; k++)                                                             \
+    _Pragma("unroll") for (u32 i = 0; i < GR_WI; i++) dst_[k][i] = *(const G u32x4 *)(wp[i] + ((kb0_) + k) * 32u);
+#define GR_FETCH_X(kb0_)                                                                                        \
+  do {                                                                                                          \
+    _Pragma("unroll") for (u32 i = 0; i < GR_T * 8u / NT; i++) rx[i] = *(const G u32x4 *)(xp[i] + (kb0_) * 32u); \
+    _Pragma("unroll") for (u32 q = 0; q < GR_SPT; q++) {                                                        \
+      const u32 r = sr + q < rows ? q : 0u;                                                                     \
+      _Pragma("unroll") for (u32 k = 0; k < GR_KB; k++) rsw[q][k] = swp[(unsigned long)r * nb + (kb0_) + k];   \
+    }                                                                                                           \
+    rsx = t0 < GR_T * GR_KB ? sxp[(kb0_)] : 0.0f;                                                               \
+  } while (0)
+#define GR_STORE_X(bf_)                                                                                         \
+  do {                                                                                                          \
+    _Pragma("unroll") for (u32 i = 0; i < GR_T * 8u / NT; i++) {                                                \
+      const u32 p = t0 + NT * i;                                                                                \
+      *(LDSP u32x4 *)(gr_x[bf_] + (p >> 3) * GR_LS + (p & 7u) * 16u) = rx[i];                                   \
+    }                                                                                                           \
+    if (t0 * GR_SPT < GR_R) _Pragma("unroll") for (u32 q = 0; q < GR_SPT; q++)                                   \
+      _Pragma("unroll") for (u32 k = 0; k < GR_KB; k++) gr_sw[bf_][k * GR_R + t0 * GR_SPT + q] = (float)rsw[q][k]; \
+    if (t0 < GR_T * GR_KB) gr_sx[bf_][t0] = rsx;                                                                \
+  } while (0)
+  GR_FETCH_W(wa, 0u);
+  GR_FETCH_X(0u);
+  GR_STORE_X(0u);
+  barrier();
+  u32 bf = 0;
+#pragma unroll 1
+  for (u32 kb0 = 0; kb0 < nb; kb0 += GR_KB) {
+    const int more = kb0 + GR_KB < nb;
+    if (more) { /* in flight during the math below */
+      GR_FETCH_W(wn, kb0 + GR_KB);
+      GR_FETCH_X(kb0 + GR_KB);
+    }
+    const LDSP u8 *lx = gr_x[bf];
+    const LDSP float *lsw = gr_sw[bf], *lsx = gr_sx[bf];
+    const u32 nk = nb - kb0 < GR_KB ? nb - kb0 : GR_KB; /* = GR_KB; the branch keeps the blocks apart for the scheduler */
+#pragma unroll
+    for (u32 k = 0; k < GR_KB; k++) {
+      if (k >= nk) break;
+      u32x4 b[GR_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GR_WJ; j++) b[j] = *(const LDSP u32x4 *)(lx + (16u * j + (l & 15u)) * GR_LS + k * 32u + 16u * h);
+      const v8i zm = (v8i)(0x4B400000); /* see ie_gemm_q8 */
+      float dx[GR_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GR_WJ; j++) dx[j] = lsx[(16u * j + (l & 15u)) * GR_KB + k];
+#pragma unroll
+      for (u32 i = 0; i < GR_WI; i++) { /* one row tile at a time (fewer registers) */
+        v8i c[GR_WJ];
+        const v2i a0 = {(int)wa[k][i].x, (int)wa[k][i].y}, a1 = {(int)wa[k][i].z, (int)wa[k][i].w};
+#pragma unroll
+        for (u32 j = 0; j < GR_WJ; j++) {
+          const v2i b0 = {(int)b[j].x, (int)b[j].y};
+          c[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a0, 1, b0, zm, 0);
+        }
+#pragma unroll
+        for (u32 j = 0; j < GR_WJ; j++) {
+          const v2i b1 = {(int)b[j].z, (int)b[j].w};
+          c[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a1, 1, b1, c[j], 0);
+        }
+        const f8 sw = *(const LDSP f8 *)(lsw + k * GR_R + wr + 16u * i + 8u * h);
+#pragma unroll
+        for (u32 j = 0; j < GR_WJ; j++) acc[i][j] += (sw * dx[j]) * (__builtin_bit_cast(f8, c[j]) - 12582912.0f);
+      }
+      __builtin_amdgcn_sched_barrier(0); /* keep the blocks apart: the scheduler otherwise overlaps them and spills */
+    }
+    if (more) GR_STORE_X(bf ^ 1u); /* nobody reads that buffer in this chunk */
+    lbarrier();
+    bf ^= 1u;
+#pragma unroll
+    for (u32 k = 0; k < GR_KB; k++)
+#pragma unroll
+      for (u32 i = 0; i < GR_WI; i++) wa[k][i] = wn[k][i];
+  }
+#pragma unroll
+  for (u32 i = 0; i < GR_WI; i++)
+#pragma unroll
+    for (u32 j = 0; j < GR_WJ; j++) {
+      const u32 t = tbase + 16u * j + (l & 15u);
+      if (t >= T) continue;
+      for (u32 v = 0; v < 8u; v++) {
+        const u32 r = rbase + wr + 16u * i + 8u * h + v;
+        if (r < rows) y[t * ys + r] = epilogue(acc[i][j][v], r, bias, res ? res + t * rs : res);
+      }
+    }
+#undef GR_FETCH_W
+#undef GR_FETCH_X
+#undef GR_STORE_X
+}
+
 /* The same product with fp16 WMMA (v_wmma_f32_16x16x16_f16, f32 sums):
  * while staging the tiles in LDS, each weight becomes fp16 (int8 x its
  * block scale) and each activation too (int8 x its block scale), so the

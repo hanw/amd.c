@@ -77,11 +77,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 /* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
  * linear layer are gpu_backend.ns: at least the tokens of a verify run */
@@ -404,10 +404,15 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           static int trmin = -1, gmin = -1;
           if (trmin < 0) trmin = getenv("IE_TR_MIN") ? atoi(getenv("IE_TR_MIN")) : 2;
           if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
-          static int gk = -1; /* IE_GEMM=h: the fp16 WMMA kernel */
-          if (gk < 0) gk = getenv("IE_GEMM") && getenv("IE_GEMM")[0] == 'h' ? K_GEMM_H : K_GEMM_Q8;
+          /* ie_gemm_q8r (weights straight into registers, 256 rows per
+           * workgroup) when nb % 4 == 0; else ie_gemm_q8 (128 rows).
+           * IE_GEMM=old: always ie_gemm_q8; IE_GEMM=h: the fp16 WMMA kernel. */
+          static int gsel = -1;
+          if (gsel < 0) gsel = !getenv("IE_GEMM") ? 0 : getenv("IE_GEMM")[0] == 'h' ? 1 : 2;
+          const int gk = gsel == 1 ? K_GEMM_H : gsel == 0 && nb % 4u == 0u ? K_GEMM_Q8R : K_GEMM_Q8;
+          const u32 grows = gk == K_GEMM_Q8R ? 256u : 128u;
           if ((int)T >= gmin) { /* many tokens: the matrix instruction (WMMA) */
-            launch(b, gk, ((rows + 127u) / 128u) * ((T + 63u) / 64u), args);
+            launch(b, gk, ((rows + grows - 1u) / grows) * ((T + 63u) / 64u), args);
             if (getenv("IE_GEMM_CHECK")) { /* debug: compare with ie_gemv_q8q8_t, 16 tokens at a time, no bias/residual */
               static float *dev = NULL;
               static size_t cap = 0;
@@ -418,7 +423,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
               (void)one;
               float *y1 = malloc(need), *y2 = malloc(need);
               void *ga[] = {&w0, &w1, &A, &dev, &rows, &nb, &nul, &nul, &T, &xs, &ys, &rs};
-              launch(b, gk, ((rows + 127u) / 128u) * ((T + 63u) / 64u), ga);
+              launch(b, gk, ((rows + grows - 1u) / grows) * ((T + 63u) / 64u), ga);
               for (u32 t0 = 0; t0 < T; t0 += 16) {
                 u32 tn = T - t0 < 16 ? T - t0 : 16;
                 char *Ab = (char *)A + (size_t)t0 * xs;
