@@ -560,6 +560,15 @@ static int new_buf(graph *g, const char *name, uint32_t bytes) {
   return (int)g->n_bufs++;
 }
 
+/* A buffer that the tokens of a run share (stride 0): only for an op that
+ * is launched once per token, one token after the other (attention scores). */
+static int new_buf_shared(graph *g, const char *name, uint32_t bytes) {
+  int id = new_buf(g, name, bytes);
+  buf *b = &g->bufs[id];
+  b->size = b->stride, b->stride = 0;
+  return id;
+}
+
 static void touch(graph *g, int id, uint32_t t) {
   if (id < 0) return;
   buf *b = &g->bufs[id];
@@ -693,7 +702,7 @@ static int attn_block(gb *B, const model *m, const layer *L, int x, int xn, int 
     }
     int att = new_buf(g, "attn", qd * 4);
     const uint32_t sc_cpu = m->n_head * n_ctx, sc_gpu = m->n_head * ie_att_max_split(n_ctx) * (m->hd + 2);
-    int sc = new_buf(g, "scores", (sc_cpu > sc_gpu ? sc_cpu : sc_gpu) * 4);
+    int sc = new_buf_shared(g, "scores", (sc_cpu > sc_gpu ? sc_cpu : sc_gpu) * 4);
     o = emit(B, OP_ATTN, qsrc, att, sc), o->n = qd;
     if (q35) { /* out *= sigmoid(gate): the gate of head h is at h * 2 hd + hd */
       o->gt = qkv, o->gtoff = m->hd * 4, o->gstride = 2 * m->hd;

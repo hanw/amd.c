@@ -15,6 +15,7 @@
 
 #define G __attribute__((address_space(1))) /* global memory */
 #define LDS __attribute__((address_space(3), loader_uninitialized))
+#define LDSP __attribute__((address_space(3))) /* LDS pointer targets */
 #define KERNEL __attribute__((amdgpu_kernel, visibility("protected"))) void
 #define NT 256u
 
@@ -446,6 +447,197 @@ KERNEL ie_gemv_q8q8_tr(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float
   }
 }
 
+/* Prompt chunks of many tokens: Y = W X with the matrix instruction
+ * v_wmma_i32_16x16x16_iu8 (int8 x int8 -> int32, 16 x 16 x 16 per wave).
+ * Lane layout (gfx12, checked by tools/wmma_test.c): A: lane l holds row
+ * l % 16, K bytes 8 (l / 16) .. + 7; B: lane l holds token l % 16, the same
+ * K bytes; D: lane l, element v = row 8 (l / 16) + v, token l % 16.
+ *
+ * Workgroup tile: 128 rows x 64 tokens. K goes in chunks of GM_KB blocks of
+ * 32: the workgroup copies the weight tile (128 rows x GM_KB x 32 bytes,
+ * 16-byte loads, each row's bytes are contiguous), the activation tile and
+ * both scale tiles into LDS; then wave w does rows 32 (w % 4) .. + 31 and
+ * tokens 32 (w / 4) .. + 31: 2 x 2 WMMA tiles, two WMMA (K = 16 each) per
+ * block give the exact int32 block dot product of each (row, token), then
+ * acc += (scale_w * scale_x) * dot, the blocks in order. The token tiles of
+ * one row tile are next to each other in the grid, so they read W from the
+ * cache: W comes from memory about once. The float sums are in a different
+ * order than in ie_gemv_q8q8, so the results are close to (about 1e-7
+ * relative), not bitwise equal to, the one-token results. */
+typedef int v2i __attribute__((ext_vector_type(2)));
+typedef int v8i __attribute__((ext_vector_type(8)));
+#ifndef GM_KB
+#define GM_KB 4u /* blocks of 32 per K chunk */
+#endif
+#define GM_R 128u
+#define GM_T 64u
+#define GM_LS (GM_KB * 32u + 16u) /* LDS row stride, bytes (padded: fewer bank conflicts, 16-byte aligned) */
+static LDS u8 gm_w[GM_R * GM_LS];
+static LDS u8 gm_x[GM_T * GM_LS];
+static LDS float gm_sw[GM_KB * GM_R], gm_sx[GM_T * GM_KB]; /* gm_sw[k][row]: 8 rows in 2 16-byte reads */
+typedef float f8 __attribute__((ext_vector_type(8)));
+KERNEL ie_gemm_q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G float *bias,
+                  const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
+  const u32 ntt = (T + GM_T - 1u) / GM_T, tt = wgid() % ntt, rt = wgid() / ntt, t0 = tid(), w = t0 >> 5, l = lane();
+  const u32 rbase = rt * GM_R, tbase = tt * GM_T, h = l >> 4;
+  const u32 wr = 32u * (w & 3u), wt = 32u * (w >> 2); /* this wave's rows and tokens in the tile */
+  f8 acc[2][2];
+  for (u32 i = 0; i < 2u; i++)
+    for (u32 j = 0; j < 2u; j++) acc[i][j] = (f8)(0.0f);
+  const v8i z = {0, 0, 0, 0, 0, 0, 0, 0};
+  /* Software pipeline: the global loads of K chunk n + 1 go out (into
+   * registers) before the WMMA of chunk n, so their latency overlaps the
+   * math. Thread t0 always copies the same pieces: weight pieces t0 + 256 i
+   * (row p / 8, piece p % 8), activation pieces t0 + 256 i (token p / 8),
+   * weight scales t0 + 256 i ([k][row]), activation scales t0 ([token][k]). */
+  u32x4 rw[GM_R * 8u / NT], rx[GM_T * 8u / NT];
+  float rsw[GM_R * GM_KB / NT], rsx = 0.0f;
+#define GM_FETCH(kb0_)                                                                                          \
+  do {                                                                                                          \
+    const u32 kbf = (kb0_), nkf = nb - kbf < GM_KB ? nb - kbf : GM_KB;                                          \
+    for (u32 i = 0; i < GM_R * 8u / NT; i++) {                                                                  \
+      const u32 p = t0 + NT * i, r = p >> 3, pc = p & 7u, gr = rbase + r < rows ? rbase + r : rows - 1u;        \
+      if (pc < 2u * nkf) rw[i] = *(const G u32x4 *)(qw + ie_q8_dst_word(gr, kbf, 0u, nb) + pc * 4u);            \
+    }                                                                                                           \
+    for (u32 i = 0; i < GM_T * 8u / NT; i++) {                                                                  \
+      const u32 p = t0 + NT * i, tk = p >> 3, pc = p & 7u, gt = tbase + tk < T ? tbase + tk : T - 1u;           \
+      if (pc < 2u * nkf) rx[i] = *(const G u32x4 *)(xq + (unsigned long)gt * xs + kbf * 32u + pc * 16u);       \
+    }                                                                                                           \
+    for (u32 i = 0; i < GM_R * GM_KB / NT; i++) {                                                               \
+      const u32 p = t0 + NT * i, k = p / GM_R, r = p % GM_R, gr = rbase + r < rows ? rbase + r : rows - 1u;     \
+      if (k < nkf) rsw[i] = (float)qs[ie_q8_dst_scale(gr, kbf + k, nb)];                                       \
+    }                                                                                                           \
+    if (t0 < GM_T * GM_KB) {                                                                                    \
+      const u32 tk = t0 / GM_KB, k = t0 % GM_KB, gt = tbase + tk < T ? tbase + tk : T - 1u;                     \
+      if (k < nkf) rsx = ((const G float *)(xq + (unsigned long)gt * xs + 32u * nb))[kbf + k];                  \
+    }                                                                                                           \
+  } while (0)
+  GM_FETCH(0u);
+  for (u32 kb0 = 0; kb0 < nb; kb0 += GM_KB) {
+    const u32 nk = nb - kb0 < GM_KB ? nb - kb0 : GM_KB;
+    for (u32 i = 0; i < GM_R * 8u / NT; i++) {
+      const u32 p = t0 + NT * i;
+      if ((p & 7u) < 2u * nk) *(LDSP u32x4 *)(gm_w + (p >> 3) * GM_LS + (p & 7u) * 16u) = rw[i];
+    }
+    for (u32 i = 0; i < GM_T * 8u / NT; i++) {
+      const u32 p = t0 + NT * i;
+      if ((p & 7u) < 2u * nk) *(LDSP u32x4 *)(gm_x + (p >> 3) * GM_LS + (p & 7u) * 16u) = rx[i];
+    }
+    for (u32 i = 0; i < GM_R * GM_KB / NT; i++) gm_sw[t0 + NT * i] = rsw[i];
+    if (t0 < GM_T * GM_KB) gm_sx[t0] = rsx;
+    barrier();
+    if (kb0 + GM_KB < nb) GM_FETCH(kb0 + GM_KB); /* in flight during the math below */
+    for (u32 k = 0; k < nk; k++) {
+      v2i a0[2], a1[2], b0[2], b1[2];
+      for (u32 i = 0; i < 2u; i++) {
+        const LDSP u8 *pa = gm_w + (wr + 16u * i + (l & 15u)) * GM_LS + k * 32u + 8u * h;
+        a0[i] = *(const LDSP v2i *)pa, a1[i] = *(const LDSP v2i *)(pa + 16u);
+        const LDSP u8 *pb = gm_x + (wt + 16u * i + (l & 15u)) * GM_LS + k * 32u + 8u * h;
+        b0[i] = *(const LDSP v2i *)pb, b1[i] = *(const LDSP v2i *)(pb + 16u);
+      }
+      /* all WMMA of the block first (independent), then the scaling: the
+       * scaling of one tile does not wait for the WMMA of the next */
+      v8i c[2][2];
+      for (u32 i = 0; i < 2u; i++)
+        for (u32 j = 0; j < 2u; j++) c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a0[i], 1, b0[j], z, 0);
+      for (u32 i = 0; i < 2u; i++)
+        for (u32 j = 0; j < 2u; j++) c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a1[i], 1, b1[j], c[i][j], 0);
+      f8 sw[2];
+      for (u32 i = 0; i < 2u; i++) sw[i] = *(const LDSP f8 *)(gm_sw + k * GM_R + wr + 16u * i + 8u * h);
+      for (u32 j = 0; j < 2u; j++) {
+        const float dx = gm_sx[(wt + 16u * j + (l & 15u)) * GM_KB + k];
+        for (u32 i = 0; i < 2u; i++) acc[i][j] += (sw[i] * dx) * __builtin_convertvector(c[i][j], f8);
+      }
+    }
+    barrier(); /* the tiles are read before the next chunk overwrites them */
+  }
+  for (u32 i = 0; i < 2u; i++)
+    for (u32 j = 0; j < 2u; j++) {
+      const u32 t = tbase + wt + 16u * j + (l & 15u);
+      if (t >= T) continue;
+      for (u32 v = 0; v < 8u; v++) {
+        const u32 r = rbase + wr + 16u * i + 8u * h + v;
+        if (r < rows) y[t * ys + r] = epilogue(acc[i][j][v], r, bias, res ? res + t * rs : res);
+      }
+    }
+#undef GM_FETCH
+}
+
+/* The same product with fp16 WMMA (v_wmma_f32_16x16x16_f16, f32 sums):
+ * while staging the tiles in LDS, each weight becomes fp16 (int8 x its
+ * block scale) and each activation too (int8 x its block scale), so the
+ * WMMA sums need no per-block scaling. Tile: 128 rows x 64 tokens, K in
+ * chunks of GH_K = 64; waves as in ie_gemm_q8. Lane layout as the int8
+ * WMMA (8 values per lane). fp16 keeps 11 significant bits: each product
+ * is rounded once to fp16 (relative error <= 2^-11) before the f32 sums. */
+typedef _Float16 h8 __attribute__((ext_vector_type(8)));
+typedef float v8f __attribute__((ext_vector_type(8)));
+#define GH_K 64u
+#define GH_LS (GH_K + 8u) /* LDS row stride in halves (16-byte aligned rows, fewer bank conflicts) */
+static LDS f16 gh_w[GM_R * GH_LS];
+static LDS f16 gh_x[GM_T * GH_LS];
+KERNEL ie_gemm_h(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G float *bias,
+                 const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
+  const u32 ntt = (T + GM_T - 1u) / GM_T, tt = wgid() % ntt, rt = wgid() / ntt, t0 = tid(), w = t0 >> 5, l = lane();
+  const u32 rbase = rt * GM_R, tbase = tt * GM_T, h = l >> 4;
+  const u32 wr = 32u * (w & 3u), wt = 32u * (w >> 2);
+  const u32 K = nb * 32u;
+  v8f acc[2][2];
+  for (u32 i = 0; i < 2u; i++)
+    for (u32 j = 0; j < 2u; j++) acc[i][j] = (v8f)(0.0f);
+  for (u32 k0 = 0; k0 < K; k0 += GH_K) { /* K is a multiple of 32; a last chunk of 32 is padded with zeros */
+    /* weights: 128 rows x 4 pieces of 16 int8 (one piece: half a block) */
+    for (u32 p = t0; p < GM_R * 4u; p += NT) {
+      const u32 r = p >> 2, pc = p & 3u, gr = rbase + r < rows ? rbase + r : rows - 1u, kk = k0 + pc * 16u;
+      h8 lo = (h8)(0.0f), hi = (h8)(0.0f);
+      if (kk < K) {
+        const u32x4 q = *(const G u32x4 *)(qw + ie_q8_dst_word(gr, kk >> 5, (kk & 31u) >> 2, nb));
+        const float sc = (float)qs[ie_q8_dst_scale(gr, kk >> 5, nb)];
+        const u32 wd[4] = {q.x, q.y, q.z, q.w};
+        for (u32 e = 0; e < 8u; e++) lo[e] = (f16)(sc * (float)(i8)ie_byte(wd[e >> 2], e & 3u));
+        for (u32 e = 0; e < 8u; e++) hi[e] = (f16)(sc * (float)(i8)ie_byte(wd[2u + (e >> 2)], e & 3u));
+      }
+      *(LDSP h8 *)(gh_w + r * GH_LS + pc * 16u) = lo;
+      *(LDSP h8 *)(gh_w + r * GH_LS + pc * 16u + 8u) = hi;
+    }
+    /* activations: 64 tokens x 4 pieces */
+    for (u32 p = t0; p < GM_T * 4u; p += NT) {
+      const u32 tk = p >> 2, pc = p & 3u, gt = tbase + tk < T ? tbase + tk : T - 1u, kk = k0 + pc * 16u;
+      h8 lo = (h8)(0.0f), hi = (h8)(0.0f);
+      if (kk < K) {
+        const G u8 *xt = xq + (unsigned long)gt * xs;
+        const u32x4 q = *(const G u32x4 *)(xt + kk);
+        const float sc = ((const G float *)(xt + 32u * nb))[kk >> 5];
+        const u32 wd[4] = {q.x, q.y, q.z, q.w};
+        for (u32 e = 0; e < 8u; e++) lo[e] = (f16)(sc * (float)(i8)ie_byte(wd[e >> 2], e & 3u));
+        for (u32 e = 0; e < 8u; e++) hi[e] = (f16)(sc * (float)(i8)ie_byte(wd[2u + (e >> 2)], e & 3u));
+      }
+      *(LDSP h8 *)(gh_x + tk * GH_LS + pc * 16u) = lo;
+      *(LDSP h8 *)(gh_x + tk * GH_LS + pc * 16u + 8u) = hi;
+    }
+    barrier();
+    for (u32 ks = 0; ks < GH_K; ks += 16u) {
+      h8 a[2], bb[2];
+      for (u32 i = 0; i < 2u; i++) {
+        a[i] = *(const LDSP h8 *)(gh_w + (wr + 16u * i + (l & 15u)) * GH_LS + ks + 8u * h);
+        bb[i] = *(const LDSP h8 *)(gh_x + (wt + 16u * i + (l & 15u)) * GH_LS + ks + 8u * h);
+      }
+      for (u32 i = 0; i < 2u; i++)
+        for (u32 j = 0; j < 2u; j++) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a[i], bb[j], acc[i][j]);
+    }
+    barrier();
+  }
+  for (u32 i = 0; i < 2u; i++)
+    for (u32 j = 0; j < 2u; j++) {
+      const u32 t = tbase + wt + 16u * j + (l & 15u);
+      if (t >= T) continue;
+      for (u32 v = 0; v < 8u; v++) {
+        const u32 r = rbase + wr + 16u * i + 8u * h + v;
+        if (r < rows) y[t * ys + r] = epilogue(acc[i][j][v], r, bias, res ? res + t * rs : res);
+      }
+    }
+}
+
 /* y = W x for an f32 matrix (F16 weights dequantized at load):
  * the same grid; lane l does the elements ie_lane_blk(l, t) < cols. */
 KERNEL ie_gemv_f32(const G float *w, const G float *x, G float *y, u32 rows, u32 cols, const G float *bias,
@@ -724,7 +916,7 @@ KERNEL ie_qkn_rope_kv(const G float *qkv, G float *qo, G float *kc, G float *vc,
  * gdn) does the same arithmetic for one token (slot c = 0). */
 #define GDN_SLOTS 4u
 #define GDN_RING 32u
-static LDS float gd_q[128], gd_k[128], gd_v[128], gd_p[2][128], gd_r[8];
+static LDS float gd_q[128], gd_k[128], gd_r[8];
 /* conv input of channel c at token u of this launch, or (before the launch)
  * from the ring; 0 before position 0 */
 static inline float conv_in(const G float *in, u32 is, const G float *ring, u32 c, u32 t, u32 d, u32 pos, u32 cd) {
@@ -733,7 +925,7 @@ static inline float conv_in(const G float *in, u32 is, const G float *ring, u32 
   return p >= d ? ring[((p - d) & (GDN_RING - 1u)) * cd + c] : 0.0f;
 }
 static inline float conv_ch(const G float *in, u32 is, G float *ring, const G float *cw, u32 c, u32 t, u32 pos, u32 cd,
-                            int writer) {
+                            int writer) { /* writer = 0: the host stores the ring after the launch (ie_ring_store) */
   float acc = 0.0f;
   for (u32 j = 0; j < 4u; j++) /* oldest first, as ggml_ssm_conv */
     acc += conv_in(in, is, ring, c, t, 3u - j, pos, cd) * cw[c * 4u + j];
@@ -743,30 +935,29 @@ static inline float conv_ch(const G float *in, u32 is, G float *ring, const G fl
   if (writer) ring[((pos + t) & (GDN_RING - 1u)) * cd + c] = in[t * is + c];
   return acc / (1.0f + __builtin_expf(-acc));
 }
-KERNEL ie_gdn(const G float *in, G float *out, G u8 *oq, G float *ring, G float *S, const G float *cw, const G float *dtb,
-              const G float *sa, const G float *nw, u32 pos, u32 cd, u32 nk, u32 nv, float eps, u32 T, u32 is, u32 os,
-              u32 qs, u32 c, u32 wfrom) {
+/* Linear attention for 1 .. 4 tokens (decode, speculative verify): one
+ * workgroup per value head, the gated RMSNorm and the Q8 copy fused (no
+ * second launch). Thread t: value dim j = t % 128, key dims i of half t /
+ * 128. Same state slots and ring as ie_gdn. */
+static LDS float gd1_v[128], gd1_p[2][128];
+KERNEL ie_gdn1(const G float *in, G float *out, G u8 *oq, G float *ring, G float *S, const G float *cw, const G float *dtb,
+               const G float *sa, const G float *nw, u32 pos, u32 cd, u32 nk, u32 nv, float eps, u32 T, u32 is, u32 os,
+               u32 qs, u32 c, u32 wfrom, u32 rw) {
   const u32 h = wgid(), t0 = tid(), j = t0 & 127u, half = t0 >> 7, kh = h % nk, w = t0 >> 5, inner = nv * 128u;
   const unsigned long slot = (unsigned long)nv * 16384u, own = (unsigned long)h * 16384u + half * 64u * 128u + j;
-  /* the state loads first: they do not depend on the conv, so their
-   * memory latency overlaps it */
   float st[64];
   for (u32 ii = 0; ii < 64u; ii++) st[ii] = pos ? S[c * slot + own + ii * 128u] : 0.0f;
   for (u32 t = 0; t < T; t++) {
     const G float *it = in + t * is;
-    /* conv + SiLU: threads < 128 do q (channel kh*128 + j) and v (2 nk 128 +
-     * h 128 + j); threads >= 128 do k (nk 128 + kh 128 + j). The q and k ring
-     * slots are written by the workgroup h == kh only. */
-    const float a = conv_ch(in, is, ring, cw, half ? nk * 128u + kh * 128u + j : kh * 128u + j, t, pos, cd, h == kh);
-    const float vv = half ? 0.0f : conv_ch(in, is, ring, cw, 2u * nk * 128u + h * 128u + j, t, pos, cd, 1);
-    /* L2 norm of q (waves 0-3) and k (waves 4-7): x / sqrt(sum x^2 + eps) */
+    const float a = conv_ch(in, is, ring, cw, half ? nk * 128u + kh * 128u + j : kh * 128u + j, t, pos, cd, rw && h == kh);
+    const float vv = half ? 0.0f : conv_ch(in, is, ring, cw, 2u * nk * 128u + h * 128u + j, t, pos, cd, rw);
     const float ss = wave_sum_all(a * a);
     if (lane() == 0u) gd_r[w] = ss;
     barrier();
     const float n2 = half ? gd_r[4] + gd_r[5] + gd_r[6] + gd_r[7] : gd_r[0] + gd_r[1] + gd_r[2] + gd_r[3];
     const float an = a * (1.0f / __builtin_sqrtf(n2 + eps));
     if (half) gd_k[j] = an;
-    else gd_q[j] = an, gd_v[j] = vv;
+    else gd_q[j] = an, gd1_v[j] = vv;
     const float beta = sigmoidf(it[cd + inner + h]);
     const float al = it[cd + inner + nv + h] + dtb[h];
     const float sp = al > 20.0f ? al : __builtin_logf(1.0f + __builtin_expf(al));
@@ -777,9 +968,9 @@ KERNEL ie_gdn(const G float *in, G float *out, G u8 *oq, G float *ring, G float 
       st[ii] = st[ii] * decay;
       pk += st[ii] * gd_k[half * 64u + ii];
     }
-    gd_p[half][j] = pk;
+    gd1_p[half][j] = pk;
     barrier();
-    const float delta = (gd_v[j] - (gd_p[0][j] + gd_p[1][j])) * beta;
+    const float delta = (gd1_v[j] - (gd1_p[0][j] + gd1_p[1][j])) * beta;
     barrier();
     float po = 0.0f;
     G float *Sw = S + ((c + t) % GDN_SLOTS) * slot + own;
@@ -788,10 +979,9 @@ KERNEL ie_gdn(const G float *in, G float *out, G u8 *oq, G float *ring, G float 
       if (t >= wfrom) Sw[ii * 128u] = st[ii]; /* uniform */
       po += st[ii] * gd_q[half * 64u + ii];
     }
-    gd_p[half][j] = po;
+    gd1_p[half][j] = po;
     barrier();
-    const float o = (gd_p[0][j] + gd_p[1][j]) * (1.0f / __builtin_sqrtf(128.0f));
-    /* gated RMSNorm over the 128 values of the head (waves 0-3) */
+    const float o = (gd1_p[0][j] + gd1_p[1][j]) * (1.0f / __builtin_sqrtf(128.0f));
     const float s2 = wave_sum_all(o * o);
     if (lane() == 0u) gd_r[w] = s2;
     barrier();
@@ -802,7 +992,162 @@ KERNEL ie_gdn(const G float *in, G float *out, G u8 *oq, G float *ring, G float 
       out[t * os + h * 128u + j] = y;
       if (oq) quant_wave(y, (h * 128u + j) >> 5, oq + t * qs, inner >> 5);
     }
+    barrier();
+  }
+}
+
+/* (ie_gdn) Workgroup (h, cq): value head h, value columns 32 cq .. 32 cq + 31
+ * (4 workgroups per head: more workgroups than heads keeps the GPU busy).
+ * Wave w holds the state rows (key dims) 16 w .. 16 w + 15 of these columns:
+ * lane l, column j = 32 cq + l, 16 state values in registers. The conv, L2
+ * norm and gates are computed by every workgroup of the head (cheap); the
+ * output o (before the gated norm) goes to out, and ie_gnorm then does the
+ * gated RMSNorm, which needs the whole head. */
+#define GD_SPLIT 4u
+static LDS float gd_p8[8][32], gd_v32[32];
+KERNEL ie_gdn(const G float *in, G float *out, G float *ring, G float *S, const G float *cw, const G float *dtb,
+              const G float *sa, u32 pos, u32 cd, u32 nk, u32 nv, float eps, u32 T, u32 is, u32 os, u32 c, u32 wfrom,
+              u32 rw) {
+  const u32 h = wgid() / GD_SPLIT, cq = wgid() % GD_SPLIT, t0 = tid(), w = t0 >> 5, l = lane(), kh = h % nk;
+  const u32 j128 = t0 & 127u, half = t0 >> 7, inner = nv * 128u;
+  const unsigned long slot = (unsigned long)nv * 16384u, own = (unsigned long)h * 16384u + (16u * w) * 128u + 32u * cq + l;
+  /* the state loads first: they do not depend on the conv, so their
+   * memory latency overlaps it */
+  float st[16];
+  for (u32 ii = 0; ii < 16u; ii++) st[ii] = pos ? S[c * slot + own + ii * 128u] : 0.0f;
+  for (u32 t = 0; t < T; t++) {
+    const G float *it = in + t * is;
+    /* conv + SiLU: threads < 128 do q (channel kh*128 + j128), threads >=
+     * 128 do k; threads < 32 also v (this workgroup's 32 columns). Ring
+     * writers: q and k by workgroup (kh, 0), v by its workgroup. */
+    const float a = conv_ch(in, is, ring, cw, half ? nk * 128u + kh * 128u + j128 : kh * 128u + j128, t, pos, cd,
+                            rw && h == kh && cq == 0u);
+    const float vv = t0 < 32u ? conv_ch(in, is, ring, cw, 2u * nk * 128u + h * 128u + 32u * cq + t0, t, pos, cd, rw) : 0.0f;
+    /* L2 norm of q (waves 0-3) and k (waves 4-7): x / sqrt(sum x^2 + eps) */
+    const float ss = wave_sum_all(a * a);
+    if (lane() == 0u) gd_r[w] = ss;
+    barrier();
+    const float n2 = half ? gd_r[4] + gd_r[5] + gd_r[6] + gd_r[7] : gd_r[0] + gd_r[1] + gd_r[2] + gd_r[3];
+    const float an = a * (1.0f / __builtin_sqrtf(n2 + eps));
+    if (half) gd_k[j128] = an;
+    else gd_q[j128] = an;
+    if (t0 < 32u) gd_v32[t0] = vv;
+    const float beta = sigmoidf(it[cd + inner + h]);
+    const float al = it[cd + inner + nv + h] + dtb[h];
+    const float sp = al > 20.0f ? al : __builtin_logf(1.0f + __builtin_expf(al));
+    const float decay = __builtin_expf(sp * sa[h]);
+    barrier();
+    float pk = 0.0f;
+    for (u32 ii = 0; ii < 16u; ii++) {
+      st[ii] = st[ii] * decay;
+      pk += st[ii] * gd_k[16u * w + ii];
+    }
+    gd_p8[w][l] = pk;
+    barrier();
+    float kv = 0.0f;
+    for (u32 x = 0; x < 8u; x++) kv += gd_p8[x][l];
+    const float delta = (gd_v32[l] - kv) * beta;
+    barrier();
+    float po = 0.0f;
+    G float *Sw = S + ((c + t) % GDN_SLOTS) * slot + own;
+    for (u32 ii = 0; ii < 16u; ii++) {
+      st[ii] += gd_k[16u * w + ii] * delta;
+      if (t >= wfrom) Sw[ii * 128u] = st[ii]; /* uniform */
+      po += st[ii] * gd_q[16u * w + ii];
+    }
+    gd_p8[w][l] = po;
+    barrier();
+    if (w == 0u) {
+      float o = 0.0f;
+      for (u32 x = 0; x < 8u; x++) o += gd_p8[x][l];
+      out[t * os + h * 128u + 32u * cq + l] = o * (1.0f / __builtin_sqrtf(128.0f));
+    }
     barrier(); /* the LDS of this token is read before the next token writes it */
+  }
+}
+
+/* The gated RMSNorm of the linear attention output, in place: per value
+ * head (128 values) y = rmsnorm(o) * nw * silu(z), z from the input row (in
+ * + cd); and the Q8 copy. Wave w of workgroup (g, token y) does head 8 g +
+ * w; lane l holds the values l, l + 32, l + 64, l + 96 (one per Q8 block). */
+KERNEL ie_gnorm(G float *out, const G float *in, const G float *nw, G u8 *oq, u32 nv, u32 cd, float eps, u32 is, u32 os,
+                u32 qs) {
+  out = TOK(out, os), in = TOKC(in, is), oq = TOK(oq, qs);
+  const u32 h = wgid() * 8u + (tid() >> 5), l = lane();
+  if (h >= nv) return; /* whole waves */
+  float o[4], s2 = 0.0f;
+  for (u32 q = 0; q < 4u; q++) o[q] = out[h * 128u + 32u * q + l], s2 += o[q] * o[q];
+  s2 = wave_sum_all(s2);
+  const float r = 1.0f / __builtin_sqrtf(s2 / 128.0f + eps);
+  for (u32 q = 0; q < 4u; q++) {
+    const u32 jj = 32u * q + l;
+    const float z = in[cd + h * 128u + jj];
+    const float y = o[q] * r * nw[jj] * (z / (1.0f + __builtin_expf(-z)));
+    out[h * 128u + jj] = y;
+    if (oq) quant_wave(y, (h * 128u + 32u * q) >> 5, oq, (nv * 128u) >> 5);
+  }
+}
+
+/* The conv inputs of the last 3 of T tokens (positions pos + T - 3 ..) into
+ * the ring, after an ie_gdn launch with rw = 0 (a prompt chunk: more tokens
+ * than the ring has slots, so ie_gdn cannot write the ring safely while
+ * other workgroups still read it). Thread i: channel i % cd of token T - 3
+ * + i / cd. */
+KERNEL ie_ring_store(const G float *in, G float *ring, u32 pos, u32 T, u32 cd, u32 is) {
+  const u32 i = wgid() * NT + tid(), n = T < 3u ? T : 3u;
+  if (i >= n * cd) return;
+  const u32 t = T - n + i / cd, c = i % cd;
+  ring[((pos + t) & (GDN_RING - 1u)) * cd + c] = in[t * is + c];
+}
+
+/* Attention of a prompt chunk in one launch: workgroup (h, y) = query head h
+ * of token y (position pos0 + y), all positions 0 .. pos0 + y; wave w does
+ * the positions w, w + 8, .. with an online softmax, then the 8 waves merge
+ * in LDS (as ie_attn_split, with one split). Output gate and Q8 copy as
+ * ie_attn_split. Strides (bytes) between the tokens: qs (q), os (out), oqs
+ * (oq), gs (gate). hd <= 256, hd % 32 == 0 when oq is set. */
+KERNEL ie_attn_pf(const G float *q, const G float *kc, const G float *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
+                  u32 n_kv, G u8 *oq, const G float *gate, u32 gstride, u32 qs, u32 os, u32 oqs, u32 gs) {
+  q = TOKC(q, qs), out = TOK(out, os), oq = TOK(oq, oqs), gate = TOK(gate, gs);
+  const u32 h = wgid(), pos = pos0 + tokid(), kh = h / (n_head / n_kv), kvd = n_kv * hd;
+  const u32 w = tid() >> 5, l = lane();
+  const float scale = 1.0f / __builtin_sqrtf((float)hd);
+  float qv[8], acc[8];
+  for (u32 j = 0; j < 8u; j++) {
+    const u32 i = l + 32u * j;
+    qv[j] = i < hd ? q[h * hd + i] : 0.0f;
+    acc[j] = 0.0f;
+  }
+  float m = -__builtin_inff(), sum = 0.0f;
+  for (u32 p = w; p <= pos; p += 8u) {
+    const G float *k = kc + (unsigned long)p * kvd + kh * hd;
+    const G float *v = vc + (unsigned long)p * kvd + kh * hd;
+    float d = 0.0f;
+    for (u32 j = 0; j < 8u; j++)
+      if (l + 32u * j < hd) d += qv[j] * k[l + 32u * j];
+    d = wave_sum_all(d) * scale;
+    const float mn = __builtin_fmaxf(m, d), c = __builtin_expf(m - mn), e = __builtin_expf(d - mn);
+    sum = sum * c + e;
+    for (u32 j = 0; j < 8u; j++)
+      if (l + 32u * j < hd) acc[j] = acc[j] * c + e * v[l + 32u * j];
+    m = mn;
+  }
+  if (l == 0u) at_m[w] = m, at_l[w] = sum;
+  for (u32 j = 0; j < 8u; j++)
+    if (l + 32u * j < hd) at_o[w][l + 32u * j] = acc[j];
+  barrier();
+  float M = at_m[0];
+  for (u32 x = 1; x < 8u; x++) M = __builtin_fmaxf(M, at_m[x]);
+  float L = 0.0f;
+  for (u32 x = 0; x < 8u; x++) L += at_l[x] * (at_m[x] == -__builtin_inff() ? 0.0f : __builtin_expf(at_m[x] - M));
+  if (tid() < hd) { /* whole waves when oq is set */
+    float o = 0.0f;
+    for (u32 x = 0; x < 8u; x++)
+      if (at_m[x] != -__builtin_inff()) o += at_o[x][tid()] * __builtin_expf(at_m[x] - M);
+    o = o / L;
+    if (gate) o = o * sigmoidf(gate[h * gstride + tid()]);
+    out[h * hd + tid()] = o;
+    if (oq) quant_wave(o, (h * hd + tid()) >> 5, oq, (n_head * hd) >> 5);
   }
 }
 

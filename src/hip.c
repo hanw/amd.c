@@ -77,11 +77,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 enum { GDN_RING = 32, GDN_SLOTS = 4 }; /* as in ie_kernels.c */
 /* The argmax kernel: workgroups, and its device scratch (partial results and
@@ -382,9 +382,45 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           /* many tokens (prompt chunks): 4 rows per wave, 4 times less
            * activation traffic; few tokens (verify): one row per wave, more
            * workgroups. The same results either way. */
-          static int trmin = -1;
-          if (trmin < 0) trmin = getenv("IE_TR_MIN") ? atoi(getenv("IE_TR_MIN")) : 5;
-          if ((int)T >= trmin) {
+          static int trmin = -1, gmin = -1;
+          if (trmin < 0) trmin = getenv("IE_TR_MIN") ? atoi(getenv("IE_TR_MIN")) : 2;
+          if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
+          static int gk = -1; /* IE_GEMM=h: the fp16 WMMA kernel */
+          if (gk < 0) gk = getenv("IE_GEMM") && getenv("IE_GEMM")[0] == 'h' ? K_GEMM_H : K_GEMM_Q8;
+          if ((int)T >= gmin) { /* many tokens: the matrix instruction (WMMA) */
+            launch(b, gk, ((rows + 127u) / 128u) * ((T + 63u) / 64u), args);
+            if (getenv("IE_GEMM_CHECK")) { /* debug: compare with ie_gemv_q8q8_t, 16 tokens at a time, no bias/residual */
+              static float *dev = NULL;
+              static size_t cap = 0;
+              const size_t need = (size_t)T * ys * 4;
+              if (need > cap) { if (dev) H.Free(dev); HIP(H.Malloc((void **)&dev, need)); cap = need; }
+              void *nul = NULL;
+              u32 one = 1;
+              (void)one;
+              float *y1 = malloc(need), *y2 = malloc(need);
+              void *ga[] = {&w0, &w1, &A, &dev, &rows, &nb, &nul, &nul, &T, &xs, &ys, &rs};
+              launch(b, gk, ((rows + 127u) / 128u) * ((T + 63u) / 64u), ga);
+              for (u32 t0 = 0; t0 < T; t0 += 16) {
+                u32 tn = T - t0 < 16 ? T - t0 : 16;
+                char *Ab = (char *)A + (size_t)t0 * xs;
+                float *Bb = (float *)B + (size_t)t0 * ys;
+                void *ta[] = {&w0, &w1, &Ab, &Bb, &rows, &nb, &nul, &nul, &tn, &xs, &ys, &rs};
+                launch(b, K_GEMV_Q8_T, gemv_groups(rows), ta);
+              }
+              HIP(H.Memcpy(y1, dev, need, hipMemcpyDeviceToHost));
+              HIP(H.Memcpy(y2, B, need, hipMemcpyDeviceToHost));
+              double mx = 0, d = 0;
+              for (u32 t = 0; t < T; t++)
+                for (u32 r = 0; r < rows; r++) {
+                  double u = y1[(size_t)t * ys + r], v = y2[(size_t)t * ys + r];
+                  if (fabs(v) > mx) mx = fabs(v);
+                  if (fabs(u - v) > d) d = fabs(u - v);
+                }
+              fprintf(stderr, "gemm check %ux%u T=%u: max |gemm - gemv| / max |gemv| = %.2e\n", rows, o->w->cols, T, mx > 0 ? d / mx : 0);
+              free(y1), free(y2);
+              if (bias || R) ie_die("IE_GEMM_CHECK: stop at the first GEMV with bias or residual (the check overwrote its output)");
+            }
+          } else if ((int)T >= trmin) {
             static unsigned rpw = 0; /* rows per wave of ie_gemv_q8q8_tr (GEMV_R) */
             if (!rpw) rpw = getenv("IE_TR_R") ? (unsigned)atoi(getenv("IE_TR_R")) : 4u;
             unsigned gr = (rows + 8u * rpw - 1u) / (8u * rpw);
@@ -453,8 +489,27 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         void *cw = b->d[i].w0, *dtb = b->d[i].w1, *sa = b->d[i].bias, *nw = b->d[i].nw;
         u32 cd = m->conv_dim, nk = m->n_kh, nv = m->n_vh;
         u32 is = g->bufs[o->a].stride / 4u, os = g->bufs[o->b].stride / 4u, qs = o->qo >= 0 ? g->bufs[o->qo].stride : 0u;
-        void *args[] = {&A, &B, &Q, &ring, &st, &cw, &dtb, &sa, &nw, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &qs, &slot, &wfrom};
-        launch(b, K_GDN, nv, args);
+        /* a prompt chunk (wfrom > 0) may have more tokens than the ring has
+         * slots: ie_gdn does not write the ring, ie_ring_store does after it */
+        u32 rw = wfrom == 0;
+        if (T <= 4u) { /* decode and verify: one kernel, the norm fused */
+          void *a1[] = {&A, &B, &Q, &ring, &st, &cw, &dtb, &sa, &nw, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &qs, &slot, &wfrom, &rw};
+          launch(b, K_GDN1, nv, a1);
+          if (!rw) {
+            void *a2[] = {&A, &ring, &pos, &T, &cd, &is};
+            launch(b, K_RING_STORE, (3u * cd + 255u) / 256u, a2);
+          }
+          break;
+        }
+        void *args[] = {&A, &B, &ring, &st, &cw, &dtb, &sa, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &slot, &wfrom, &rw};
+        launch(b, K_GDN, nv * 4u, args); /* prompt chunks: 4 workgroups per value head (GD_SPLIT) */
+        if (!rw) {
+          void *a2[] = {&A, &ring, &pos, &T, &cd, &is};
+          launch(b, K_RING_STORE, (3u * cd + 255u) / 256u, a2);
+        }
+        u32 isb = is * 4u, osb = os * 4u; /* the gated norm, all tokens: grid y */
+        void *a3[] = {&B, &A, &nw, &Q, &nv, &cd, &eps, &isb, &osb, &qs};
+        launch_t(b, K_GNORM, (nv + 7u) / 8u, T, a3);
         break;
       }
       case OP_KV: {
@@ -469,6 +524,14 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         float *kc = b->kc + base, *vc = b->vc + base;
         void *GT = o->gt >= 0 ? b->arena + g->bufs[o->gt].off + o->gtoff + (size_t)t * g->bufs[o->gt].stride : NULL;
         u32 gs = o->gstride;
+        if (T > 1) { /* a prompt chunk on the fast path: all tokens in one launch */
+          GT = o->gt >= 0 ? b->arena + g->bufs[o->gt].off + o->gtoff : NULL;
+          u32 qst = g->bufs[o->a].stride, ost = g->bufs[o->b].stride, oqst = o->qo >= 0 ? g->bufs[o->qo].stride : 0u;
+          u32 gst = o->gt >= 0 ? g->bufs[o->gt].stride : 0u;
+          void *args[] = {&A, &kc, &vc, &B, &pos, (void *)&hd, (void *)&nhd, (void *)&nkv, &Q, &GT, &gs, &qst, &ost, &oqst, &gst};
+          launch_t(b, K_ATTN_PF, nhd, T, args);
+          break;
+        }
         if (b->attn_split) {
           u32 ch = ie_att_ch(pos), nsplit = ie_att_nsplit(pos);
           void *args[] = {&A, &kc, &vc, &C, &B, &pos, (void *)&hd, (void *)&nhd, (void *)&nkv, &nsplit, &ch, &b->at_count, &Q, &GT, &gs};
@@ -520,8 +583,10 @@ static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u
     if (nobatch < 0) nobatch = getenv("IE_GEMV_NOBATCH") != NULL; /* debug: one GEMV launch per token */
     /* one launch for all tokens: GDN (sequential inside), Q8 GEMV (weights
      * read once), and the per-token kernels with a token grid dimension */
+    static int gmin = -1;
+    if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
     const int all = k == OP_GDN || (k == OP_GEMV_Q8 && !nobatch) || k == OP_RMSNORM || k == OP_QUANT || k == OP_SWIGLU ||
-                    k == OP_QKN_ROPE_KV;
+                    k == OP_QKN_ROPE_KV || (k == OP_ATTN && (int)T >= gmin); /* the fast (not bitwise) prefill path */
     if (all) launch_op(b, i, 0, toks[0], pos, T, slot, wfrom);
     else
       for (u32 t = 0; t < T; t++) launch_op(b, i, t, toks[t], pos + t, 1, slot, wfrom);
@@ -564,9 +629,11 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
   if (sec == 1 && g->mtp_argmax < 0) ie_die("the graph has no MTP ops");
   run_ops(b, sec ? g->n_main : 0, sec ? g->n_ops : g->n_main, toks, T, pos, last_only ? T - 1 : 0);
   const buf *am = &g->bufs[sec ? g->mtp_argmax : g->argmax];
-  u32 tmp[16 * 64];
+  u32 *tmp = malloc((size_t)T * am->stride);
+  if (!tmp) ie_die("out of memory");
   HIP(H.Memcpy(tmp, b->arena + am->off, (size_t)T * am->stride, hipMemcpyDeviceToHost));
   for (u32 t = 0; t < T; t++) out[t] = tmp[t * am->stride / 4u];
+  free(tmp);
 }
 
 static void gpu_accept(backend *bk, uint32_t k) {

@@ -180,7 +180,8 @@ static inline uint32_t ie_att_max_split(uint32_t n_ctx) {
 #define IE_ATT_MAX_SPLIT 2048u
 typedef struct {
   const char *name;
-  /* stride: bytes per token (256-aligned); size = stride * graph.T */
+  /* stride: bytes per token (256-aligned); size = stride * graph.T; or
+   * stride 0: one part that all tokens share (new_buf_shared) */
   uint32_t stride, size, off, first, last;
 } buf;
 

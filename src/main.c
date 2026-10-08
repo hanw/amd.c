@@ -115,7 +115,7 @@ static void ppl_add(ppl_acc *pa, const float *lg, uint32_t vocab, uint32_t next)
  * the row of g->h_out that holds h(n-1). */
 static uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32_t *toks, uint32_t n, uint32_t chunk,
                         int mtp, ppl_acc *pa, uint32_t *hrow) {
-  uint32_t a[16], d[16], last = 0, T = 1;
+  uint32_t *a = malloc(chunk * 4), *d = malloc(chunk * 4), last = 0, T = 1;
   float *lg = pa && pa->on ? malloc((size_t)chunk * g->bufs[g->logits].stride) : NULL;
   if (mtp) b->copy_rows(b, g->mtp_h, 0, -1, 0, 1); /* h(-1) = 0 */
   for (uint32_t p0 = 0; p0 < n; p0 += T) {
@@ -135,7 +135,7 @@ static uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32
       b->copy_rows(b, g->mtp_h, 0, g->h_out, T - 1, 1);
     }
   }
-  free(lg);
+  free(lg), free(a), free(d);
   *hrow = T - 1;
   return last;
 }
@@ -224,14 +224,14 @@ static void usage(void) {
           "  --stop: end the generation at the end-of-sequence token\n"
           "  --draft D: speculative decoding with the model's MTP head, D = 1 to 3 drafts per step (GPU);\n"
           "             --mtp FILE: the MTP head from FILE (default: the model file)\n"
-          "  --chunk N: GPU, the prompt in chunks of up to N tokens (1 to 16, default 16)\n"
+          "  --chunk N: GPU, the prompt in chunks of up to N tokens (1 to 512, default 256)\n"
           "  --temp T [--top-k K] [--top-p P] [--seed S]: sampling (default: greedy)\n");
   exit(2);
 }
 
 int main(int argc, char **argv) {
   const char *mtp_path = NULL;
-  uint32_t draft = 0, chunk = 16, top_k = 0;
+  uint32_t draft = 0, chunk = 256, top_k = 0;
   float temp = 0.0f, top_p = 1.0f;
   uint64_t seed = 1;
   const char *path = NULL, *be = "cpu", *toks = "1", *dump = NULL, *hsaco = "build/ie_kernels.hsaco", *tfile = NULL;
@@ -316,7 +316,7 @@ int main(int argc, char **argv) {
           m.arch == ARCH_QWEN35 ? "qwen35" : m.arch == ARCH_QWEN2 ? "qwen2" : "llama", m.n_layer, m.dim, m.ffn, m.n_head, m.n_kv, m.hd, m.vocab,
           m.rope == ROPE_NEOX ? "neox" : "norm", m.weight_bytes / 1e6);
 
-  if (chunk < 1 || chunk > 16) ie_die("--chunk: 1 to 16");
+  if (chunk < 1 || chunk > 512) ie_die("--chunk: 1 to 512");
   const int gpu = !strcmp(be, "gpu"), use_pf = gpu && !dump;
   if (!use_pf) chunk = 1;
   graph gr;
