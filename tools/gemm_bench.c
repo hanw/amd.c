@@ -45,6 +45,11 @@ int main(int argc, char **argv) {
     void *args[] = {&qw, &qs, &xq, &y, &rows, &nb, &nul, &nul, &T, &xsu, &ys, &rs};
     unsigned GR = getenv("GM_R") ? (unsigned)atoi(getenv("GM_R")) : 128, GT = getenv("GM_T") ? (unsigned)atoi(getenv("GM_T")) : 64;
     unsigned g = ((rows + GR - 1) / GR) * ((T + GT - 1) / GT);
+    if (getenv("ROWS_PER_WG")) { /* the GEMV kernels: rows / ROWS_PER_WG workgroups (ie_gemv_q8q8_tr: 32) */
+      const unsigned rpw = (unsigned)atoi(getenv("ROWS_PER_WG"));
+      g = (rows + rpw - 1) / rpw;
+      if (g >= 253 && g <= 256) g = 257;
+    }
     const int it = 20;
     for (int i = -3; i < it; i++) {
       if (i == 0) EvR(e0, NULL);
