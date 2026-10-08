@@ -26,7 +26,7 @@ typedef struct {
    * MAT_Q4 (rows*nb*4 nibble words, the nibbles of each sub-block in the
    * Q4_0 order, values 0..15); qs: rows*nb u16 (6-bit scale | 6-bit min << 8)
    * of each sub-block, then rows*(nb/8)*2 u16 (f16 d, f16 dmin) of each
-   * super-block. Weight = d*sc*q - dmin*mn (as ggml). See ie_q4k_* below. */
+   * super-block. Weight = d*sc*q - dmin*mn (as ggml). Index maps: ie_q4k_* in core/ie_core.h. */
   /* MAT_F32: rows*cols floats (dequantized from F32/F16, or Q8_0 for the embedding). */
   float *f;
   /* Streaming load (ie_mat_sink set): the device copies of qw and qs (or
@@ -39,13 +39,6 @@ typedef struct {
   float *f;
 } vec;
 
-/* MAT_Q4K index maps: the (scale, min) word of sub-block b of row r, the
- * (d, dmin) pair of super-block s (both in u16 units of qs). */
-static inline uint64_t ie_q4k_sm(uint32_t r, uint32_t b, uint32_t nb) { return (uint64_t)r * nb + b; }
-static inline uint64_t ie_q4k_dd(uint32_t rows, uint32_t r, uint32_t s, uint32_t nb) {
-  return (uint64_t)rows * nb + ((uint64_t)r * (nb / 8u) + s) * 2u;
-}
-static inline uint64_t ie_q4k_qs_n(uint32_t rows, uint32_t nb) { return (uint64_t)rows * nb + (uint64_t)rows * (nb / 8u) * 2u; }
 
 typedef struct {
   vec attn_norm, ffn_norm;

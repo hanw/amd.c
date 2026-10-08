@@ -115,7 +115,7 @@ Q4_K 矩阵（Q4_K_M 文件的主体）保持 4 位（`MAT_Q4K`）：每 32 个�
 每块存 6 位缩放和 6 位最小值，每 256 个权重存 f16 的 d 和 dmin。块点积：dq = Σ q·a（整数，精确），
 然后 acc += da · ((d·sc)·dq − (dmin·mn)·asum)，和 ggml 的反量化公式相同。核函数：单 token `ie_gemv_q4kq8`，
 2 到 16 个 token `ie_gemv_q4kq8_tr`（与单 token 逐位相同），17 个以上 `ie_gemm_q4kr`（WMMA）。
-Q5_K、Q6_K 和 Q4_K 的词嵌入在加载时再量化成 Q8_0（近似）。qwen35 的 Q4_0 矩阵（Q4_K_M 文件里的 MTP 层）按 Q8_0 加载（精确：int8 = q − 8，同一缩放）。
+Q5_K、Q6_K 和 Q4_K 的词嵌入在加载时再量化成 Q8_0（近似）。整数部分（地址、半字节重排、子块点积）由 Lean 证明（5 条定律，见“什么被验证”）。qwen35 的 Q4_0 矩阵（Q4_K_M 文件里的 MTP 层）按 Q8_0 加载（精确：int8 = q − 8，同一缩放）。
 已确认：`make test` 的 tiny-llama-k（Q4_K、Q5_K、Q6_K）与 numpy 参考（gguf 包自己的反量化）相对差 3e-7。
 
 **Qwen3.8-27B Q4_K_M**（bartowski，17.4 GB；主体 Q4_K，另有 Q6_K、Q8_0、Q5_K，自带 MTP 层 blk.64）。2026-10-08，同一台 R9700：
@@ -499,9 +499,11 @@ MTP 推测解码与普通解码的输出仍然相同（27B 三个提示，3 和 
 
 ## 什么被验证、什么被测试、什么没有测试
 
-**被验证（Lean 证明，对所有输入成立，`make proofs` 约 1 分钟）**：`core/ie_core.h` 中的函数满足 `laws/ie_laws.cpp` 的 22 条定律：
+**被验证（Lean 证明，对所有输入成立，`make proofs` 约 1 分钟）**：`core/ie_core.h` 中的函数满足 `laws/ie_laws.cpp` 的 29 条定律：
 GEMV 网格和 lane 划分的覆盖与唯一性；Q4_0 和 Q8_0 重排地址在数组内且是双射；半字节和字节解包符合 GGUF；
-Q4×Q8 和 Q8×Q8 的块点积公式等于精确的整数点积；跨 lane 求和与 wave 树归约等于普通求和（模 2^32）；
+Q4×Q8 和 Q8×Q8 的块点积公式等于精确的整数点积；
+Q4_K（`MAT_Q4K`）：重排地址和 GGUF 源地址在数组内、字地址是双射、半字节重排符合 GGUF（`q4k_nibble`）、
+子块点积 `ie_q4k_dot` 等于 Σ q·a（`q4k_dot`；单 token、多 token 核函数和 CPU 都调用它）；跨 lane 求和与 wave 树归约等于普通求和（模 2^32）；
 被 `ie_plan_check` 接受的规划：缓冲区在 arena 内、256 对齐、同时存活的缓冲区不重叠。
 
 **只被测试**：GGUF 解析、模型加载、贪心规划器（它的输出由验证过的检查函数检查）、

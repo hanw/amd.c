@@ -192,6 +192,58 @@ def ie_q8q8_spec.go (fuel : Nat) (n : U32) (qw : Mem) (qb : U32) (aw : Mem) (ab 
 def ie_q8q8_spec (n : U32) (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) (j : U32) : U32 :=
   ie_q8q8_spec.go n.toNat n qw qb aw ab j
 
+/-- C++: ie_q4k_sizes_ok -/
+def ie_q4k_sizes_ok (rows : U32) (nb : U32) : Bool :=
+  ((((BitVec.ult rows 262144#32) && (BitVec.ult nb 2048#32)) && (BitVec.ult (rows * nb) 67108864#32)) && ((nb % 8#32) == 0#32))
+
+/-- C++: ie_q4k_sm -/
+def ie_q4k_sm (r : U32) (b : U32) (nb : U32) : U32 :=
+  ((r * nb) + b)
+
+/-- C++: ie_q4k_dd -/
+def ie_q4k_dd (rows : U32) (r : U32) (b : U32) (nb : U32) : U32 :=
+  ((rows * nb) + (((r * (nb / 8#32)) + (b / 8#32)) * 2#32))
+
+/-- C++: ie_q4k_qs_n -/
+def ie_q4k_qs_n (rows : U32) (nb : U32) : U32 :=
+  ((rows * nb) + ((rows * (nb / 8#32)) * 2#32))
+
+/-- C++: ie_q4k_src_blk -/
+def ie_q4k_src_blk (r : U32) (b : U32) (nb : U32) : U32 :=
+  (((r * nb) + ((b / 8#32) * 8#32)) * 18#32)
+
+/-- C++: ie_q4k_src_qbyte -/
+def ie_q4k_src_qbyte (r : U32) (b : U32) (j : U32) (nb : U32) : U32 :=
+  ((((ie_q4k_src_blk r b nb) + 16#32) + (32#32 * ((b % 8#32) / 2#32))) + j)
+
+/-- C++: ie_q4k_src_nib -/
+def ie_q4k_src_nib (qbyte : U32) (b : U32) : U32 :=
+  (bif ((b % 2#32) == 1#32) then ((qbyte &&& 255#32) >>> 4) else (qbyte &&& 15#32))
+
+/-- C++: ie_q4k_pack -/
+def ie_q4k_pack (lo : U32) (hi : U32) (b : U32) : U32 :=
+  ((ie_q4k_src_nib lo b) ||| ((ie_q4k_src_nib hi b) <<< 4))
+
+/-- C++: ie_q4k_dot -/
+def ie_q4k_dot (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) : U32 :=
+  (ie_q4q8_word (ie_q4q8_word (ie_q4q8_word (ie_q4q8_word 0#32 (Mem.load qw qb) (Mem.load aw ab) (Mem.load aw (ab + 4#32))) (Mem.load qw (qb + 1#32)) (Mem.load aw (ab + 1#32)) (Mem.load aw (ab + 5#32))) (Mem.load qw (qb + 2#32)) (Mem.load aw (ab + 2#32)) (Mem.load aw (ab + 6#32))) (Mem.load qw (qb + 3#32)) (Mem.load aw (ab + 3#32)) (Mem.load aw (ab + 7#32)))
+
+/-- C++: ie_q4k_term -/
+def ie_q4k_term (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) (j : U32) : U32 :=
+  ((ie_q4_nib (Mem.load qw (qb + (ie_q4_word_of j))) j) * (ie_sext8 (ie_byte (Mem.load aw (ab + (j >>> 2))) (j &&& 3#32))))
+
+/-- C++: ie_q4k_spec (recursive: fuel counts down with n) -/
+def ie_q4k_spec.go (fuel : Nat) (n : U32) (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) (j : U32) : U32 :=
+  match fuel with
+  | 0 =>
+    0#32
+  | fuel' + 1 =>
+    (bif (BitVec.ult j 32#32) then ((ie_q4k_term qw qb aw ab j) + (ie_q4k_spec.go fuel' (n - 1#32) qw qb aw ab (j + 1#32))) else 0#32)
+
+/-- C++: ie_q4k_spec -/
+def ie_q4k_spec (n : U32) (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) (j : U32) : U32 :=
+  ie_q4k_spec.go n.toNat n qw qb aw ab j
+
 /-- C++: ie_gemv_ngroups -/
 def ie_gemv_ngroups (rows : U32) : U32 :=
   ((rows + 7#32) >>> 3)
@@ -415,5 +467,25 @@ def law_q8_byte (q0 : U32) (q1 : U32) (q2 : U32) (q3 : U32) (j : U32) : Bool :=
 /-- C++: law_q8q8_block -/
 def law_q8q8_block (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) : Bool :=
   ((ie_q8q8_block qw qb aw ab) == (ie_q8q8_spec 32#32 qw qb aw ab 0#32))
+
+/-- C++: law_q4k_addr -/
+def law_q4k_addr (rows : U32) (nb : U32) (r : U32) (b : U32) (w : U32) (j : U32) : Bool :=
+  ((!(((((ie_q4k_sizes_ok rows nb) && (BitVec.ult r rows)) && (BitVec.ult b nb)) && (BitVec.ult w 4#32)) && (BitVec.ult j 32#32))) || (((((BitVec.ult (ie_q4_dst_word r b w nb) ((rows * nb) * 4#32)) && (BitVec.ult (ie_q4k_sm r b nb) (rows * nb))) && (BitVec.ult ((ie_q4k_dd rows r b nb) + 1#32) (ie_q4k_qs_n rows nb))) && (BitVec.ult ((ie_q4k_src_blk r b nb) + 15#32) ((rows * nb) * 18#32))) && (BitVec.ult (ie_q4k_src_qbyte r b j nb) ((rows * nb) * 18#32))))
+
+/-- C++: law_q4k_inverse -/
+def law_q4k_inverse (rows : U32) (nb : U32) (r : U32) (b : U32) (w : U32) : Bool :=
+  ((!((((ie_q4k_sizes_ok rows nb) && (BitVec.ult r rows)) && (BitVec.ult b nb)) && (BitVec.ult w 4#32))) || ((((ie_q4_word_row (ie_q4_dst_word r b w nb) nb) == r) && ((ie_q4_word_blk (ie_q4_dst_word r b w nb) nb) == b)) && ((ie_q4_word_w (ie_q4_dst_word r b w nb)) == w)))
+
+/-- C++: law_q4k_onto -/
+def law_q4k_onto (rows : U32) (nb : U32) (i : U32) : Bool :=
+  ((!(((ie_q4k_sizes_ok rows nb) && (BitVec.ult 0#32 nb)) && (BitVec.ult i ((rows * nb) * 4#32)))) || (((BitVec.ult (ie_q4_word_row i nb) rows) && (BitVec.ult (ie_q4_word_blk i nb) nb)) && ((ie_q4_dst_word (ie_q4_word_row i nb) (ie_q4_word_blk i nb) (ie_q4_word_w i) nb) == i)))
+
+/-- C++: law_q4k_nibble -/
+def law_q4k_nibble (l0 : U32) (l1 : U32) (l2 : U32) (l3 : U32) (h0 : U32) (h1 : U32) (h2 : U32) (h3 : U32) (b : U32) (j : U32) : Bool :=
+  ((!(BitVec.ult j 32#32)) || ((ie_q4_nib (ie_pack4 (ie_q4k_pack l0 h0 b) (ie_q4k_pack l1 h1 b) (ie_q4k_pack l2 h2 b) (ie_q4k_pack l3 h3 b)) j) == (ie_q4k_src_nib (bif (BitVec.ult j 16#32) then (bif ((j &&& 3#32) == 0#32) then l0 else (bif ((j &&& 3#32) == 1#32) then l1 else (bif ((j &&& 3#32) == 2#32) then l2 else l3))) else (bif ((j &&& 3#32) == 0#32) then h0 else (bif ((j &&& 3#32) == 1#32) then h1 else (bif ((j &&& 3#32) == 2#32) then h2 else h3)))) b)))
+
+/-- C++: law_q4k_dot -/
+def law_q4k_dot (qw : Mem) (qb : U32) (aw : Mem) (ab : U32) : Bool :=
+  ((ie_q4k_dot qw qb aw ab) == (ie_q4k_spec 32#32 qw qb aw ab 0#32))
 
 end C

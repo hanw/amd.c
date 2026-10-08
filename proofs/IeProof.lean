@@ -359,4 +359,133 @@ theorem q8q8_block : Laws.q8q8_block := by
     BitVec.reduceAnd, BitVec.reduceHShiftRight, Bool.cond_true, Bool.cond_false, BitVec.add_zero, BitVec.zero_add]
   ac_rfl
 
+
+-- 6. The Q4_K path (MAT_Q4K)
+
+theorem q4k_nibble : Laws.q4k_nibble := by
+  intro l0 l1 l2 l3 h0 h1 h2 h3 b j
+  simp only [law_q4k_nibble, ie_q4_nib, ie_pack4, ie_q4k_pack, ie_q4k_src_nib]; bv_decide
+
+theorem q4k_inverse : Laws.q4k_inverse := by
+  intro rows nb r b w
+  unfold law_q4k_inverse
+  cases hs : ie_q4k_sizes_ok rows nb <;> cases hr : BitVec.ult r rows <;> cases hb : BitVec.ult b nb <;>
+    cases hw : BitVec.ult w 4#32 <;>
+    simp only [Bool.false_and, Bool.and_false, Bool.not_false, Bool.true_or, Bool.true_and, Bool.not_true, Bool.false_or]
+  simp only [ie_q4k_sizes_ok, Bool.and_eq_true, BitVec.ult_iff_lt, beq_iff_eq] at hs hr hb hw
+  have ⟨q1, q2⟩ := rows_nb8 rows nb hs.1.1.1 hs.1.1.2 hs.1.2
+  have ⟨p1, p2⟩ := r_nb8 rows nb r hs.1.1.1 hs.1.1.2 hs.1.2 hr
+  have hb' : b.toNat < nb.toNat := hb
+  have hw' : w.toNat < 4 := hw
+  have hN : 0 < nb.toNat := by omega
+  simp only [ie_q4_word_row, ie_q4_word_blk, ie_q4_word_w, ie_q4_dst_word, Bool.and_eq_true, beq_iff_eq]
+  have es : (r * nb + b).toNat = b.toNat + nb.toNat * r.toNat := by
+    rw [BitVec.toNat_add, p1, Nat.mod_eq_of_lt (by omega), Nat.mul_comm, Nat.add_comm]
+  have e4 : ((r * nb + b) * 4#32 + w).toNat / 4 = b.toNat + nb.toNat * r.toNat := by
+    simp only [BitVec.toNat_add, BitVec.toNat_mul, BitVec.toNat_ofNat, es]
+    rw [Nat.mul_comm nb.toNat] at *
+    generalize r.toNat * nb.toNat = pn at *
+    simp (disch := omega) only [Nat.mod_eq_of_lt]
+    omega
+  refine ⟨⟨?_, ?_⟩, ?_⟩ <;> apply BitVec.eq_of_toNat_eq
+  · rw [BitVec.toNat_udiv, BitVec.toNat_udiv, BitVec.toNat_ofNat, e4, Nat.add_mul_div_left _ _ hN, Nat.div_eq_of_lt hb', Nat.zero_add]
+  · rw [BitVec.toNat_umod, BitVec.toNat_udiv, BitVec.toNat_ofNat, e4, Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hb']
+  · simp only [BitVec.toNat_umod, BitVec.toNat_add, BitVec.toNat_mul, BitVec.toNat_ofNat, es]
+    rw [Nat.mul_comm nb.toNat] at *
+    generalize r.toNat * nb.toNat = pn at *
+    simp (disch := omega) only [Nat.mod_eq_of_lt]
+    omega
+
+theorem q4k_onto : Laws.q4k_onto := by
+  intro rows nb i
+  unfold law_q4k_onto
+  cases hs : ie_q4k_sizes_ok rows nb <;> cases h0 : BitVec.ult 0#32 nb <;> cases hi : BitVec.ult i (rows * nb * 4#32) <;>
+    simp only [Bool.false_and, Bool.and_false, Bool.not_false, Bool.true_or, Bool.true_and, Bool.not_true, Bool.false_or]
+  simp only [ie_q4k_sizes_ok, Bool.and_eq_true, BitVec.ult_iff_lt, beq_iff_eq] at hs h0 hi
+  have ⟨q1, q2⟩ := rows_nb8 rows nb hs.1.1.1 hs.1.1.2 hs.1.2
+  have hN : 0 < nb.toNat := h0
+  have hi' : i.toNat < rows.toNat * nb.toNat * 4 := by
+    have := BitVec.lt_def.mp hi
+    simp only [BitVec.toNat_mul, q1, BitVec.toNat_ofNat] at this
+    simp (disch := omega) only [Nat.mod_eq_of_lt] at this; exact this
+  simp only [ie_q4_word_row, ie_q4_word_blk, ie_q4_word_w, ie_q4_dst_word, Bool.and_eq_true, beq_iff_eq, BitVec.ult_iff_lt]
+  have hq : i.toNat / 4 < rows.toNat * nb.toNat := by omega
+  have hd : i.toNat / 4 / nb.toNat < rows.toNat := (Nat.div_lt_iff_lt_mul hN).mpr hq
+  have hm : i.toNat / 4 % nb.toNat < nb.toNat := Nat.mod_lt _ hN
+  have hdm := Nat.div_add_mod (i.toNat / 4) nb.toNat
+  have hle : nb.toNat * (i.toNat / 4 / nb.toNat) ≤ i.toNat / 4 := by omega
+  refine ⟨⟨?_, ?_⟩, ?_⟩
+  · rw [BitVec.lt_def, BitVec.toNat_udiv, BitVec.toNat_udiv, BitVec.toNat_ofNat]; exact hd
+  · rw [BitVec.lt_def, BitVec.toNat_umod, BitVec.toNat_udiv, BitVec.toNat_ofNat]; exact hm
+  · apply BitVec.eq_of_toNat_eq
+    simp only [BitVec.toNat_add, BitVec.toNat_mul, BitVec.toNat_udiv, BitVec.toNat_umod, BitVec.toNat_ofNat]
+    simp (disch := omega) only [Nat.mod_eq_of_lt (a := 4) (b := 2^32)]
+    rw [Nat.mul_comm (i.toNat / 4 / nb.toNat)]
+    generalize nb.toNat * (i.toNat / 4 / nb.toNat) = pn at *
+    simp (disch := omega) only [Nat.mod_eq_of_lt]
+    omega
+
+theorem q4k_addr : Laws.q4k_addr := by
+  intro rows nb r b w j
+  unfold law_q4k_addr
+  cases hs : ie_q4k_sizes_ok rows nb <;> cases hr : BitVec.ult r rows <;> cases hb : BitVec.ult b nb <;>
+    cases hw : BitVec.ult w 4#32 <;> cases hj : BitVec.ult j 32#32 <;>
+    simp only [Bool.false_and, Bool.and_false, Bool.not_false, Bool.true_or, Bool.true_and, Bool.not_true, Bool.false_or]
+  simp only [ie_q4k_sizes_ok, Bool.and_eq_true, BitVec.ult_iff_lt, beq_iff_eq] at hs hr hb hw hj
+  have ⟨q1, q2⟩ := rows_nb8 rows nb hs.1.1.1 hs.1.1.2 hs.1.2
+  have ⟨p1, p2⟩ := r_nb8 rows nb r hs.1.1.1 hs.1.1.2 hs.1.2 hr
+  have h8 : nb.toNat % 8 = 0 := by
+    have := congrArg BitVec.toNat hs.2
+    simpa [BitVec.toNat_umod] using this
+  have hb' : b.toNat < nb.toNat := hb
+  have hw' : w.toNat < 4 := hw
+  have hj' : j.toNat < 32 := hj
+  have hr' : r.toNat + 1 ≤ rows.toNat := by bv_omega
+  -- the products with nb / 8
+  have m1 : r.toNat * (nb.toNat / 8) + nb.toNat / 8 ≤ rows.toNat * (nb.toNat / 8) := by
+    rw [← Nat.succ_mul]; exact Nat.mul_le_mul_right _ hr'
+  have m2 : rows.toNat * nb.toNat = 8 * (rows.toNat * (nb.toNat / 8)) := by
+    have e : nb.toNat = 8 * (nb.toNat / 8) := by omega
+    conv => lhs; rw [e]
+    rw [Nat.mul_left_comm]
+  have m3 : r.toNat * nb.toNat = 8 * (r.toNat * (nb.toNat / 8)) := by
+    have e : nb.toNat = 8 * (nb.toNat / 8) := by omega
+    conv => lhs; rw [e]
+    rw [Nat.mul_left_comm]
+  simp only [ie_q4_dst_word, ie_q4k_sm, ie_q4k_dd, ie_q4k_qs_n, ie_q4k_src_qbyte, ie_q4k_src_blk, Bool.and_eq_true,
+    BitVec.ult_iff_lt, BitVec.lt_def, BitVec.toNat_add, BitVec.toNat_mul, BitVec.toNat_udiv, BitVec.toNat_umod,
+    BitVec.toNat_ofNat, p1, q1]
+  generalize r.toNat * (nb.toNat / 8) = a at *
+  generalize rows.toNat * (nb.toNat / 8) = c at *
+  generalize r.toNat * nb.toNat = pn at *
+  generalize rows.toNat * nb.toNat = qn at *
+  simp (disch := omega) only [Nat.mod_eq_of_lt]
+  omega
+
+theorem q4k_dot : Laws.q4k_dot := by
+  intro qw qb aw ab
+  have hb := q4q8_block qw qb aw ab
+  simp only [law_q4q8_block, beq_iff_eq] at hb
+  have e : ie_q4k_dot qw qb aw ab = ie_q4q8_block qw qb aw ab (ie_q8_sum aw ab) + 8#32 * ie_q8_sum aw ab := by
+    simp only [ie_q4k_dot, ie_q4q8_block, BitVec.sub_add_cancel]
+  simp only [law_q4k_dot, beq_iff_eq, e, hb]
+  simp only [ie_q4q8_spec, ie_q4k_spec, ie_q8_sum, ie_sum_s8x4, BitVec.toNat_ofNat, Nat.reduceMod]
+  simp only [ie_q4q8_spec.go, ie_q4k_spec.go, ie_q4q8_term, ie_q4k_term, ie_q4_word_of, BitVec.reduceULT, BitVec.reduceAdd,
+    BitVec.reduceSub, BitVec.reduceAnd, BitVec.reduceMul, BitVec.reduceHShiftRight, Bool.cond_true, Bool.cond_false,
+    BitVec.add_zero, BitVec.zero_add]
+  generalize Mem.load qw qb = w0
+  generalize Mem.load qw (qb + 1#32) = w1
+  generalize Mem.load qw (qb + 2#32) = w2
+  generalize Mem.load qw (qb + 3#32) = w3
+  generalize Mem.load aw ab = x0
+  generalize Mem.load aw (ab + 1#32) = x1
+  generalize Mem.load aw (ab + 2#32) = x2
+  generalize Mem.load aw (ab + 3#32) = x3
+  generalize Mem.load aw (ab + 4#32) = x4
+  generalize Mem.load aw (ab + 5#32) = x5
+  generalize Mem.load aw (ab + 6#32) = x6
+  generalize Mem.load aw (ab + 7#32) = x7
+  grind
+
+
 end Proof

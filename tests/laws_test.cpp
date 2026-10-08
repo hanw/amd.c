@@ -45,6 +45,11 @@ int main() {
     CHECK("q8_inverse", law_q8_inverse(rows, nb8, r, b8, small(9)));
     CHECK("q8_onto", law_q8_onto(rows, nb8, small(rows * nb8 * 8u + 3u)));
     CHECK("q8_byte", law_q8_byte(r32(), r32(), r32(), r32(), edge()));
+    u32 nbk = it % 2 ? small(0x101u) & ~7u : small(0x801u), bk = small(nbk + 1u);
+    CHECK("q4k_addr", law_q4k_addr(rows, nbk, r, bk, small(5), small(34)));
+    CHECK("q4k_inverse", law_q4k_inverse(rows, nbk, r, bk, small(5)));
+    CHECK("q4k_onto", law_q4k_onto(rows, nbk, small(rows * nbk * 4u + 3u)));
+    CHECK("q4k_nibble", law_q4k_nibble(r32(), r32(), r32(), r32(), r32(), r32(), r32(), r32(), edge(), small(34)));
   }
   // Memory arrays.
   static u32 xs[4096], qs[64], as[64];
@@ -57,6 +62,7 @@ int main() {
     CHECK("wave_sum", law_wave_sum(x));
     CHECK("q4q8_block", law_q4q8_block(q, small(32), a, small(32)));
     CHECK("q8q8_block", law_q8q8_block(q, small(32), a, small(32)));
+    CHECK("q4k_dot", law_q4k_dot(q, small(32), a, small(32)));
   }
   // Plans: random small plans; the laws must hold when the checker accepts.
   int accepted = 0;

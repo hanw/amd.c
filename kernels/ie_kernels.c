@@ -303,7 +303,7 @@ KERNEL ie_gemv_q4q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y
  * Q4_0 blocks, values 0..15; qs: (scale | min << 8) per sub-block of 32,
  * then (f16 d, f16 dmin) per super-block of 256), x is Q8. The same grid,
  * lanes and reduction as ie_gemv_q4q8. Per sub-block b:
- *   dq = sum q a = ie_q4q8_block + 8 asum,
+ *   dq = sum q a = ie_q4k_dot (law q4k_dot),
  *   acc += da * ((d sc) dq - (dmin mn) asum)   (no fused multiply-add).
  * ie_gemv_q4kq8_tr does the same arithmetic in the same order per token. */
 KERNEL ie_gemv_q4kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
@@ -315,8 +315,8 @@ KERNEL ie_gemv_q4kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *
     const G u32 *aw = (const G u32 *)xq;
     const G float *da = (const G float *)(xq + 32u * nb);
     const G u32 *asum = (const G u32 *)(xq + 36u * nb);
-    const G u16 *smr = qs + (unsigned long)r * nb;
-    const G f16 *ddr = (const G f16 *)qs + (unsigned long)rows * nb + (unsigned long)r * (nb >> 3) * 2u;
+    const G u16 *smr = qs + ie_q4k_sm(r, 0u, nb);
+    const G f16 *ddr = (const G f16 *)qs + ie_q4k_dd(rows, r, 0u, nb);
     float acc = 0.0f;
     for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
       u32x4 w4[GEMV_U], a0[GEMV_U], a1[GEMV_U];
@@ -337,10 +337,9 @@ KERNEL ie_gemv_q4kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *
         const u32 wq[4] = {w4[k].x, w4[k].y, w4[k].z, w4[k].w};
         const u32 av[8] = {a0[k].x, a0[k].y, a0[k].z, a0[k].w, a1[k].x, a1[k].y, a1[k].z, a1[k].w};
         const Mem qm = {wq}, am = {av};
-        const int dot = (int)ie_q4q8_block(qm, 0u, am, 0u, as[k]);
+        const int dq = (int)ie_q4k_dot(qm, 0u, am, 0u); /* sum q a (law q4k_dot) */
         /* the arithmetic of q4k_term */
         const float sc = dv[k] * (float)(sm[k] & 63u), mm = mv[k] * (float)(sm[k] >> 8);
-        const int dq = dot + 8 * (int)as[k];
         /* acc = fma(sc dq, da, acc); acc = fma(-mm, da asum, acc) (explicit fma: the same in every Q4K kernel) */
         const float x = dav[k] * (float)(int)as[k];
         const float a1 = __builtin_fmaf(sc * (float)dq, dav[k], acc), a2 = __builtin_fmaf(-mm, x, a1);
@@ -371,18 +370,16 @@ _Pragma("unroll") \
     const u32 b = okb ? ie_lane_blk(l, t + u) : ie_lane_blk(l, t); \
     /* per row, once per block: the 32 weights as int8 words (weight j = \
      * byte j % 4 of word j / 4, as the activations) and the two scales */ \
-    u32 wv[QR][8]; \
+    u32 wv[QR][4]; \
     float sc[QR], mm[QR]; \
     if (!okb) continue; /* past nb (only some lanes, at the end) */ \
 _Pragma("unroll") \
     for (u32 q = 0; q < QR; q++) { \
       const u32 r = r0 + q < rows ? r0 + q : r0; /* a row past the end: row r0 again, not stored */ \
       const u32x4 w4 = __builtin_nontemporal_load((const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb))); \
-      const u32 x4[4] = {w4.x, w4.y, w4.z, w4.w}; \
-_Pragma("unroll") \
-      for (u32 k = 0; k < 4u; k++) wv[q][k] = x4[k] & 0x0F0F0F0Fu, wv[q][k + 4u] = (x4[k] >> 4) & 0x0F0F0F0Fu; \
-      const u32 sm = qs[r * nb + b]; \
-      const unsigned long dd = (unsigned long)rows * nb + ((unsigned long)r * (nb >> 3) + (b >> 3)) * 2u; \
+      wv[q][0] = w4.x, wv[q][1] = w4.y, wv[q][2] = w4.z, wv[q][3] = w4.w; \
+      const u32 sm = qs[ie_q4k_sm(r, b, nb)]; \
+      const u32 dd = ie_q4k_dd(rows, r, b, nb); \
       sc[q] = (float)((const G f16 *)qs)[dd] * (float)(sm & 63u); \
       mm[q] = (float)((const G f16 *)qs)[dd + 1u] * (float)(sm >> 8); \
     } \
@@ -398,9 +395,8 @@ _Pragma("unroll") \
         const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w}; \
 _Pragma("unroll") \
         for (u32 q = 0; q < QR; q++) { \
-          int dq = 0; /* sum q a, exact: the same integer as ie_q4q8_block + 8 asum */ \
-_Pragma("unroll") \
-          for (u32 k = 0; k < 8u; k++) dq = __builtin_amdgcn_sudot4(true, (int)wv[q][k], true, (int)av[k], dq, false); \
+          const Mem qm = {wv[q]}, am = {av}; /* the nibble masks are common to the tokens: computed once */ \
+          const int dq = (int)ie_q4k_dot(qm, 0u, am, 0u); /* sum q a (law q4k_dot) */ \
           acc[q][j] = __builtin_fmaf(-mm[q], xa, __builtin_fmaf(sc[q] * (float)dq, da, acc[q][j])); \
         } \
       } \

@@ -116,4 +116,29 @@ def q8q8_block : Prop :=
   forall (qw : C.Mem) (qb : C.U32) (aw : C.Mem) (ab : C.U32),
     C.law_q8q8_block qw qb aw ab = true
 
+/-- C++: law_q4k_addr -/
+def q4k_addr : Prop :=
+  forall (rows : C.U32) (nb : C.U32) (r : C.U32) (b : C.U32) (w : C.U32) (j : C.U32),
+    C.law_q4k_addr rows nb r b w j = true
+
+/-- C++: law_q4k_inverse -/
+def q4k_inverse : Prop :=
+  forall (rows : C.U32) (nb : C.U32) (r : C.U32) (b : C.U32) (w : C.U32),
+    C.law_q4k_inverse rows nb r b w = true
+
+/-- C++: law_q4k_onto -/
+def q4k_onto : Prop :=
+  forall (rows : C.U32) (nb : C.U32) (i : C.U32),
+    C.law_q4k_onto rows nb i = true
+
+/-- C++: law_q4k_nibble -/
+def q4k_nibble : Prop :=
+  forall (l0 : C.U32) (l1 : C.U32) (l2 : C.U32) (l3 : C.U32) (h0 : C.U32) (h1 : C.U32) (h2 : C.U32) (h3 : C.U32) (b : C.U32) (j : C.U32),
+    C.law_q4k_nibble l0 l1 l2 l3 h0 h1 h2 h3 b j = true
+
+/-- C++: law_q4k_dot -/
+def q4k_dot : Prop :=
+  forall (qw : C.Mem) (qb : C.U32) (aw : C.Mem) (ab : C.U32),
+    C.law_q4k_dot qw qb aw ab = true
+
 end Laws

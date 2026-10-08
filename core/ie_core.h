@@ -241,6 +241,58 @@ IE_FN(u32, ie_q8q8_spec, (u32 n, Mem qw, u32 qb, Mem aw, u32 ab, u32 j)) {
 }
 
 /* ======================================================================
+ * 2c. Q4_K weights (MAT_Q4K) x Q8 activations
+ * ==================================================================== */
+
+/* GGUF Q4_K: super-blocks of 256 weights (8 sub-blocks of 32), 144 bytes:
+ * f16 d, f16 dmin, 12 bytes of 6-bit scales and mins, 128 nibble bytes.
+ * Sub-blocks 2k and 2k + 1 share the bytes 32k .. 32k + 31: the low nibbles
+ * are sub-block 2k, the high nibbles sub-block 2k + 1. Weight =
+ * d * sc * q - dmin * mn (q = 0..15).
+ * MAT_Q4K (GPU): the nibble words of sub-block b of row r as a Q4_0 block
+ * (ie_q4_dst_word; byte j: weights j and j + 16 in the low and high nibble);
+ * qs (u16): (sc | mn << 8) of sub-block b at ie_q4k_sm, then the (f16 d,
+ * f16 dmin) of each super-block at ie_q4k_dd; ie_q4k_qs_n entries in all.
+ * The sizes: those of Q8_0, and whole super-blocks (nb % 8 == 0). Then
+ * rows * nb * 18 < 2^31: no address wraps. */
+IE_FN(bool, ie_q4k_sizes_ok, (u32 rows, u32 nb)) {
+  return rows < 0x40000u && nb < 0x800u && rows * nb < 0x4000000u && nb % 8u == 0u;
+}
+IE_FN(u32, ie_q4k_sm, (u32 r, u32 b, u32 nb)) { return r * nb + b; }
+IE_FN(u32, ie_q4k_dd, (u32 rows, u32 r, u32 b, u32 nb)) { return rows * nb + (r * (nb / 8u) + b / 8u) * 2u; }
+IE_FN(u32, ie_q4k_qs_n, (u32 rows, u32 nb)) { return rows * nb + rows * (nb / 8u) * 2u; }
+
+/* GGUF Q4_K source: the super-block of sub-block b of row r starts at byte
+ * (r * nb + 8 (b / 8)) * 18 (144 = 8 * 18); byte j (j < 32) of the nibble
+ * bytes of sub-block b is at + 16 + 32 * ((b % 8) / 2) + j. */
+IE_FN(u32, ie_q4k_src_blk, (u32 r, u32 b, u32 nb)) { return (r * nb + (b / 8u) * 8u) * 18u; }
+IE_FN(u32, ie_q4k_src_qbyte, (u32 r, u32 b, u32 j, u32 nb)) {
+  return ie_q4k_src_blk(r, b, nb) + 16u + 32u * ((b % 8u) / 2u) + j;
+}
+/* The nibble of sub-block b in a source byte, and the repacked byte j of
+ * the Q4_0-order block from the source bytes j (lo) and j + 16 (hi). */
+IE_FN(u32, ie_q4k_src_nib, (u32 qbyte, u32 b)) { return b % 2u == 1u ? (qbyte & 255u) >> 4u : qbyte & 15u; }
+IE_FN(u32, ie_q4k_pack, (u32 lo, u32 hi, u32 b)) { return ie_q4k_src_nib(lo, b) | (ie_q4k_src_nib(hi, b) << 4u); }
+
+/* The integer dot product of one MAT_Q4K sub-block (4 words at qb of qw,
+ * nibbles q = 0..15) and one Q8 block: the sum over j < 32 of q_j * a_j,
+ * as the kernels compute it (8 dot4, no offset). The kernels then add
+ * da ((d sc) dot - (dmin mn) asum) in float. */
+IE_FN(u32, ie_q4k_dot, (Mem qw, u32 qb, Mem aw, u32 ab)) {
+  return ie_q4q8_word(ie_q4q8_word(ie_q4q8_word(ie_q4q8_word(0u, IE_LOAD(qw, qb), IE_LOAD(aw, ab), IE_LOAD(aw, ab + 4u)),
+                                                IE_LOAD(qw, qb + 1u), IE_LOAD(aw, ab + 1u), IE_LOAD(aw, ab + 5u)),
+                                   IE_LOAD(qw, qb + 2u), IE_LOAD(aw, ab + 2u), IE_LOAD(aw, ab + 6u)),
+                      IE_LOAD(qw, qb + 3u), IE_LOAD(aw, ab + 3u), IE_LOAD(aw, ab + 7u));
+}
+/* The spec: the sum over j < 32 of nibble j * activation j. n is the fuel. */
+IE_FN(u32, ie_q4k_term, (Mem qw, u32 qb, Mem aw, u32 ab, u32 j)) {
+  return ie_q4_nib(IE_LOAD(qw, qb + ie_q4_word_of(j)), j) * ie_sext8(ie_byte(IE_LOAD(aw, ab + (j >> 2u)), j & 3u));
+}
+IE_FN(u32, ie_q4k_spec, (u32 n, Mem qw, u32 qb, Mem aw, u32 ab, u32 j)) {
+  return n == 0u ? 0u : j < 32u ? ie_q4k_term(qw, qb, aw, ab, j) + ie_q4k_spec(n - 1u, qw, qb, aw, ab, j + 1u) : 0u;
+}
+
+/* ======================================================================
  * 3. Work split: GEMV grid, lanes, reductions
  * ==================================================================== */
 

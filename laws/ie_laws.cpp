@@ -172,3 +172,50 @@ constexpr auto law_q8_byte(u32 q0, u32 q1, u32 q2, u32 q3, u32 j) -> bool {
 constexpr auto law_q8q8_block(Mem qw, u32 qb, Mem aw, u32 ab) -> bool {
   return ie_q8q8_block(qw, qb, aw, ab) == ie_q8q8_spec(32u, qw, qb, aw, ab, 0u);
 }
+
+// ---------------------------------------------------------------------
+// 6. The Q4_K path (MAT_Q4K)
+// ---------------------------------------------------------------------
+
+// LAW q4k_addr: every address of the MAT_Q4K layout and of the GGUF Q4_K
+// source is inside its array: nibble words < rows*nb*4, (scale, min) words
+// < rows*nb, the (d, dmin) pair < ie_q4k_qs_n, the source header bytes and
+// nibble bytes < rows*nb*18 (the file size of the tensor).
+constexpr auto law_q4k_addr(u32 rows, u32 nb, u32 r, u32 b, u32 w, u32 j) -> bool {
+  return !(ie_q4k_sizes_ok(rows, nb) && r < rows && b < nb && w < 4u && j < 32u) ||
+         (ie_q4_dst_word(r, b, w, nb) < rows * nb * 4u && ie_q4k_sm(r, b, nb) < rows * nb &&
+          ie_q4k_dd(rows, r, b, nb) + 1u < ie_q4k_qs_n(rows, nb) && ie_q4k_src_blk(r, b, nb) + 15u < rows * nb * 18u &&
+          ie_q4k_src_qbyte(r, b, j, nb) < rows * nb * 18u);
+}
+
+// LAW q4k_inverse: the word map of MAT_Q4K (ie_q4_dst_word) is one-to-one
+// for the Q4_K sizes.
+constexpr auto law_q4k_inverse(u32 rows, u32 nb, u32 r, u32 b, u32 w) -> bool {
+  return !(ie_q4k_sizes_ok(rows, nb) && r < rows && b < nb && w < 4u) ||
+         (ie_q4_word_row(ie_q4_dst_word(r, b, w, nb), nb) == r && ie_q4_word_blk(ie_q4_dst_word(r, b, w, nb), nb) == b &&
+          ie_q4_word_w(ie_q4_dst_word(r, b, w, nb)) == w);
+}
+
+// LAW q4k_onto: every nibble word i of MAT_Q4K is the image of one (r, b, w).
+constexpr auto law_q4k_onto(u32 rows, u32 nb, u32 i) -> bool {
+  return !(ie_q4k_sizes_ok(rows, nb) && 0u < nb && i < rows * nb * 4u) ||
+         (ie_q4_word_row(i, nb) < rows && ie_q4_word_blk(i, nb) < nb &&
+          ie_q4_dst_word(ie_q4_word_row(i, nb), ie_q4_word_blk(i, nb), ie_q4_word_w(i), nb) == i);
+}
+
+// LAW q4k_nibble: nibble j of a repacked word (its 4 bytes made by
+// ie_q4k_pack from the source bytes l0..l3 = j' and h0..h3 = j' + 16) is the
+// GGUF nibble of sub-block b in source byte j (j < 16: l_(j&3), else h_(j&3)).
+constexpr auto law_q4k_nibble(u32 l0, u32 l1, u32 l2, u32 l3, u32 h0, u32 h1, u32 h2, u32 h3, u32 b, u32 j) -> bool {
+  return !(j < 32u) ||
+         ie_q4_nib(ie_pack4(ie_q4k_pack(l0, h0, b), ie_q4k_pack(l1, h1, b), ie_q4k_pack(l2, h2, b), ie_q4k_pack(l3, h3, b)), j) ==
+             ie_q4k_src_nib(j < 16u ? ((j & 3u) == 0u ? l0 : (j & 3u) == 1u ? l1 : (j & 3u) == 2u ? l2 : l3)
+                                    : ((j & 3u) == 0u ? h0 : (j & 3u) == 1u ? h1 : (j & 3u) == 2u ? h2 : h3),
+                            b);
+}
+
+// LAW q4k_dot: the kernels' sub-block dot product is the spec: the sum over
+// j < 32 of nibble j * activation j (exact, mod 2^32; |sum| < 2^16).
+constexpr auto law_q4k_dot(Mem qw, u32 qb, Mem aw, u32 ab) -> bool {
+  return ie_q4k_dot(qw, qb, aw, ab) == ie_q4k_spec(32u, qw, qb, aw, ab, 0u);
+}

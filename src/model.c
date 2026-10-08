@@ -188,17 +188,18 @@ static void repack_q4k(mat *w, const uint8_t *src) {
   w->qs = ie_alloc((size_t)ie_q4k_qs_n(rows, nb) * 2);
   for (uint32_t r = 0; r < rows; r++)
     for (uint32_t sb = 0; sb < ns; sb++) {
-      const uint8_t *blk = src + ((size_t)r * ns + sb) * 144, *q = blk + 16;
-      memcpy(&w->qs[ie_q4k_dd(rows, r, sb, nb)], blk, 2);
-      memcpy(&w->qs[ie_q4k_dd(rows, r, sb, nb) + 1], blk + 2, 2);
+      const uint8_t *blk = src + ie_q4k_src_blk(r, sb * 8u, nb); /* the super-block header: d, dmin, scales */
+      memcpy(&w->qs[ie_q4k_dd(rows, r, sb * 8u, nb)], blk, 2);
+      memcpy(&w->qs[ie_q4k_dd(rows, r, sb * 8u, nb) + 1u], blk + 2, 2);
       for (uint32_t k = 0; k < 8; k++) {
         const uint32_t b = sb * 8 + k;
         uint8_t sc, mn;
         q4k_scale_min((int)k, blk + 4, &sc, &mn);
         w->qs[ie_q4k_sm(r, b, nb)] = (uint16_t)(sc | (mn << 8));
-        uint8_t nib[32], by[16];
-        for (int l = 0; l < 32; l++) nib[l] = (k & 1) ? q[32 * (k / 2) + l] >> 4 : q[32 * (k / 2) + l] & 15;
-        for (int j = 0; j < 16; j++) by[j] = (uint8_t)(nib[j] | (nib[j + 16] << 4));
+        /* byte j of the Q4_0-order block: source bytes j and j + 16 (law q4k_nibble, q4k_addr) */
+        uint32_t by[16];
+        for (uint32_t j = 0; j < 16; j++)
+          by[j] = ie_q4k_pack(src[ie_q4k_src_qbyte(r, b, j, nb)], src[ie_q4k_src_qbyte(r, b, j + 16u, nb)], b);
         for (uint32_t wd = 0; wd < 4; wd++) w->qw[ie_q4_dst_word(r, b, wd, nb)] = ie_pack4(by[4 * wd], by[4 * wd + 1], by[4 * wd + 2], by[4 * wd + 3]);
       }
     }
@@ -254,7 +255,7 @@ static void load_mat(mat *w, gguf_file *g, const char *name, uint32_t rows, uint
     repack_q8(w, q8);
     free(q8);
     *bytes += (uint64_t)rows * w->nb * 34;
-  } else if (t->type == GGML_Q4_K && !emb && cols % 256 == 0 && ie_q8_sizes_ok(rows, cols / 32)) {
+  } else if (t->type == GGML_Q4_K && !emb && cols % 256 == 0 && ie_q4k_sizes_ok(rows, cols / 32)) {
     w->kind = MAT_Q4K;
     w->nb = cols / 32;
     repack_q4k(w, t->data);
@@ -304,7 +305,7 @@ static int concat_mats(mat *dst, mat *const *src, int n) {
   const uint32_t cols = src[0]->cols, nb = src[0]->nb;
   if (kind == MAT_Q4 && !ie_sizes_ok(rows, nb)) return 0;
   if (kind == MAT_Q4K) { /* two sections in qs: concatenate each */
-    if (!ie_q8_sizes_ok(rows, nb)) return 0;
+    if (!ie_q4k_sizes_ok(rows, nb)) return 0;
     memset(dst, 0, sizeof *dst);
     dst->kind = kind, dst->rows = rows, dst->cols = src[0]->cols, dst->nb = nb;
     dst->qw = ie_alloc((size_t)rows * nb * 16);
