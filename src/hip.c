@@ -77,11 +77,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 /* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
  * linear layer are gpu_backend.ns: at least the tokens of a verify run */
@@ -121,6 +121,9 @@ typedef struct {
   uint32_t host_n;
   float *kc, *vc, *rcos, *rsin;
   float *ring, *st; /* qwen35 linear attention state (see cpu.c) */
+  /* the chunked linear attention of prompt chunks (ie_gdn_prep/wy/seq):
+   * scratch for T tokens, or NULL (graph T <= 16 or no linear layers) */
+  float *cq_qk, *cq_v, *cq_bg, *cq_u, *cq_w, *cq_m, *cq_g;
   void *tok0, *tok1; /* token_embd */
   dop *d;
   /* host -> device map of uploaded arrays */
@@ -269,6 +272,16 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
                sbytes = (size_t)m->n_rec * b->ns * m->n_vh * m->sd * m->sd * 4 + 4;
   HIP(H.Malloc((void **)&b->ring, rbytes));
   HIP(H.Malloc((void **)&b->st, sbytes));
+  if (m->n_rec && g->T > 16u && !(getenv("IE_GDN_CHUNK") && getenv("IE_GDN_CHUNK")[0] == '0')) {
+    const size_t T = g->T, nb = (T + 31u) / 32u, nv = m->n_vh;
+    HIP(H.Malloc((void **)&b->cq_qk, T * m->n_kh * 256u * 4u));
+    HIP(H.Malloc((void **)&b->cq_v, T * nv * 128u * 4u));
+    HIP(H.Malloc((void **)&b->cq_bg, T * nv * 2u * 4u));
+    HIP(H.Malloc((void **)&b->cq_u, T * nv * 128u * 4u));
+    HIP(H.Malloc((void **)&b->cq_w, T * nv * 128u * 4u));
+    HIP(H.Malloc((void **)&b->cq_m, nb * nv * 32u * 32u * 4u));
+    HIP(H.Malloc((void **)&b->cq_g, T * nv * 4u));
+  }
   const size_t rt = (size_t)g->n_ctx * (m->n_rot / 2) * 4;
   b->rcos = upload(b, g->rope_cos, rt);
   b->rsin = upload(b, g->rope_sin, rt);
@@ -508,8 +521,55 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           }
           break;
         }
-        void *args[] = {&A, &B, &ring, &st, &cw, &dtb, &sa, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &slot, &wfrom, &rw, &ns};
-        launch(b, K_GDN, nv * 4u, args); /* prompt chunks: 4 workgroups per value head (GD_SPLIT) */
+        static int cmin = -1;
+        if (cmin < 0) cmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
+        if (b->cq_qk && wfrom == T - 1u && (int)T >= cmin && m->sd == 128u) {
+          /* the chunked form: only the state after the last token is kept */
+          static int gchk = -1;
+          if (gchk < 0) gchk = getenv("IE_GDN_CHECK") != NULL;
+          float *ref = NULL, *sref = NULL;
+          const size_t ob = (size_t)T * os * 4u, sb = (size_t)nv * 16384u * 4u;
+          float *sw = st + (size_t)((slot + T - 1u) % ns) * nv * 16384u;
+          /* debug: the sequential kernel first, its output and state kept (not
+           * when the state after the chunk goes to the slot it is read from) */
+          if (gchk && (slot + T - 1u) % ns == slot) gchk = 2;
+          else if (gchk == 2) gchk = 1;
+          if (gchk == 1) {
+            void *args[] = {&A, &B, &ring, &st, &cw, &dtb, &sa, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &slot, &wfrom, &rw, &ns};
+            launch(b, K_GDN, nv * 4u, args);
+            ref = malloc(ob), sref = malloc(sb);
+            HIP(H.Memcpy(ref, B, ob, hipMemcpyDeviceToHost));
+            HIP(H.Memcpy(sref, sw, sb, hipMemcpyDeviceToHost));
+          }
+          void *p1[] = {&A, &ring, &cw, &dtb, &sa, &pos, &cd, &nk, &nv, &eps, &is, &b->cq_qk, &b->cq_v, &b->cq_bg};
+          launch_t(b, K_GDN_PREP, 1, T, p1);
+          void *p2[] = {&b->cq_qk, &b->cq_v, &b->cq_bg, &b->cq_u, &b->cq_w, &b->cq_m, &b->cq_g, &T, &nk, &nv};
+          launch(b, K_GDN_WY, nv * ((T + 31u) / 32u), p2);
+          void *p3[] = {&b->cq_qk, &b->cq_u, &b->cq_w, &b->cq_m, &b->cq_g, &B, &os, &st, &slot, &ns, &pos, &T, &nk, &nv};
+          launch(b, K_GDN_SEQ, nv * 4u, p3); /* 4 workgroups per value head (GD_SPLIT) */
+          if (gchk == 1) {
+            float *x = malloc(ob), *y = malloc(sb);
+            HIP(H.Memcpy(x, B, ob, hipMemcpyDeviceToHost));
+            HIP(H.Memcpy(y, sw, sb, hipMemcpyDeviceToHost));
+            double eo = 0, mo = 0, es = 0, ms = 0;
+            for (u32 t = 0; t < T; t++)
+              for (u32 k = 0; k < nv * 128u; k++) {
+                const double a = ref[(size_t)t * os + k], d = fabs(a - x[(size_t)t * os + k]);
+                if (d > eo) eo = d;
+                if (fabs(a) > mo) mo = fabs(a);
+              }
+            for (size_t k = 0; k < sb / 4u; k++) {
+              const double d = fabs(sref[k] - y[k]);
+              if (d > es) es = d;
+              if (fabs(sref[k]) > ms) ms = fabs(sref[k]);
+            }
+            fprintf(stderr, "gdn check layer %u T %u pos %u: out %.3g / %.3g, state %.3g / %.3g\n", o->layer, T, pos, eo, mo, es, ms);
+            free(x), free(y), free(ref), free(sref);
+          }
+        } else {
+          void *args[] = {&A, &B, &ring, &st, &cw, &dtb, &sa, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &slot, &wfrom, &rw, &ns};
+          launch(b, K_GDN, nv * 4u, args); /* prompt chunks: 4 workgroups per value head (GD_SPLIT) */
+        }
         if (!rw) {
           void *a2[] = {&A, &ring, &pos, &T, &cd, &is};
           launch(b, K_RING_STORE, (3u * cd + 255u) / 256u, a2);

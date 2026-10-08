@@ -40,6 +40,15 @@ static inline void barrier(void) {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
 }
 
+/* Workgroup barrier for LDS only: global loads still in flight stay in
+ * flight (barrier() waits for them and invalidates the L0 cache). For
+ * kernels whose threads do not exchange data through global memory. */
+static inline void lbarrier(void) {
+  __asm__ volatile("s_wait_dscnt 0x0" ::: "memory");
+  __builtin_amdgcn_s_barrier();
+  __asm__ volatile("" ::: "memory");
+}
+
 /* Value of lane (this lane + off) of the wave: ds_bpermute (byte address). */
 static inline float shfl_xor_f(float v, u32 m) {
   return __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((int)((lane() ^ m) * 4u), __builtin_bit_cast(int, v)));
@@ -1138,6 +1147,298 @@ KERNEL ie_gnorm(G float *out, const G float *in, const G float *nw, G u8 *oq, u3
     out[h * 128u + jj] = y;
     if (oq) quant_wave(y, (h * 128u + 32u * q) >> 5, oq, (nv * 128u) >> 5);
   }
+}
+
+/* ---- Linear attention of a prompt chunk, the chunked (parallel) form ----
+ * For a block of GC tokens with start state S0 (S[i][j], i key, j value),
+ * gamma_t = the product of the decays g of tokens 1 .. t of the block:
+ *   delta_t = beta_t (v_t - gamma_t S0^T k_t - sum_{s<t} (gamma_t/gamma_s) (k_t.k_s) delta_s)
+ * so Delta = U - W S0 with U = Tm diag(beta) V, W = Tm diag(beta gamma) K,
+ * Tm = (I + L)^-1, L[t][s] = beta_t (gamma_t/gamma_s) k_t.k_s (s < t): U and
+ * W do not depend on S0. Then
+ *   O = diag(gamma) Q S0 + M Delta,  M[t][s] = (gamma_t/gamma_s) q_t.k_s (s <= t)
+ *   S_new = gamma_n S0 + K^T diag(gamma_n / gamma) Delta.
+ * (tools/gdn_chunk.py checks the identity against the token recurrence.)
+ * Scratch (global, per run): qk[t][nk][256] (q (times 1/sqrt(128)) | k, L2
+ * normed), vv[t][nv][128], bg[t][nv][2] (beta, log g), U, W [t][nv][128],
+ * Mb[block][nv][GC][GC], Gc[t][nv] (cumulative log g in the block). */
+#define GC 32u
+typedef float f4 __attribute__((ext_vector_type(4)));
+/* 1: conv + SiLU of all channels, L2 norms, beta and log g; workgroup y = token y */
+KERNEL ie_gdn_prep(const G float *in, const G float *ring, const G float *cw, const G float *dtb, const G float *sa,
+                   u32 pos, u32 cd, u32 nk, u32 nv, float eps, u32 is, G float *qk, G float *vv, G float *bg) {
+  const u32 t = tokid(), inner = nv * 128u, nq = nk * 128u;
+  const G float *it = in + t * is;
+  for (u32 c = tid(); c < cd; c += NT) {
+    float acc = 0.0f;
+    for (u32 j = 0; j < 4u; j++) acc += conv_in(in, is, ring, c, t, 3u - j, pos, cd) * cw[c * 4u + j];
+    const float y = acc / (1.0f + __builtin_expf(-acc));
+    if (c < 2u * nq) {
+      const u32 isk = c >= nq, cc = isk ? c - nq : c;
+      qk[((unsigned long)t * nk + cc / 128u) * 256u + isk * 128u + cc % 128u] = y;
+    } else {
+      vv[(unsigned long)t * inner + (c - 2u * nq)] = y;
+    }
+  }
+  for (u32 h = tid(); h < nv; h += NT) {
+    const float al = it[cd + inner + nv + h] + dtb[h];
+    const float sp = al > 20.0f ? al : __builtin_logf(1.0f + __builtin_expf(al));
+    bg[((unsigned long)t * nv + h) * 2u] = 1.0f / (1.0f + __builtin_expf(-it[cd + inner + h]));
+    bg[((unsigned long)t * nv + h) * 2u + 1u] = sp * sa[h];
+  }
+  barrier(); /* the conv outputs of this workgroup are visible to it */
+  const u32 w = tid() >> 5, l = lane();
+  for (u32 hh = w; hh < 2u * nk; hh += 8u) { /* q of key head hh / 2 (even) or its k (odd) */
+    G float *x = qk + ((unsigned long)t * nk + hh / 2u) * 256u + (hh & 1u) * 128u;
+    float v4[4], ss = 0.0f;
+    for (u32 q = 0; q < 4u; q++) v4[q] = x[l + 32u * q], ss += v4[q] * v4[q];
+    ss = wave_sum_all(ss);
+    const float r = (1.0f / __builtin_sqrtf(ss + eps)) * ((hh & 1u) ? 1.0f : 1.0f / __builtin_sqrtf(128.0f));
+    for (u32 q = 0; q < 4u; q++) x[l + 32u * q] = v4[q] * r;
+  }
+}
+
+/* 2: U, W and M of block b for value head h (workgroup h + nv b) */
+static LDS float wy_k[GC][132] __attribute__((aligned(16))), wy_q[GC][132] __attribute__((aligned(16))), wy_L[GC][GC] __attribute__((aligned(16))), wy_G[GC], wy_b[GC], wy_lg[GC];
+/* rows of 132: 16-byte reads of 8 lanes (8 rows) fall on different banks */
+KERNEL ie_gdn_wy(const G float *qk, const G float *vv, const G float *bg, G float *U, G float *W, G float *Mb, G float *Gc,
+                 u32 T, u32 nk, u32 nv) {
+  const u32 h = wgid() % nv, b = wgid() / nv, t0 = b * GC, n = T - t0 < GC ? T - t0 : GC, kh = h % nk, th = tid();
+  {
+    f4 q4[4], k4[4];
+#pragma unroll
+    for (u32 k = 0; k < 4u; k++) { /* float4 e: row e / 32, dims 4 (e % 32) .. + 3 */
+      const u32 e = th + NT * k, r = e >> 5;
+      const G float *src = qk + ((unsigned long)(t0 + r) * nk + kh) * 256u + 4u * (e & 31u);
+      q4[k] = r < n ? *(const G f4 *)src : (f4){0.0f, 0.0f, 0.0f, 0.0f};
+      k4[k] = r < n ? *(const G f4 *)(src + 128u) : (f4){0.0f, 0.0f, 0.0f, 0.0f};
+    }
+#pragma unroll
+    for (u32 k = 0; k < 4u; k++) {
+      const u32 e = th + NT * k;
+      *(LDSP f4 *)&wy_q[e >> 5][4u * (e & 31u)] = q4[k];
+      *(LDSP f4 *)&wy_k[e >> 5][4u * (e & 31u)] = k4[k];
+    }
+  }
+  if (th < GC) {
+    wy_b[th] = th < n ? bg[((unsigned long)(t0 + th) * nv + h) * 2u] : 0.0f;
+    wy_lg[th] = th < n ? bg[((unsigned long)(t0 + th) * nv + h) * 2u + 1u] : 0.0f;
+  }
+  lbarrier();
+  if (th < GC) { /* cumulative log decay in the block */
+    float G0 = 0.0f;
+    for (u32 r = 0; r <= th; r++) G0 += wy_lg[r];
+    wy_G[th] = G0;
+    if (th < n) Gc[(unsigned long)(t0 + th) * nv + h] = G0;
+  }
+  lbarrier();
+  /* L (strictly lower) and M (lower with the diagonal): thread e does pairs e, e + 256, .. */
+  for (u32 e = th; e < GC * GC; e += NT) {
+    const u32 r = e / GC, c = e % GC;
+    float kk = 0.0f, qq = 0.0f;
+    if (r < n && c <= r) {
+      float kk2 = 0.0f, qq2 = 0.0f;
+#pragma unroll 4
+      for (u32 i = 0; i < 128u; i += 8u) {
+        const f4 a0 = *(const LDSP f4 *)&wy_k[r][i], a1 = *(const LDSP f4 *)&wy_k[r][i + 4u];
+        const f4 q0 = *(const LDSP f4 *)&wy_q[r][i], q1 = *(const LDSP f4 *)&wy_q[r][i + 4u];
+        const f4 c0 = *(const LDSP f4 *)&wy_k[c][i], c1 = *(const LDSP f4 *)&wy_k[c][i + 4u];
+        kk += a0.x * c0.x + a0.y * c0.y + a0.z * c0.z + a0.w * c0.w;
+        kk2 += a1.x * c1.x + a1.y * c1.y + a1.z * c1.z + a1.w * c1.w;
+        qq += q0.x * c0.x + q0.y * c0.y + q0.z * c0.z + q0.w * c0.w;
+        qq2 += q1.x * c1.x + q1.y * c1.y + q1.z * c1.z + q1.w * c1.w;
+      }
+      kk += kk2, qq += qq2;
+    }
+    const float dec = r < n && c <= r ? __builtin_expf(wy_G[r] - wy_G[c]) : 0.0f;
+    wy_L[r][c] = c < r ? wy_b[r] * dec * kk : 0.0f;
+    Mb[(((unsigned long)b * nv + h) * GC + r) * GC + c] = dec * qq;
+  }
+  lbarrier();
+  /* forward substitution, one column per thread: column th of [beta V | beta gamma K] */
+  float x[GC];
+  const int isw = th >= 128u;
+  const u32 j = th & 127u;
+#pragma unroll
+  for (u32 r = 0; r < GC; r++) {
+    x[r] = 0.0f;
+    if (r < n) { /* uniform */
+      float acc = isw ? wy_b[r] * __builtin_expf(wy_G[r]) * wy_k[r][j] : wy_b[r] * vv[((unsigned long)(t0 + r) * nv + h) * 128u + j];
+#pragma unroll
+      for (u32 c = 0; c < r; c++) acc -= wy_L[r][c] * x[c];
+      x[r] = acc;
+      (isw ? W : U)[((unsigned long)(t0 + r) * nv + h) * 128u + j] = acc;
+    }
+  }
+}
+
+/* 3: the blocks in order, for value head h and its value columns 32 cq ..
+ * 32 cq + 31 (workgroup 4 h + cq): the columns of the state do not depend on
+ * each other, so 4 workgroups share a head. Wave w owns the 4 columns
+ * 32 cq + 4 w + a (a < 4); lane l holds the state of the key dims 4 l + k
+ * (k < 4): st[4 k + a] = S[4 l + k][32 cq + 4 w + a]. A product X S0 (X:
+ * 32 rows of 128) is then a sum over the 32 lanes, done as a reduce-scatter
+ * with DPP: no exchange between waves, and the LDS reads of X rows are
+ * 16 bytes per lane, consecutive (no broadcast). Writes the output o (before
+ * the gated norm) of every token and the state after the last token to
+ * slot (c + T - 1) % ns. */
+static LDS float sq_w[GC][128] __attribute__((aligned(16))), sq_q[GC][128] __attribute__((aligned(16))),
+    sq_k[GC][128] __attribute__((aligned(16))), sq_d[8][GC][4] __attribute__((aligned(16))), sq_m[GC][GC + 1u], sq_G[GC];
+static inline int xor_i(int v, u32 m) { /* the value of lane (this lane ^ m) */
+  switch (m) { /* DPP row_xmask:m = 0x160 + m */
+    case 16: return xrow_i(v);
+    case 8: return __builtin_amdgcn_update_dpp(0, v, 0x168, 0xF, 0xF, true);
+    case 4: return __builtin_amdgcn_update_dpp(0, v, 0x164, 0xF, 0xF, true);
+    case 2: return __builtin_amdgcn_update_dpp(0, v, 0x162, 0xF, 0xF, true);
+    default: return __builtin_amdgcn_update_dpp(0, v, 0x161, 0xF, 0xF, true);
+  }
+}
+/* p[a] = sum over the 128 key dims of x[r][i] S[i][col a] for the row r =
+ * rho(l) = 16 (l & 1) + (l >> 1) of this lane (a permutation of the rows):
+ * per lane, partial sums over its 4 key dims, for 16 rows at a time (fewer
+ * registers); 4 halving steps (step m: the lanes with bit m keep the upper
+ * half of the rows and send the lower half to lane ^ m) leave row l >> 1 in
+ * the lanes l and l ^ 1, which then add their values. */
+static inline void sq_prod(const LDSP float (*x)[128], const float *st, u32 l, float *p) {
+#pragma unroll
+  for (u32 hf = 0; hf < 2u; hf++) {
+    float acc[64];
+#pragma unroll
+    for (u32 r = 0; r < 16u; r++) {
+      const f4 v = *(const LDSP f4 *)&x[16u * hf + r][4u * l];
+#pragma unroll
+      for (u32 a = 0; a < 4u; a++) acc[4u * r + a] = v.x * st[a] + v.y * st[4u + a] + v.z * st[8u + a] + v.w * st[12u + a];
+    }
+#pragma unroll
+    for (u32 m = 16u, R = 16u; m >= 2u; m >>= 1, R >>= 1) {
+      const int up = (l & m) != 0u;
+#pragma unroll
+      for (u32 r = 0; r < R / 2u; r++)
+#pragma unroll
+        for (u32 a = 0; a < 4u; a++) {
+          const float lo = acc[4u * r + a], hi = acc[4u * (r + R / 2u) + a];
+          acc[4u * r + a] = (up ? hi : lo) + I2F(xor_i(F2I(up ? lo : hi), m));
+        }
+    }
+#pragma unroll
+    for (u32 a = 0; a < 4u; a++) {
+      const float v = acc[a] + I2F(xor_i(F2I(acc[a]), 1u));
+      if ((l & 1u) == hf) p[a] = v;
+    }
+  }
+}
+/* 32 rows of 128 floats (rows r < n; row r at src + r * rs) into registers:
+ * thread th holds the float4 number th + NT k (row (th + NT k) / 32) */
+static inline void sq_ld(f4 *x, const G float *src, unsigned long rs, u32 n, u32 th) {
+#pragma unroll
+  for (u32 k = 0; k < 4u; k++) {
+    const u32 e = th + NT * k, r = e >> 5;
+    x[k] = r < n ? *(const G f4 *)(src + r * rs + 4u * (e & 31u)) : (f4){0.0f, 0.0f, 0.0f, 0.0f};
+  }
+}
+static inline void sq_st(LDSP float (*dst)[128], const f4 *x, u32 th) {
+#pragma unroll
+  for (u32 k = 0; k < 4u; k++) {
+    const u32 e = th + NT * k;
+    *(LDSP f4 *)&dst[e >> 5][4u * (e & 31u)] = x[k];
+  }
+}
+KERNEL ie_gdn_seq(const G float *qk, const G float *U, const G float *W, const G float *Mb, const G float *Gc, G float *out,
+                  u32 os, G float *S, u32 c, u32 ns, u32 pos, u32 T, u32 nk, u32 nv) {
+  const u32 h = wgid() / GD_SPLIT, cq = wgid() % GD_SPLIT, kh = h % nk, th = tid(), w = th >> 5, l = lane();
+  const u32 col = 32u * cq + 4u * w, rl = 16u * (l & 1u) + (l >> 1); /* this wave's first column; this lane's row (sq_prod) */
+  const unsigned long slot = (unsigned long)nv * 16384u, own = (unsigned long)h * 16384u + (4u * l) * 128u + col;
+  const unsigned long wrs = (unsigned long)nv * 128u, qrs = (unsigned long)nk * 256u;
+  float st[16];
+#pragma unroll
+  for (u32 k = 0; k < 4u; k++)
+#pragma unroll
+    for (u32 a = 0; a < 4u; a++) st[4u * k + a] = pos ? S[c * slot + own + k * 128u + a] : 0.0f;
+  /* the next block's inputs are loaded into registers one block ahead */
+  f4 rw[4], rq[4], rk[4];
+  float ru[4], rm[4], rg;
+  {
+    const u32 n = T < GC ? T : GC;
+    sq_ld(rw, W + (unsigned long)h * 128u, wrs, n, th);
+    sq_ld(rq, qk + (unsigned long)kh * 256u, qrs, n, th);
+    sq_ld(rk, qk + (unsigned long)kh * 256u + 128u, qrs, n, th);
+#pragma unroll
+    for (u32 a = 0; a < 4u; a++) ru[a] = rl < n ? U[(unsigned long)rl * wrs + h * 128u + col + a] : 0.0f;
+#pragma unroll
+    for (u32 k = 0; k < 4u; k++) rm[k] = Mb[(unsigned long)h * GC * GC + th + NT * k];
+    rg = th < n ? Gc[(unsigned long)th * nv + h] : 0.0f;
+  }
+  for (u32 b = 0, t0 = 0; t0 < T; b++, t0 += GC) {
+    const u32 n = T - t0 < GC ? T - t0 : GC, t1 = t0 + GC, n1 = t1 < T ? (T - t1 < GC ? T - t1 : GC) : 0u;
+    sq_st(sq_w, rw, th);
+    sq_st(sq_q, rq, th);
+    sq_st(sq_k, rk, th);
+#pragma unroll
+    for (u32 k = 0; k < 4u; k++) {
+      const u32 e = th + NT * k;
+      sq_m[e >> 5][e & 31u] = rm[k];
+    }
+    if (th < GC) sq_G[th] = rg;
+    float u[4];
+#pragma unroll
+    for (u32 a = 0; a < 4u; a++) u[a] = ru[a];
+    lbarrier();
+    if (n1) { /* uniform: prefetch the next block */
+      sq_ld(rw, W + (unsigned long)t1 * wrs + h * 128u, wrs, n1, th);
+      sq_ld(rq, qk + (unsigned long)t1 * qrs + kh * 256u, qrs, n1, th);
+      sq_ld(rk, qk + (unsigned long)t1 * qrs + kh * 256u + 128u, qrs, n1, th);
+#pragma unroll
+      for (u32 a = 0; a < 4u; a++) ru[a] = rl < n1 ? U[(unsigned long)(t1 + rl) * wrs + h * 128u + col + a] : 0.0f;
+#pragma unroll
+      for (u32 k = 0; k < 4u; k++) rm[k] = Mb[(((unsigned long)(b + 1u) * nv + h) * GC) * GC + th + NT * k];
+      rg = th < n1 ? Gc[(unsigned long)(t1 + th) * nv + h] : 0.0f;
+    }
+    /* Delta = U - W S0, row rl of the block (0 for rows >= n) */
+    float p[4], d[4];
+    sq_prod(sq_w, st, l, p);
+#pragma unroll
+    for (u32 a = 0; a < 4u; a++) d[a] = rl < n ? u[a] - p[a] : 0.0f;
+    *(LDSP f4 *)&sq_d[w][rl][0] = (f4){d[0], d[1], d[2], d[3]}; /* this wave's rows of Delta */
+    /* O = diag(gamma) Q S0 + M Delta (M is 0 above the diagonal) */
+    sq_prod(sq_q, st, l, p);
+    const float gl = sq_G[rl];
+    float o[4];
+#pragma unroll
+    for (u32 a = 0; a < 4u; a++) o[a] = __builtin_expf(gl) * p[a];
+#pragma unroll 8
+    for (u32 s2 = 0; s2 < GC; s2++) {
+      const float mm = sq_m[rl][s2];
+      const f4 dv = *(const LDSP f4 *)&sq_d[w][s2][0];
+      o[0] += mm * dv.x, o[1] += mm * dv.y, o[2] += mm * dv.z, o[3] += mm * dv.w;
+    }
+    if (rl < n) {
+      G float *op = out + (t0 + rl) * os + h * 128u + col;
+#pragma unroll
+      for (u32 a = 0; a < 4u; a++) op[a] = o[a];
+    }
+    /* S_new = gamma_n S0 + K^T diag(gamma_n / gamma) Delta */
+    const float Gn = sq_G[n - 1u], eg = __builtin_expf(Gn), sc = __builtin_expf(Gn - gl);
+    /* the reads of sq_d above are done (one wave: LDS operations in order) */
+    *(LDSP f4 *)&sq_d[w][rl][0] = (f4){d[0] * sc, d[1] * sc, d[2] * sc, d[3] * sc};
+#pragma unroll
+    for (u32 i = 0; i < 16u; i++) st[i] *= eg;
+#pragma unroll 4
+    for (u32 r = 0; r < GC; r++) {
+      const f4 kv = *(const LDSP f4 *)&sq_k[r][4u * l];
+      const f4 dv = *(const LDSP f4 *)&sq_d[w][r][0];
+      const float kk[4] = {kv.x, kv.y, kv.z, kv.w}, dd[4] = {dv.x, dv.y, dv.z, dv.w};
+#pragma unroll
+      for (u32 k = 0; k < 4u; k++)
+#pragma unroll
+        for (u32 a = 0; a < 4u; a++) st[4u * k + a] += kk[k] * dd[a];
+    }
+    lbarrier(); /* the LDS of this block is read before the next block writes it */
+  }
+  G float *Sw = S + ((c + T - 1u) % ns) * slot + own;
+#pragma unroll
+  for (u32 k = 0; k < 4u; k++)
+#pragma unroll
+    for (u32 a = 0; a < 4u; a++) Sw[k * 128u + a] = st[4u * k + a];
 }
 
 /* The conv inputs of the last 3 of T tokens (positions pos + T - 3 ..) into
