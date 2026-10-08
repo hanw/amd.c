@@ -201,6 +201,10 @@ typedef struct {
    * input of the next position); mtp_h: the MTP h input (the host copies
    * rows into it); mtp_g: the MTP normed output (the h of the next draft). */
   uint32_t n_main;
+  /* first op of the output head (output matrix, argmax) of the model and of
+   * the MTP head: a prompt chunk runs the model head for its last token
+   * only, and the MTP head not at all */
+  uint32_t i_head, i_mtp_head;
   int h_out, mtp_h, mtp_g, mtp_logits, mtp_argmax;
   float *rope_cos, *rope_sin; /* [n_ctx][n_rot/2] */
   uint64_t weight_bytes_per_token;

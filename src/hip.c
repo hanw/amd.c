@@ -77,11 +77,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 enum { GDN_RING = 32, GDN_SLOTS = 4 }; /* as in ie_kernels.c */
 /* The argmax kernel: workgroups, and its device scratch (partial results and
@@ -358,7 +358,8 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
       case OP_RMSNORM: {
         u32 xs = g->bufs[o->a].stride, ys = g->bufs[o->b].stride, qs = o->qo >= 0 ? g->bufs[o->qo].stride : 0u;
         void *args[] = {&A, &w0, &B, &n, &eps, &Q, &xs, &ys, &qs};
-        launch_t(b, K_RMSNORM, (n + 255u) / 256u, T, args); /* one block of 32 per wave */
+        if (T >= 8u) launch_t(b, K_RMSNORM_T, 1u, T, args); /* many tokens: one workgroup per token */
+        else launch_t(b, K_RMSNORM, (n + 255u) / 256u, T, args); /* one block of 32 per wave */
         break;
       }
       case OP_QUANT: {
@@ -529,7 +530,8 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           u32 qst = g->bufs[o->a].stride, ost = g->bufs[o->b].stride, oqst = o->qo >= 0 ? g->bufs[o->qo].stride : 0u;
           u32 gst = o->gt >= 0 ? g->bufs[o->gt].stride : 0u;
           void *args[] = {&A, &kc, &vc, &B, &pos, (void *)&hd, (void *)&nhd, (void *)&nkv, &Q, &GT, &gs, &qst, &ost, &oqst, &gst};
-          launch_t(b, K_ATTN_PF, nhd, T, args);
+          if (nhd / nkv <= 8u) launch_t(b, K_ATTN_PFG, nkv, T, args); /* K/V read once per group of query heads */
+          else launch_t(b, K_ATTN_PF, nhd, T, args);
           break;
         }
         if (b->attn_split) {
@@ -571,6 +573,9 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
 /* Run the ops [i0, i1) for T tokens toks at positions pos .. pos + T - 1. */
 static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u32 T, u32 pos, u32 wfrom) {
   const u32 slot = b->slot;
+  /* a prompt chunk (wfrom > 0, more than one token): the model head only for
+   * the last token, the MTP head not at all (its drafts are not needed) */
+  const int chunk = wfrom > 0 && !b->base.all_logits;
   const graph *g = b->g;
   for (u32 t = 0; t < T; t++) {
     if (toks[t] >= b->m->vocab) ie_die("token %u >= vocab %u", toks[t], b->m->vocab);
@@ -579,6 +584,11 @@ static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u
   if (T > g->T) ie_die("%u tokens in one run; the graph has room for %u", T, g->T);
   for (uint32_t i = i0; i < i1; i++) {
     const int k = g->ops[i].kind;
+    if (chunk && i >= g->i_head && i < g->n_main) { /* last token only (its row T - 1) */
+      launch_op(b, i, T - 1, toks[T - 1], pos + T - 1, 1, slot, wfrom);
+      continue;
+    }
+    if (chunk && g->mtp_logits >= 0 && i >= g->i_mtp_head) continue;
     static int nobatch = -1;
     if (nobatch < 0) nobatch = getenv("IE_GEMV_NOBATCH") != NULL; /* debug: one GEMV launch per token */
     /* one launch for all tokens: GDN (sequential inside), Q8 GEMV (weights

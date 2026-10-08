@@ -26,6 +26,9 @@ struct backend {
   /* Copy n token rows of buffer src (from row r0) to buffer dst (from row
    * d0); src < 0: write zeros. */
   void (*copy_rows)(backend *b, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n);
+  /* 1: prompt chunks compute the logits of every token (perplexity); 0
+   * (default): only of the last token */
+  int all_logits;
 };
 
 /* CPU: the same algorithm and the same work split as the GPU kernels. */

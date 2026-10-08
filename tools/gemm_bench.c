@@ -43,7 +43,8 @@ int main(int argc, char **argv) {
     unsigned xsu = (unsigned)xs, ys = rows, rs = 0;
     void *nul = NULL;
     void *args[] = {&qw, &qs, &xq, &y, &rows, &nb, &nul, &nul, &T, &xsu, &ys, &rs};
-    unsigned g = ((rows + 127) / 128) * ((T + 63) / 64);
+    unsigned GR = getenv("GM_R") ? (unsigned)atoi(getenv("GM_R")) : 128, GT = getenv("GM_T") ? (unsigned)atoi(getenv("GM_T")) : 64;
+    unsigned g = ((rows + GR - 1) / GR) * ((T + GT - 1) / GT);
     const int it = 20;
     for (int i = -3; i < it; i++) {
       if (i == 0) EvR(e0, NULL);

@@ -469,90 +469,142 @@ typedef int v8i __attribute__((ext_vector_type(8)));
 #ifndef GM_KB
 #define GM_KB 4u /* blocks of 32 per K chunk */
 #endif
+/* Workgroup tile GM_R rows x GM_T tokens; each wave GM_WI x GM_WJ WMMA tiles
+ * (16 x 16 each); the 8 waves form a (GM_R / 16 GM_WI) x (GM_T / 16 GM_WJ)
+ * grid. src/hip.c uses the same GM_R and GM_T for the launch grid. */
+#ifndef GM_R
 #define GM_R 128u
+#endif
+#ifndef GM_T
 #define GM_T 64u
+#endif
+#ifndef GM_WI
+#define GM_WI 2u
+#endif
+#ifndef GM_WJ
+#define GM_WJ 2u
+#endif
+#define GM_WROWS (GM_R / (16u * GM_WI)) /* waves along the rows */
 #define GM_LS (GM_KB * 32u + 16u) /* LDS row stride, bytes (padded: fewer bank conflicts, 16-byte aligned) */
-static LDS u8 gm_w[GM_R * GM_LS];
-static LDS u8 gm_x[GM_T * GM_LS];
-static LDS float gm_sw[GM_KB * GM_R], gm_sx[GM_T * GM_KB]; /* gm_sw[k][row]: 8 rows in 2 16-byte reads */
+#ifndef GM_NBUF
+#define GM_NBUF 1u /* LDS stages: 2 = double buffer (one barrier per K chunk; measured slower: half the workgroups per CU) */
+#endif
+static LDS u8 gm_w[GM_NBUF][GM_R * GM_LS];
+static LDS u8 gm_x[GM_NBUF][GM_T * GM_LS];
+static LDS float gm_sw[GM_NBUF][GM_KB * GM_R], gm_sx[GM_NBUF][GM_T * GM_KB]; /* gm_sw[k][row]: 8 rows in 2 16-byte reads */
 typedef float f8 __attribute__((ext_vector_type(8)));
+#define GM_NSX ((GM_T * GM_KB + NT - 1u) / NT)
 KERNEL ie_gemm_q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G float *bias,
                   const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
   const u32 ntt = (T + GM_T - 1u) / GM_T, tt = wgid() % ntt, rt = wgid() / ntt, t0 = tid(), w = t0 >> 5, l = lane();
   const u32 rbase = rt * GM_R, tbase = tt * GM_T, h = l >> 4;
-  const u32 wr = 32u * (w & 3u), wt = 32u * (w >> 2); /* this wave's rows and tokens in the tile */
-  f8 acc[2][2];
-  for (u32 i = 0; i < 2u; i++)
-    for (u32 j = 0; j < 2u; j++) acc[i][j] = (f8)(0.0f);
-  const v8i z = {0, 0, 0, 0, 0, 0, 0, 0};
+  const u32 wr = 16u * GM_WI * (w % GM_WROWS), wt = 16u * GM_WJ * (w / GM_WROWS); /* this wave's rows and tokens */
+  f8 acc[GM_WI][GM_WJ];
+#pragma unroll
+  for (u32 i = 0; i < GM_WI; i++)
+#pragma unroll
+    for (u32 j = 0; j < GM_WJ; j++) acc[i][j] = (f8)(0.0f);
   /* Software pipeline: the global loads of K chunk n + 1 go out (into
-   * registers) before the WMMA of chunk n, so their latency overlaps the
-   * math. Thread t0 always copies the same pieces: weight pieces t0 + 256 i
-   * (row p / 8, piece p % 8), activation pieces t0 + 256 i (token p / 8),
-   * weight scales t0 + 256 i ([k][row]), activation scales t0 ([token][k]). */
+   * registers) before the WMMA of chunk n, and (GM_NBUF = 2) are stored into
+   * the other LDS buffer after it: one barrier per chunk. Thread t0 copies
+   * the pieces t0 + 256 i. */
   u32x4 rw[GM_R * 8u / NT], rx[GM_T * 8u / NT];
-  float rsw[GM_R * GM_KB / NT], rsx = 0.0f;
+  float rsw[GM_R * GM_KB / NT], rsx[GM_NSX];
 #define GM_FETCH(kb0_)                                                                                          \
   do {                                                                                                          \
     const u32 kbf = (kb0_), nkf = nb - kbf < GM_KB ? nb - kbf : GM_KB;                                          \
-    for (u32 i = 0; i < GM_R * 8u / NT; i++) {                                                                  \
+    _Pragma("unroll") for (u32 i = 0; i < GM_R * 8u / NT; i++) {                                                \
       const u32 p = t0 + NT * i, r = p >> 3, pc = p & 7u, gr = rbase + r < rows ? rbase + r : rows - 1u;        \
       if (pc < 2u * nkf) rw[i] = *(const G u32x4 *)(qw + ie_q8_dst_word(gr, kbf, 0u, nb) + pc * 4u);            \
     }                                                                                                           \
-    for (u32 i = 0; i < GM_T * 8u / NT; i++) {                                                                  \
+    _Pragma("unroll") for (u32 i = 0; i < GM_T * 8u / NT; i++) {                                                \
       const u32 p = t0 + NT * i, tk = p >> 3, pc = p & 7u, gt = tbase + tk < T ? tbase + tk : T - 1u;           \
       if (pc < 2u * nkf) rx[i] = *(const G u32x4 *)(xq + (unsigned long)gt * xs + kbf * 32u + pc * 16u);       \
     }                                                                                                           \
-    for (u32 i = 0; i < GM_R * GM_KB / NT; i++) {                                                               \
+    _Pragma("unroll") for (u32 i = 0; i < GM_R * GM_KB / NT; i++) {                                             \
       const u32 p = t0 + NT * i, k = p / GM_R, r = p % GM_R, gr = rbase + r < rows ? rbase + r : rows - 1u;     \
       if (k < nkf) rsw[i] = (float)qs[ie_q8_dst_scale(gr, kbf + k, nb)];                                       \
     }                                                                                                           \
-    if (t0 < GM_T * GM_KB) {                                                                                    \
-      const u32 tk = t0 / GM_KB, k = t0 % GM_KB, gt = tbase + tk < T ? tbase + tk : T - 1u;                     \
-      if (k < nkf) rsx = ((const G float *)(xq + (unsigned long)gt * xs + 32u * nb))[kbf + k];                  \
+    _Pragma("unroll") for (u32 i = 0; i < GM_NSX; i++) {                                                        \
+      const u32 p = t0 + NT * i, tk = p / GM_KB, k = p % GM_KB, gt = tbase + tk < T ? tbase + tk : T - 1u;      \
+      if (p < GM_T * GM_KB && k < nkf) rsx[i] = ((const G float *)(xq + (unsigned long)gt * xs + 32u * nb))[kbf + k]; \
     }                                                                                                           \
   } while (0)
+#define GM_STORE(bf_, kb0_)                                                                                     \
+  do {                                                                                                          \
+    const u32 nks = nb - (kb0_) < GM_KB ? nb - (kb0_) : GM_KB;                                                  \
+    _Pragma("unroll") for (u32 i = 0; i < GM_R * 8u / NT; i++) {                                                \
+      const u32 p = t0 + NT * i;                                                                                \
+      if ((p & 7u) < 2u * nks) *(LDSP u32x4 *)(gm_w[bf_] + (p >> 3) * GM_LS + (p & 7u) * 16u) = rw[i];          \
+    }                                                                                                           \
+    _Pragma("unroll") for (u32 i = 0; i < GM_T * 8u / NT; i++) {                                                \
+      const u32 p = t0 + NT * i;                                                                                \
+      if ((p & 7u) < 2u * nks) *(LDSP u32x4 *)(gm_x[bf_] + (p >> 3) * GM_LS + (p & 7u) * 16u) = rx[i];          \
+    }                                                                                                           \
+    _Pragma("unroll") for (u32 i = 0; i < GM_R * GM_KB / NT; i++) gm_sw[bf_][t0 + NT * i] = rsw[i];            \
+    _Pragma("unroll") for (u32 i = 0; i < GM_NSX; i++)                                                          \
+      if (t0 + NT * i < GM_T * GM_KB) gm_sx[bf_][t0 + NT * i] = rsx[i];                                         \
+  } while (0)
   GM_FETCH(0u);
+  GM_STORE(0u, 0u);
+  barrier();
+  u32 bf = 0;
   for (u32 kb0 = 0; kb0 < nb; kb0 += GM_KB) {
     const u32 nk = nb - kb0 < GM_KB ? nb - kb0 : GM_KB;
-    for (u32 i = 0; i < GM_R * 8u / NT; i++) {
-      const u32 p = t0 + NT * i;
-      if ((p & 7u) < 2u * nk) *(LDSP u32x4 *)(gm_w + (p >> 3) * GM_LS + (p & 7u) * 16u) = rw[i];
-    }
-    for (u32 i = 0; i < GM_T * 8u / NT; i++) {
-      const u32 p = t0 + NT * i;
-      if ((p & 7u) < 2u * nk) *(LDSP u32x4 *)(gm_x + (p >> 3) * GM_LS + (p & 7u) * 16u) = rx[i];
-    }
-    for (u32 i = 0; i < GM_R * GM_KB / NT; i++) gm_sw[t0 + NT * i] = rsw[i];
-    if (t0 < GM_T * GM_KB) gm_sx[t0] = rsx;
-    barrier();
-    if (kb0 + GM_KB < nb) GM_FETCH(kb0 + GM_KB); /* in flight during the math below */
+    const int more = kb0 + GM_KB < nb;
+    if (more) GM_FETCH(kb0 + GM_KB); /* in flight during the math below */
+    const LDSP u8 *lw = gm_w[bf], *lx = gm_x[bf];
+    const LDSP float *lsw = gm_sw[bf], *lsx = gm_sx[bf];
     for (u32 k = 0; k < nk; k++) {
-      v2i a0[2], a1[2], b0[2], b1[2];
-      for (u32 i = 0; i < 2u; i++) {
-        const LDSP u8 *pa = gm_w + (wr + 16u * i + (l & 15u)) * GM_LS + k * 32u + 8u * h;
+      v2i a0[GM_WI], a1[GM_WI], b0[GM_WJ], b1[GM_WJ];
+#pragma unroll
+      for (u32 i = 0; i < GM_WI; i++) {
+        const LDSP u8 *pa = lw + (wr + 16u * i + (l & 15u)) * GM_LS + k * 32u + 8u * h;
         a0[i] = *(const LDSP v2i *)pa, a1[i] = *(const LDSP v2i *)(pa + 16u);
-        const LDSP u8 *pb = gm_x + (wt + 16u * i + (l & 15u)) * GM_LS + k * 32u + 8u * h;
-        b0[i] = *(const LDSP v2i *)pb, b1[i] = *(const LDSP v2i *)(pb + 16u);
       }
-      /* all WMMA of the block first (independent), then the scaling: the
-       * scaling of one tile does not wait for the WMMA of the next */
-      v8i c[2][2];
-      for (u32 i = 0; i < 2u; i++)
-        for (u32 j = 0; j < 2u; j++) c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a0[i], 1, b0[j], z, 0);
-      for (u32 i = 0; i < 2u; i++)
-        for (u32 j = 0; j < 2u; j++) c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a1[i], 1, b1[j], c[i][j], 0);
-      f8 sw[2];
-      for (u32 i = 0; i < 2u; i++) sw[i] = *(const LDSP f8 *)(gm_sw + k * GM_R + wr + 16u * i + 8u * h);
-      for (u32 j = 0; j < 2u; j++) {
-        const float dx = gm_sx[(wt + 16u * j + (l & 15u)) * GM_KB + k];
-        for (u32 i = 0; i < 2u; i++) acc[i][j] += (sw[i] * dx) * __builtin_convertvector(c[i][j], f8);
+#pragma unroll
+      for (u32 j = 0; j < GM_WJ; j++) {
+        const LDSP u8 *pb = lx + (wt + 16u * j + (l & 15u)) * GM_LS + k * 32u + 8u * h;
+        b0[j] = *(const LDSP v2i *)pb, b1[j] = *(const LDSP v2i *)(pb + 16u);
+      }
+      /* all WMMA of the block first (independent tiles), then the scaling.
+       * The int32 sums start at the bits of 12582912.0f (0x4B400000): the
+       * result read as float is exactly 12582912 + dot (|dot| <= 32 * 127 *
+       * 127 < 2^22), so one exact subtraction gives the dot as a float. */
+      const v8i zm = (v8i)(0x4B400000);
+      v8i c[GM_WI][GM_WJ];
+#pragma unroll
+      for (u32 i = 0; i < GM_WI; i++)
+#pragma unroll
+        for (u32 j = 0; j < GM_WJ; j++) c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a0[i], 1, b0[j], zm, 0);
+#pragma unroll
+      for (u32 i = 0; i < GM_WI; i++)
+#pragma unroll
+        for (u32 j = 0; j < GM_WJ; j++) c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a1[i], 1, b1[j], c[i][j], 0);
+      f8 sw[GM_WI];
+#pragma unroll
+      for (u32 i = 0; i < GM_WI; i++) sw[i] = *(const LDSP f8 *)(lsw + k * GM_R + wr + 16u * i + 8u * h);
+#pragma unroll
+      for (u32 j = 0; j < GM_WJ; j++) {
+        const float dx = lsx[(wt + 16u * j + (l & 15u)) * GM_KB + k];
+#pragma unroll
+        for (u32 i = 0; i < GM_WI; i++) acc[i][j] += (sw[i] * dx) * (__builtin_bit_cast(f8, c[i][j]) - 12582912.0f);
       }
     }
-    barrier(); /* the tiles are read before the next chunk overwrites them */
+    if (GM_NBUF == 2u) {
+      if (more) GM_STORE(bf ^ 1u, kb0 + GM_KB); /* the other buffer: nobody reads it in this chunk */
+      barrier();
+      bf ^= 1u;
+    } else {
+      barrier(); /* the tiles are read before the next chunk overwrites them */
+      if (more) GM_STORE(0u, kb0 + GM_KB);
+      barrier();
+    }
   }
-  for (u32 i = 0; i < 2u; i++)
-    for (u32 j = 0; j < 2u; j++) {
+#pragma unroll
+  for (u32 i = 0; i < GM_WI; i++)
+#pragma unroll
+    for (u32 j = 0; j < GM_WJ; j++) {
       const u32 t = tbase + wt + 16u * j + (l & 15u);
       if (t >= T) continue;
       for (u32 v = 0; v < 8u; v++) {
@@ -561,6 +613,7 @@ KERNEL ie_gemm_q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, 
       }
     }
 #undef GM_FETCH
+#undef GM_STORE
 }
 
 /* The same product with fp16 WMMA (v_wmma_f32_16x16x16_f16, f32 sums):
@@ -1148,6 +1201,87 @@ KERNEL ie_attn_pf(const G float *q, const G float *kc, const G float *vc, G floa
     if (gate) o = o * sigmoidf(gate[h * gstride + tid()]);
     out[h * hd + tid()] = o;
     if (oq) quant_wave(o, (h * hd + tid()) >> 5, oq, (n_head * hd) >> 5);
+  }
+}
+
+/* RMSNorm of many tokens (prompt chunks): workgroup y = token y does the
+ * whole row (each element read once for the sum of squares, once for the
+ * output), wave w the blocks w, w + 8, .. . Same arithmetic as rmsnorm_wg. */
+KERNEL ie_rmsnorm_t(const G float *x, const G float *w, G float *y, u32 n, float eps, G u8 *q, u32 xs, u32 ys, u32 qs) {
+  x = TOKC(x, xs), y = TOK(y, ys), q = TOK(q, qs);
+  rmsnorm_wg(x, w, y, n, eps, q);
+}
+
+/* Attention of a prompt chunk, grouped: workgroup (g, y) = KV head g of
+ * token y (position pos0 + y) and its GA = n_head / n_kv query heads (<= 8).
+ * Each K and V row is read once for all GA heads (6 for Qwen3.8-27B), and
+ * the GA dot products are independent (more work in flight per wave). Wave
+ * w does the positions w, w + 8, ..; then the waves merge one head at a
+ * time in LDS. As ie_attn_pf otherwise. */
+#define GA_MAX 8u
+static LDS float ag_m[8][GA_MAX], ag_l[8][GA_MAX];
+KERNEL ie_attn_pfg(const G float *q, const G float *kc, const G float *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
+                   u32 n_kv, G u8 *oq, const G float *gate, u32 gstride, u32 qs, u32 os, u32 oqs, u32 gs) {
+  q = TOKC(q, qs), out = TOK(out, os), oq = TOK(oq, oqs), gate = TOK(gate, gs);
+  const u32 kh = wgid(), pos = pos0 + tokid(), ga = n_head / n_kv, kvd = n_kv * hd;
+  const u32 w = tid() >> 5, l = lane();
+  const float scale = 1.0f / __builtin_sqrtf((float)hd);
+  float qv[GA_MAX][8], acc[GA_MAX][8], m[GA_MAX], sum[GA_MAX];
+#pragma unroll
+  for (u32 g = 0; g < GA_MAX; g++) {
+    m[g] = -__builtin_inff(), sum[g] = 0.0f;
+    for (u32 j = 0; j < 8u; j++) {
+      const u32 i = l + 32u * j;
+      qv[g][j] = g < ga && i < hd ? q[(kh * ga + g) * hd + i] : 0.0f;
+      acc[g][j] = 0.0f;
+    }
+  }
+  for (u32 p = w; p <= pos; p += 8u) {
+    const G float *k = kc + (unsigned long)p * kvd + kh * hd;
+    const G float *v = vc + (unsigned long)p * kvd + kh * hd;
+    float kr[8], vr[8];
+    for (u32 j = 0; j < 8u; j++) {
+      kr[j] = l + 32u * j < hd ? k[l + 32u * j] : 0.0f;
+      vr[j] = l + 32u * j < hd ? v[l + 32u * j] : 0.0f;
+    }
+#pragma unroll
+    for (u32 g = 0; g < GA_MAX; g++) {
+      if (g < ga) { /* uniform */
+      float d = 0.0f;
+      for (u32 j = 0; j < 8u; j++) d += qv[g][j] * kr[j];
+      d = wave_sum_all(d) * scale;
+      const float mn = __builtin_fmaxf(m[g], d), c = __builtin_expf(m[g] - mn), e = __builtin_expf(d - mn);
+      sum[g] = sum[g] * c + e;
+      for (u32 j = 0; j < 8u; j++) acc[g][j] = acc[g][j] * c + e * vr[j];
+      m[g] = mn;
+      }
+    }
+  }
+  if (l == 0u) {
+#pragma unroll
+    for (u32 g = 0; g < GA_MAX; g++) ag_m[w][g] = m[g], ag_l[w][g] = sum[g];
+  }
+#pragma unroll
+  for (u32 g = 0; g < GA_MAX; g++) {
+    if (g >= ga) continue; /* uniform */
+    for (u32 j = 0; j < 8u; j++)
+      if (l + 32u * j < hd) at_o[w][l + 32u * j] = acc[g][j];
+    barrier();
+    float M = ag_m[0][g];
+    for (u32 x = 1; x < 8u; x++) M = __builtin_fmaxf(M, ag_m[x][g]);
+    float L = 0.0f;
+    for (u32 x = 0; x < 8u; x++) L += ag_m[x][g] == -__builtin_inff() ? 0.0f : ag_l[x][g] * __builtin_expf(ag_m[x][g] - M);
+    if (tid() < hd) {
+      float o = 0.0f;
+      for (u32 x = 0; x < 8u; x++)
+        if (ag_m[x][g] != -__builtin_inff()) o += at_o[x][tid()] * __builtin_expf(ag_m[x][g] - M);
+      o = o / L;
+      const u32 h = kh * ga + g;
+      if (gate) o = o * sigmoidf(gate[h * gstride + tid()]);
+      out[h * hd + tid()] = o;
+      if (oq) quant_wave(o, (h * hd + tid()) >> 5, oq, (n_head * hd) >> 5);
+    }
+    barrier(); /* at_o is read before the next head writes it */
   }
 }
 

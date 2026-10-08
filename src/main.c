@@ -117,6 +117,7 @@ static uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32
                         int mtp, ppl_acc *pa, uint32_t *hrow) {
   uint32_t *a = malloc(chunk * 4), *d = malloc(chunk * 4), last = 0, T = 1;
   float *lg = pa && pa->on ? malloc((size_t)chunk * g->bufs[g->logits].stride) : NULL;
+  b->all_logits = lg != NULL;
   if (mtp) b->copy_rows(b, g->mtp_h, 0, -1, 0, 1); /* h(-1) = 0 */
   for (uint32_t p0 = 0; p0 < n; p0 += T) {
     T = n - p0 < chunk ? n - p0 : chunk;
@@ -131,7 +132,7 @@ static uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32
     }
     if (mtp) { /* MTP positions p0 .. p0+T-1: h rows [h(p0-1) (row 0, from before), h(p0) .. h(p0+T-2)] */
       if (T > 1) b->copy_rows(b, g->mtp_h, 1, g->h_out, 0, T - 1);
-      b->run(b, 1, toks + p0, T, p0, 0, d);
+      b->run(b, 1, toks + p0, T, p0, 1, d); /* KV catch-up only: its drafts are not used */
       b->copy_rows(b, g->mtp_h, 0, g->h_out, T - 1, 1);
     }
   }
