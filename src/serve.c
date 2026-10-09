@@ -56,7 +56,7 @@ static void usage(void) {
           "  --host ADDR         listen address (default 127.0.0.1; a Tailscale address, or 0.0.0.0)\n"
           "  --port N            (default 8000)\n"
           "  --api-key KEY       require \"Authorization: Bearer KEY\" (or the environment variable IE_API_KEY)\n"
-          "  --name ID           the model id in /v1/models (default: general.name of the file)\n"
+          "  --name ID           the model id in /v1/models (default: general.name of the file; spaces become -)\n"
           "  --ctx N             context: prompt + output tokens (default 8192)\n"
           "  --draft D           MTP drafts per step, 1 to 7 (GPU; default 0: off)\n"
           "  --draft-pmin P      (default 0.6)   --mtp FILE   the MTP head from FILE\n"
@@ -392,6 +392,9 @@ static void *engine_main(void *arg) {
     snprintf(MODEL_ID, sizeof MODEL_ID, "%s", gn ? gn : "amd-infer");
     free(gn);
   } else snprintf(MODEL_ID, sizeof MODEL_ID, "%s", O.name);
+  /* no white space in the id (Open WebUI refuses a model id with spaces): "Qwen3.8 27B" -> "Qwen3.8-27B" */
+  for (char *c = MODEL_ID; *c; c++)
+    if (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r') *c = '-';
 
   const uint32_t chunk = gpu ? O.chunk : 1;
   graph_build(&GR, &M, O.ctx, O.draft + 1 > chunk ? O.draft + 1 : chunk, O.draft > 0);

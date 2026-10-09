@@ -30,7 +30,7 @@ make build/ie-serve build/ie_kernels.hsaco
 | `--backend gpu\|cpu` | gpu | cpu 只用于小模型测试 |
 | `--host ADDR`、`--port N` | 127.0.0.1、8000 | 监听地址和端口 |
 | `--api-key KEY` | 无 | 请求必须带 `Authorization: Bearer KEY`。也可以用环境变量 `IE_API_KEY` |
-| `--name ID` | 模型文件的 `general.name` | `/v1/models` 返回的模型名 |
+| `--name ID` | 模型文件的 `general.name` | `/v1/models` 返回的模型名。空白字符换成 `-`（Open WebUI 不接受带空格的模型名），例如 `Qwen3.8-27B` |
 | `--ctx N` | 8192 | 提示加输出的最多 token 数。KV 缓存按这个大小分配 |
 | `--draft D` | 0 | MTP 草稿数（1 到 7，只在 GPU 上）。聊天时 3 最快（见 `claude/progress.md`） |
 | `--draft-pmin P`、`--mtp FILE` | 0.6、无 | 与 `ie-run` 相同 |
