@@ -190,6 +190,9 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
   /* the prompt is done (prefill): the model and the MTP KV cache for
    * positions < P; first: the greedy token at P; h(P-1) in h_out row hrow */
   uint32_t P = n_prompt, n = n_prompt, k = 0, tP = first;
+  /* IE_SPEC_TIME=1: the host time of the drafts and of the verify runs (each run ends with a read of its argmax, so it waits for the GPU) */
+  const int stime = getenv("IE_SPEC_TIME") != NULL;
+  double t_draft = 0, t_verify = 0, tq;
   out[n++] = tP;
   /* out[n_prompt .. sent) went to emit; a nonzero return ends the loop */
   uint32_t sent = n_prompt;
@@ -204,6 +207,7 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
      * least pmin: nd drafts (0 .. D) this step. */
     float pr[16];
     uint32_t nd = 0;
+    tq = stime ? now_ms() : 0;
     b->copy_rows(b, g->mtp_h, 0, g->h_out, hrow, k + 1);
     hrow = 0;
     b->run(b, 1, &out[P - k], k + 1, P - k, 0, tk, pr);
@@ -214,9 +218,11 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
       if (pr[0] >= pmin) d[j] = model_draft_tok(m, tk[0]), nd = j;
     }
     /* (3) verify */
+    if (stime) t_draft += now_ms() - tq, tq = now_ms();
     tk[0] = tP;
     for (uint32_t j = 1; j <= nd; j++) tk[j] = d[j];
     b->run(b, 0, tk, nd + 1, P, 0, a, NULL);
+    if (stime) t_verify += now_ms() - tq;
     const double ts0 = now_ms();
     if (lg) { /* sample instead of the argmax; only the tokens up to the first mismatch matter */
       const uint32_t K = sample_k(sp, V);
@@ -264,6 +270,8 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
   SPEC_EMIT(); /* the last step's tokens (the result does not matter now) */
 #undef SPEC_EMIT
   if (p_done) *p_done = P, *h_row = hrow ? hrow : k; /* the last verify's row k holds h(P - 1) */
+  if (stime && *n_steps)
+    fprintf(stderr, "spec time: drafts %.2f ms/step, verify %.2f ms/step (%u steps)\n", t_draft / *n_steps, t_verify / *n_steps, *n_steps);
   *gen_ms = now_ms() - t0;
   if (lg) fprintf(stderr, "sampling: %.1f ms in all (%.3f ms per step)\n", sample_ms, *n_steps ? sample_ms / *n_steps : 0.0);
   free(lg);

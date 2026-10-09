@@ -20,6 +20,7 @@
 #define NT 256u
 
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
+typedef float f32x4 __attribute__((ext_vector_type(4)));
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef signed char i8;
@@ -1855,6 +1856,173 @@ KERNEL ie_attn_split_t(const G float *q, const G float *kc, const G float *vc, G
                   (G float *)((G u8 *)out + (unsigned long)j * ost), pj, hd, n_head, n_kv, nsplit, ch, count + j * n_head,
                   oq ? oq + (unsigned long)j * oqst : oq, gate ? (const G float *)((const G u8 *)gate + (unsigned long)j * gst) : gate,
                   gstride, h, s);
+}
+
+/* Split attention with the K/V read once per KV head (ie_attn_kv): for T
+ * tokens at positions pos .. pos + T - 1 and the G = n_head / n_kv query
+ * heads of one KV head. Workgroup g = (kh * ngs + sg) * nb + b: KV head kh,
+ * the splits sg * spw .. sg * spw + spw - 1 (split s: positions s*ch ..
+ * s*ch + ch - 1, as ie_attn_split), pairs 8b .. 8b + 7 of the G * T
+ * (query head, token) pairs of kh (pair i: token i / G, query head
+ * kh * G + i % G). K and V go to LDS, 8 positions at a time (16-byte loads,
+ * the next 8 positions in flight during the math); wave w does pair 8b + w.
+ * Bitwise equal per (head, token) to attn_split_body at that position: wave
+ * x of ie_attn_split does the positions s*ch + x, + 8, ... of split s; here
+ * one wave keeps 8 streams x = 0 .. 7 with the same positions in the same
+ * order and the same arithmetic, merges them in the order of the LDS merge
+ * (x = 0 .. 7) and writes the split's (M, L, o) to the same place. A
+ * workgroup does spw splits one after the other (the splits are not
+ * changed; spw only sets the work per workgroup), then adds its number of
+ * splits to count[j * n_head + h]; the workgroup that completes the count
+ * merges the splits with all 256 threads, as attn_split_body (the same sums
+ * in the same order, its loads issued 8 at a time). LDS: the K/V buffer also
+ * holds the merge weights (16 KB in all). hd <= 256, hd % 4 == 0,
+ * ch % 8 == 0, kc and vc 16-byte aligned. */
+#define AKV_P 8u
+static LDS float akv_kv[2][AKV_P][256]; /* K, V; in the merge: the weights of the splits (<= 4096) */
+static LDS u32 akv_last[8];
+KERNEL ie_attn_kv(const G float *q, const G float *kc, const G float *vc, G float *part, G float *out, u32 pos, u32 hd,
+                  u32 n_head, u32 n_kv, u32 smax, u32 ch, G u32 *count, G u8 *oq, const G float *gate, u32 gstride, u32 qst,
+                  u32 ost, u32 oqst, u32 gst, u32 pstride, u32 T, u32 nb, u32 spw) {
+  const u32 grp = n_head / n_kv, kvd = n_kv * hd, ngs = (smax + spw - 1u) / spw;
+  const u32 b = wgid() % nb, sg = (wgid() / nb) % ngs, kh = wgid() / (nb * ngs);
+  const u32 w = tid() >> 5, l = lane();
+  const u32 pi = 8u * b + w;                  /* this wave's pair */
+  const u32 j = pi / grp, h = kh * grp + pi % grp;
+  const u32 pj = pos + j, nsplit = (pj + ch) / ch; /* ie_att_nsplit for token j */
+  const u32 s0 = sg * spw, s1 = s0 + spw < smax ? s0 + spw : smax;
+  const int on = pi < grp * T && s0 < nsplit; /* wave-uniform: this pair has splits here */
+  const u32 ndone = on ? (s1 < nsplit ? s1 : nsplit) - s0 : 0u; /* its splits in this workgroup */
+  /* the workgroup's positions: up to the last token's */
+  const u32 P0 = s0 * ch, PE = s1 * ch < pos + T ? s1 * ch : pos + T;
+  if (P0 >= PE) return; /* no token has these splits (workgroup-uniform) */
+  const float scale = 1.0f / __builtin_sqrtf((float)hd);
+  const G float *qh = on ? (const G float *)((const G u8 *)q + (unsigned long)j * qst) + h * hd : q;
+  float qv[8];
+  for (u32 jj = 0; jj < 8u; jj++) {
+    const u32 i = l + 32u * jj;
+    qv[jj] = on && i < hd ? qh[i] : 0.0f;
+  }
+  float sm[8], ss[8], sa[8][8]; /* the 8 streams (the waves of ie_attn_split) of the current split */
+  const u32 h4 = hd >> 2, n4 = AKV_P * h4; /* float4 per row, per pass (<= 512) */
+  f32x4 kr[2], vr[2];
+#define AKV_LOAD(c)                                                                          \
+  for (u32 u = 0; u < 2u; u++) {                                                             \
+    const u32 i4 = tid() + NT * u, r = i4 / h4, e4 = i4 - r * h4;                           \
+    kr[u] = vr[u] = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};                                          \
+    if (i4 < n4 && (c) + r < PE) {                                                           \
+      const unsigned long o = ((unsigned long)((c) + r) * kvd + kh * hd) / 4u + e4;          \
+      kr[u] = ((const G f32x4 *)kc)[o];                                                      \
+      vr[u] = ((const G f32x4 *)vc)[o];                                                      \
+    }                                                                                        \
+  }
+  AKV_LOAD(P0)
+  for (u32 c = P0; c < PE; c += AKV_P) {
+    const u32 s = c / ch, sp0 = s * ch, sp1 = sp0 + ch; /* the split of these 8 positions */
+    if (c == sp0) /* a new split: new streams */
+      for (u32 x = 0; x < 8u; x++) {
+        sm[x] = -__builtin_inff(), ss[x] = 0.0f;
+        for (u32 jj = 0; jj < 8u; jj++) sa[x][jj] = 0.0f;
+      }
+    for (u32 u = 0; u < 2u; u++) {
+      const u32 i4 = tid() + NT * u, r = i4 / h4, e4 = i4 - r * h4;
+      if (i4 < n4) {
+        *(LDSP f32x4 *)&akv_kv[0][r][4u * e4] = kr[u];
+        *(LDSP f32x4 *)&akv_kv[1][r][4u * e4] = vr[u];
+      }
+    }
+    barrier();
+    if (c + AKV_P < PE) { AKV_LOAD(c + AKV_P) }
+    const int live = on && s < nsplit; /* this pair has split s */
+    const u32 p1 = sp1 < pj + 1u ? sp1 : pj + 1u; /* this pair's end in split s */
+    if (live)
+#pragma unroll
+      for (u32 r = 0; r < AKV_P; r++) {
+        /* no branch: the 8 streams are independent, so their math can
+         * interleave; a position past this pair's end keeps the old state */
+        const u32 p = c + r, x = r; /* stream (p - sp0) % 8; c - sp0 is a multiple of 8 */
+        const int ok = p < p1;
+        float d = 0.0f;
+        for (u32 jj = 0; jj < 8u; jj++)
+          if (l + 32u * jj < hd) d += qv[jj] * akv_kv[0][r][l + 32u * jj];
+        d = wave_sum_all(d);
+        d *= scale;
+        const float mn = __builtin_fmaxf(sm[x], d), cc = __builtin_expf(sm[x] - mn), e = __builtin_expf(d - mn);
+        const float s2 = ss[x] * cc + e;
+        ss[x] = ok ? s2 : ss[x];
+        for (u32 jj = 0; jj < 8u; jj++)
+          if (l + 32u * jj < hd) {
+            const float a2 = sa[x][jj] * cc + e * akv_kv[1][r][l + 32u * jj];
+            sa[x][jj] = ok ? a2 : sa[x][jj];
+          }
+        sm[x] = ok ? mn : sm[x];
+      }
+    barrier();
+    /* the end of split s (for this workgroup): merge the 8 streams as the LDS
+     * merge of attn_split_body and write the split's (M, L, o) */
+    if (live && (c + AKV_P >= sp1 || c + AKV_P >= PE)) {
+      float M = sm[0];
+      for (u32 x = 1; x < 8u; x++) M = __builtin_fmaxf(M, sm[x]);
+      G float *pp = part + (unsigned long)j * pstride + (unsigned long)(h * nsplit + s) * (hd + 2u);
+      for (u32 jj = 0; jj < 8u; jj++) {
+        const u32 i = l + 32u * jj;
+        if (i < hd) {
+          float o = 0.0f;
+          for (u32 x = 0; x < 8u; x++) o += sa[x][jj] * __builtin_expf(sm[x] - M);
+          pp[2u + i] = o;
+        }
+      }
+      if (l == 0u) {
+        float L = 0.0f;
+        for (u32 x = 0; x < 8u; x++) L += ss[x] * __builtin_expf(sm[x] - M);
+        pp[0] = M;
+        pp[1] = L;
+      }
+    }
+  }
+#undef AKV_LOAD
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  barrier();
+  if (l == 0u)
+    akv_last[w] = ndone ? __atomic_fetch_add(&count[j * n_head + h], ndone, __ATOMIC_ACQ_REL) + ndone == nsplit : 0u;
+  barrier();
+  /* the merges this workgroup completed (all 256 threads, as attn_split_body) */
+  LDSP float *wv = &akv_kv[0][0][0]; /* the weights of the splits (the K/V buffer is free now) */
+  for (u32 x = 0; x < 8u; x++) {
+    if (!akv_last[x]) continue;
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    const u32 px = 8u * b + x, jx = px / grp, hx = kh * grp + px % grp, ns = (pos + jx + ch) / ch;
+    const G float *ph = part + (unsigned long)jx * pstride + (unsigned long)hx * ns * (hd + 2u);
+    float mv = -__builtin_inff();
+    for (u32 t = tid(); t < ns; t += NT) mv = __builtin_fmaxf(mv, ph[t * (hd + 2u)]);
+    const float M2 = wg_max(mv);
+    float lv = 0.0f;
+    for (u32 t = tid(); t < ns; t += NT) {
+      const float wt = __builtin_expf(ph[t * (hd + 2u)] - M2);
+      wv[t] = wt;
+      lv += ph[t * (hd + 2u) + 1u] * wt;
+    }
+    const float L2 = wg_sum(lv); /* its barrier also makes wv visible */
+    G float *ox = (G float *)((G u8 *)out + (unsigned long)jx * ost);
+    G u8 *oqx = oq ? oq + (unsigned long)jx * oqst : oq;
+    const G float *gx = gate ? (const G float *)((const G u8 *)gate + (unsigned long)jx * gst) : gate;
+    if (tid() < hd) {
+      float o = 0.0f;
+      u32 t = 0;
+      for (; t + 8u <= ns; t += 8u) { /* 8 loads in flight; the sum in the order t = 0, 1, ... */
+        float pv[8];
+        for (u32 u = 0; u < 8u; u++) pv[u] = ph[(t + u) * (hd + 2u) + 2u + tid()];
+        for (u32 u = 0; u < 8u; u++) o += pv[u] * wv[t + u];
+      }
+      for (; t < ns; t++) o += ph[t * (hd + 2u) + 2u + tid()] * wv[t];
+      o = o / L2;
+      if (gx) o = o * sigmoidf(gx[hx * gstride + tid()]);
+      ox[hx * hd + tid()] = o;
+      if (oqx) quant_wave(o, (hx * hd + tid()) >> 5, oqx, (n_head * hd) >> 5);
+    }
+    if (tid() == 0u) count[jx * n_head + hx] = 0u;
+    barrier(); /* wv is used again by the next merge */
+  }
 }
 
 /* ----------------------------------------------------------------- qwen35 */

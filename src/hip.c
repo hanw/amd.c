@@ -90,11 +90,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 /* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
  * linear layer are gpu_backend.ns: at least the tokens of a verify run */
@@ -126,6 +126,7 @@ typedef struct {
   u32 slot;                /* ie_gdn: the state slot that holds the current state */
   u32 ns;                  /* ie_gdn: state slots per linear layer (4, or 8 for more than 3 drafts) */
   int attn_split;          /* use ie_attn_split (hd <= IE_ATT_MAX_HD, and not IE_ATTN=old) */
+  int attn_kv;             /* use ie_attn_kv for decode and verify (the K/V of a split read once; not IE_ATTN=split) */
   /* IE_ATTN=check: after each ie_attn_split, also run ie_attn into chk and
    * compare the two outputs on the host (max |a - b| / max |a|). */
   int attn_check;
@@ -295,6 +296,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   const char *ae = getenv("IE_ATTN");
   b->attn_split = m->hd <= IE_ATT_MAX_HD && ie_att_max_split(g->n_ctx) <= IE_ATT_MAX_SPLIT && !(ae && !strcmp(ae, "old"));
   b->attn_check = b->attn_split && ae && !strcmp(ae, "check");
+  b->attn_kv = b->attn_split && !(ae && (!strcmp(ae, "split") || !strcmp(ae, "check"))) && ie_att_ch(0) % 8u == 0u &&
+               IE_ATT_MAX_SPLIT <= 4096u && m->hd % 4u == 0u; /* ie_attn_kv: the merge weights in its LDS buffer, float4 loads */
   if (b->attn_check) {
     HIP(H.Malloc((void **)&b->chk, m->n_head * m->hd * 4u));
     b->chk_a = ie_alloc(m->n_head * m->hd * 4u);
@@ -716,6 +719,38 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           else launch_t(b, K_ATTN_PF, nhd, T, args);
           break;
         }
+        /* decode and verify: ie_attn_kv (bitwise equal to ie_attn_split per
+         * token) from IE_ATTN_KV_MIN positions (default 768). Measured on the
+         * R9700 (27B, one token, ms/token in attention, ie_attn_kv vs
+         * ie_attn_split): 100 positions 0.67 vs 0.39, 600: 0.91 vs 0.88,
+         * 900: 1.09 vs 1.09, 7300: 3.44 vs 7.43. */
+        static int kv_min = -1;
+        if (kv_min < 0) kv_min = getenv("IE_ATTN_KV_MIN") ? atoi(getenv("IE_ATTN_KV_MIN")) : 768;
+        if (b->attn_kv && T <= b->at_tmax && pos + T > (u32)kv_min) {
+          u32 ch = ie_att_ch(pos), smax = ie_att_nsplit(pos + T - 1u);
+          if (ie_att_ch(pos + T - 1u) != ch) ie_die("ie_attn_kv: the chunk depends on the position");
+          if (T == 1u) GT = o->gt >= 0 ? b->arena + g->bufs[o->gt].off + o->gtoff + (size_t)t * g->bufs[o->gt].stride : NULL;
+          else GT = o->gt >= 0 ? b->arena + g->bufs[o->gt].off + o->gtoff : NULL;
+          u32 qst = g->bufs[o->a].stride, ost = g->bufs[o->b].stride, oqst = o->qo >= 0 ? g->bufs[o->qo].stride : 0u;
+          u32 gst = o->gt >= 0 ? g->bufs[o->gt].stride : 0u;
+          /* one token: the part area is C (as ie_attn_split); more: at_part, at_pstride floats per token */
+          void *P = T == 1u ? C : (void *)b->at_part;
+          u32 pst = T == 1u ? 0u : b->at_pstride, TT = T, nb = (nhd / nkv * T + 7u) / 8u;
+          /* splits per workgroup: about 128 workgroups (2 per CU). Measured on the
+           * R9700 (27B, one token): at 7300 positions 8 splits per workgroup
+           * (116 workgroups) 3.44 ms/token in attention, 1 split 4.42; at 900
+           * positions 1 split (116) 1.09, 8 splits 2.21. It does not change the result. */
+          static int spw_env = -1;
+          if (spw_env < 0) spw_env = getenv("IE_ATTN_SPW") ? atoi(getenv("IE_ATTN_SPW")) : 0;
+          u32 spw = spw_env > 0 ? (u32)spw_env : (u32)(smax * nkv * nb / 128u);
+          if (spw < 1u) spw = 1u;
+          if (spw > 16u) spw = 16u;
+          const u32 ngs = (smax + spw - 1u) / spw;
+          void *args[] = {&A, &kc, &vc, &P, &B, &pos, (void *)&hd, (void *)&nhd, (void *)&nkv, &smax, &ch,
+                          &b->at_count, &Q, &GT, &gs, &qst, &ost, &oqst, &gst, &pst, &TT, &nb, &spw};
+          launch(b, K_ATTN_KV, nkv * ngs * nb, args);
+          break;
+        }
         if (b->attn_split && T > 1) { /* verify: all tokens in one launch (ie_attn_split_t: bitwise equal per token) */
           u32 ch = ie_att_ch(pos), smax = ie_att_nsplit(pos + T - 1u);
           if (ie_att_ch(pos + T - 1u) != ch) ie_die("ie_attn_split_t: the chunk depends on the position");
@@ -971,7 +1006,7 @@ static int op_kernel(const gpu_backend *b, const op *o) {
     case OP_ROPE: return K_ROPE;
     case OP_KV: return K_KV;
     case OP_ROPE_KV: return K_ROPE_KV;
-    case OP_ATTN: return b->attn_split ? K_ATTN_SPLIT : K_ATTN;
+    case OP_ATTN: return b->attn_kv ? K_ATTN_KV : b->attn_split ? K_ATTN_SPLIT : K_ATTN;
     default: return K_ARGMAX;
   }
 }
