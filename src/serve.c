@@ -306,14 +306,30 @@ static void run_job(job *j) {
   const char *fin = n_calls ? "tool_calls" : j->finish == 1 ? "stop" : "length";
 
   const uint32_t n_gen = j->n_tok;
+  /* usage: the OpenAI counts, then the speed (Open WebUI shows all of usage
+   * in the (i) tooltip under an answer) */
+  sbuf us = {0};
+  {
+    const double gs = st.gen_ms / 1e3, ps = st.prefill_ms / 1e3, nc = (double)(st.n_prompt - st.cached);
+    sb_printf(&us, "{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u", j->prompt.n, n_gen, j->prompt.n + n_gen);
+    sb_printf(&us, ",\"prompt_tokens_details\":{\"cached_tokens\":%u}", st.cached);
+    sb_printf(&us, ",\"response_token/s\":%.1f,\"prompt_token/s\":%.0f", gs > 0 ? n_gen / gs : 0.0, ps > 0 ? nc / ps : 0.0);
+    sb_printf(&us, ",\"prompt_ms\":%.0f,\"response_ms\":%.0f", st.prefill_ms, st.gen_ms);
+    if (st.steps) sb_printf(&us, ",\"mtp_tokens_per_step\":%.2f", (double)st.n_out / st.steps);
+    sb_puts(&us, "}");
+  }
   if (j->stream && j->finish != 2 && !j->dead) {
     if (n_calls) sse_tool_calls(j, calls.p, calls.n);
-    sse_chunk(j, "", 0, fin);
+    { /* the last chunk carries usage too (as llama.cpp does), so clients that do not ask still see it */
+      sbuf b = {0};
+      sse_begin(&b, j);
+      sb_printf(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}],\"usage\":%s}\n\n", fin, us.p);
+      sse_send(j, &b);
+    }
     if (j->usage) {
       sbuf b = {0};
       sse_begin(&b, j);
-      sb_printf(&b, ",\"choices\":[],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}\n\n", j->prompt.n,
-                n_gen, j->prompt.n + n_gen);
+      sb_printf(&b, ",\"choices\":[],\"usage\":%s}\n\n", us.p);
       sse_send(j, &b);
     }
     send_all(j->fd, "data: [DONE]\n\n", 14);
@@ -327,12 +343,11 @@ static void run_job(job *j) {
     sb_puts(&b, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
     sb_json_str(&b, j->all.p ? j->all.p : "", cn);
     if (n_calls) sb_puts(&b, ",\"tool_calls\":"), sb_add(&b, calls.p, calls.n);
-    sb_printf(&b, "},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}", fin,
-              j->prompt.n, n_gen, j->prompt.n + n_gen);
+    sb_printf(&b, "},\"finish_reason\":\"%s\"}],\"usage\":%s}", fin, us.p);
     http_reply(j->fd, 200, "application/json", b.p, b.n);
     sb_free(&b);
   }
-  sb_free(&calls);
+  sb_free(&calls), sb_free(&us);
   const double gs = st.gen_ms / 1e3;
   fprintf(stderr, "[%lu] prompt %u tokens (%u cached%s, %.0f ms), output %u tokens in %.2f s (%.1f tokens/s)", j->rid, st.n_prompt,
           st.cached, st.cache_hit == 1 ? " with the last answer" : "", st.prefill_ms, n_gen, gs, gs > 0 ? n_gen / gs : 0.0);

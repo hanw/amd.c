@@ -95,6 +95,21 @@ curl -sN http://127.0.0.1:8000/v1/chat/completions \
 6. 使用 MTP 时，草稿里的停止 token 不再被接受，这样模型不会计算到停止 token 之后。输出不变。
 7. 日志里的 `cached N` 是跳过的 token 数，`with the last answer` 表示用了快照 1。设置 `IE_SERVE_DEBUG=1` 时，如果快照 1 没有命中，日志会打印两组 token 第一次不同的位置。
 
+### 速度信息
+
+`usage` 里除了 OpenAI 的 token 数，还有速度：
+
+| 字段 | 含义 |
+|---|---|
+| `prompt_tokens_details.cached_tokens` | 从提示缓存跳过的 token 数 |
+| `response_token/s` | 输出速度（第一个 token 之后） |
+| `prompt_token/s` | 预填充速度（只算实际计算的 token） |
+| `prompt_ms`、`response_ms` | 预填充和输出的时间（毫秒） |
+| `mtp_tokens_per_step` | 使用 MTP 时，每步平均得到的 token 数 |
+
+流式输出时，最后一个带 `finish_reason` 的分块也带 `usage`（llama.cpp 也这样做），所以客户端不请求 `include_usage` 也能看到。
+Open WebUI 会把整个 `usage` 显示在回答下方 ⓘ 图标的提示框里。
+
 ## 4. 连接 Open WebUI
 
 推测：下面的命令适用于当前的 Open WebUI 版本。我没有在 amd-gpu-host 上运行过它。
