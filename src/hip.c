@@ -13,7 +13,7 @@
 
 typedef int hipError_t; /* 0 = hipSuccess */
 typedef void *hipModule_t, *hipFunction_t, *hipStream_t, *hipEvent_t;
-enum { hipMemcpyHostToDevice = 1, hipMemcpyDeviceToHost = 2 };
+enum { hipMemcpyHostToDevice = 1, hipMemcpyDeviceToHost = 2, hipMemcpyDeviceToDevice = 3 };
 
 static struct {
   void *lib;
@@ -137,6 +137,8 @@ typedef struct {
   uint32_t host_n;
   float *kc, *vc, *rcos, *rsin;
   float *ring, *st; /* qwen35 linear attention state (see cpu.c) */
+  float *snap_ring[2], *snap_st[2]; /* the prompt cache snapshots (gpu_snap), allocated at the first save */
+  char *snap_h[2];
   /* the chunked linear attention of prompt chunks (ie_gdn_prep/wy/seq):
    * scratch for T tokens, or NULL (graph T <= 16 or no linear layers) */
   float *cq_qk, *cq_v, *cq_bg, *cq_u, *cq_w, *cq_m, *cq_g;
@@ -198,6 +200,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
 static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out,
                     float *prob);
 static void gpu_accept(backend *bk, uint32_t k);
+static void gpu_snap(backend *bk, int save, int k, int hbuf);
 static void gpu_read_rows(backend *bk, int id, uint32_t r0, uint32_t n, float *dst);
 static int gpu_topk(backend *bk, int id, uint32_t r0, uint32_t n, uint32_t nv, uint32_t K, float *val, uint32_t *idx);
 static void gpu_copy_rows(backend *bk, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n);
@@ -265,6 +268,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   b->base.run = gpu_run;
   b->base.copy_rows = gpu_copy_rows;
   b->base.accept = gpu_accept;
+  b->base.snap = gpu_snap;
   b->base.read_rows = gpu_read_rows;
   b->base.topk = gpu_topk;
   b->base.close = gpu_close;
@@ -873,6 +877,32 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
   free(tmp);
 }
 
+/* The prompt cache snapshot: the current state slot of each linear layer,
+ * the whole conv ring (it is indexed by position), and row 0 of hbuf. */
+static void gpu_snap(backend *bk, int save, int k, int hbuf) {
+  gpu_backend *b = (gpu_backend *)bk;
+  const model *m = b->m;
+  const size_t per = (size_t)m->n_vh * m->sd * m->sd * 4, rbytes = (size_t)m->n_rec * GDN_RING * m->conv_dim * 4;
+  const size_t hb = hbuf >= 0 ? b->g->bufs[hbuf].stride : 0;
+  if (!b->snap_ring[k]) {
+    if (!save) ie_die("gpu_snap: no snapshot %d to restore", k);
+    HIP(H.Malloc((void **)&b->snap_ring[k], rbytes + 4));
+    HIP(H.Malloc((void **)&b->snap_st[k], (size_t)m->n_rec * per + 4));
+    HIP(H.Malloc((void **)&b->snap_h[k], b->g->bufs[b->g->h_out].stride + 4)); /* the rows of h buffers have one size */
+  }
+  float *snap_ring = b->snap_ring[k], *snap_st = b->snap_st[k];
+  char *snap_h = b->snap_h[k];
+  for (uint32_t l = 0; l < m->n_rec; l++) {
+    char *live = (char *)b->st + ((size_t)l * b->ns + b->slot) * per, *keep = (char *)snap_st + (size_t)l * per;
+    HIP(H.Memcpy(save ? keep : live, save ? live : keep, per, hipMemcpyDeviceToDevice));
+  }
+  if (rbytes) HIP(H.Memcpy(save ? (void *)snap_ring : (void *)b->ring, save ? (void *)b->ring : (void *)snap_ring, rbytes, hipMemcpyDeviceToDevice));
+  if (hb) {
+    char *row = b->arena + b->g->bufs[hbuf].off;
+    HIP(H.Memcpy(save ? snap_h : row, save ? row : snap_h, hb, hipMemcpyDeviceToDevice));
+  }
+}
+
 static void gpu_accept(backend *bk, uint32_t k) {
   gpu_backend *b = (gpu_backend *)bk;
   b->slot = (b->slot + k) % b->ns;
@@ -1077,6 +1107,8 @@ static void gpu_close(backend *bk) {
   for (uint32_t i = 0; i < n_sdev; i++) H.Free(sdev[i]);
   free(sdev), sdev = NULL, n_sdev = cap_sdev = 0;
   H.Free(b->arena), H.Free(b->kc), H.Free(b->vc), H.Free(b->ring), H.Free(b->st);
+  for (int k = 0; k < 2; k++)
+    if (b->snap_ring[k]) H.Free(b->snap_ring[k]), H.Free(b->snap_st[k]), H.Free(b->snap_h[k]);
   H.Free(b->am_part), H.Free(b->am_count), H.Free(b->at_count), H.Free(b->at_part), H.Free(b->tk_buf), H.Free(b->gm_count);
   if (b->prof) {
     for (uint32_t i = 0; i < b->g->n_ops; i++) H.EventDestroy(b->pev[i]);

@@ -24,6 +24,7 @@ typedef struct {
   /* qwen35 linear attention state per linear layer: the last 4 conv inputs
    * (ring[slot][conv_dim], slot = pos % 4) and S[head][i (key)][j (value)] */
   float *ring, *st;
+  float *snap_ring[2], *snap_st[2]; /* the prompt cache snapshots (cpu_snap) */
 } cpu_backend;
 
 #define BUF(b, id) ((void *)((b)->arena + (b)->g->bufs[id].off))
@@ -332,10 +333,22 @@ static void gdn(const model *m, const layer *L, const float *in, float *out, flo
 static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits, double *ms);
 static void cpu_close(backend *bk);
 
+/* The prompt cache snapshot (backend.snap): the linear attention state and the conv ring. */
+static void cpu_snap(backend *bk, int save, int k, int hbuf) {
+  cpu_backend *b = (cpu_backend *)bk;
+  const model *m = b->m;
+  const size_t rb = (size_t)m->n_rec * 4 * m->conv_dim * 4, sb = (size_t)m->n_rec * m->n_vh * m->sd * m->sd * 4;
+  (void)hbuf; /* no MTP on the CPU */
+  if (!b->snap_ring[k]) b->snap_ring[k] = ie_alloc(rb + 4), b->snap_st[k] = ie_alloc(sb + 4);
+  memcpy(save ? b->snap_ring[k] : b->ring, save ? b->ring : b->snap_ring[k], rb);
+  memcpy(save ? b->snap_st[k] : b->st, save ? b->st : b->snap_st[k], sb);
+}
+
 backend *cpu_open(const model *m, const graph *g) {
   cpu_backend *b = calloc(1, sizeof *b);
   b->base.step = cpu_step;
   b->base.close = cpu_close;
+  b->base.snap = cpu_snap;
   b->m = m;
   b->g = g;
   b->arena = ie_alloc(g->arena);
@@ -354,6 +367,7 @@ static void cpu_close(backend *bk) {
   free(b->vc);
   free(b->ring);
   free(b->st);
+  for (int k = 0; k < 2; k++) free(b->snap_ring[k]), free(b->snap_st[k]);
   free(b);
 }
 

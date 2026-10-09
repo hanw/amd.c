@@ -38,13 +38,13 @@
 /* ---- options ---- */
 typedef struct {
   const char *path, *backend, *hsaco, *host, *api_key, *mtp, *name, *effort;
-  int port, think, queue_max;
+  int port, think, queue_max, cache;
   uint32_t ctx, draft, chunk, top_k, max_body;
   float pmin, temp, top_p;
 } options;
 
 static options O = {
-    .effort = "xhigh", .backend = "gpu", .hsaco = "build/ie_kernels.hsaco", .host = "127.0.0.1", .port = 8000, .think = 1, .queue_max = 8,
+    .effort = "xhigh", .backend = "gpu", .hsaco = "build/ie_kernels.hsaco", .host = "127.0.0.1", .port = 8000, .think = 1, .cache = 1, .queue_max = 8,
     .ctx = 8192, .draft = 0, .chunk = 256, .top_k = 20, .max_body = 4u << 20, .pmin = 0.6f, .temp = 0.7f, .top_p = 0.8f,
 };
 
@@ -64,6 +64,7 @@ static void usage(void) {
           "  --temp T --top-k K --top-p P   defaults when a request does not set them (0.7, 20, 0.8)\n"
           "  --no-think          end the prompt with an empty <think></think> block (no reasoning text)\n"
           "  --effort E          reasoning effort when thinking: xhigh (default), medium, low\n"
+          "  --no-cache          compute every prompt from the start (no prompt cache)\n"
           "  --queue N           the most waiting requests (default 8; more: HTTP 503)\n"
           "  --show-template     print the chat template of the model file and exit\n");
   exit(2);
@@ -333,8 +334,8 @@ static void run_job(job *j) {
   }
   sb_free(&calls);
   const double gs = st.gen_ms / 1e3;
-  fprintf(stderr, "[%lu] prompt %u tokens (%.0f tokens/s), output %u tokens in %.2f s (%.1f tokens/s)", j->rid, st.n_prompt,
-          st.prefill_ms > 0 ? 1e3 * st.n_prompt / st.prefill_ms : 0.0, n_gen, gs, gs > 0 ? n_gen / gs : 0.0);
+  fprintf(stderr, "[%lu] prompt %u tokens (%u cached%s, %.0f ms), output %u tokens in %.2f s (%.1f tokens/s)", j->rid, st.n_prompt,
+          st.cached, st.cache_hit == 1 ? " with the last answer" : "", st.prefill_ms, n_gen, gs, gs > 0 ? n_gen / gs : 0.0);
   if (st.steps) fprintf(stderr, ", mtp %.2f tokens per step", (double)st.n_out / st.steps);
   if (n_calls) fprintf(stderr, ", %d tool calls", n_calls);
   fprintf(stderr, ", %s\n", j->finish == 2 ? "client gone" : fin);
@@ -517,7 +518,8 @@ static void handle_chat(int fd, const request *r) {
   if (num_field(root, "top_p", &v)) j->gp.top_p = (float)v;
   if (num_field(root, "top_k", &v)) j->gp.top_k = v < 0 ? 0 : (uint32_t)v;
   j->gp.seed = num_field(root, "seed", &v) ? (uint64_t)(int64_t)v : (uint64_t)time(NULL) ^ ((uint64_t)fd << 32);
-  j->gp.draft = O.draft, j->gp.pmin = O.pmin, j->gp.chunk = O.chunk;
+  j->gp.draft = O.draft, j->gp.pmin = O.pmin, j->gp.chunk = O.chunk, j->gp.cache = O.cache;
+  j->gp.stops = STOP_IDS, j->gp.n_stops = 4;
   if (num_field(root, "n", &v) && v != 1) {
     http_error(fd, 400, "invalid_request_error", "only n = 1 is supported");
     goto bad;
@@ -654,6 +656,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--top-p")) O.top_p = (float)atof(ARG);
     else if (!strcmp(a, "--no-think")) O.think = 0;
     else if (!strcmp(a, "--effort")) O.effort = ARG;
+    else if (!strcmp(a, "--no-cache")) O.cache = 0;
     else if (!strcmp(a, "--queue")) O.queue_max = atoi(ARG);
     else if (!strcmp(a, "--show-template")) show_template = 1;
     else if (a[0] != '-' && !O.path) O.path = a;

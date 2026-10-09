@@ -168,7 +168,7 @@ int main(int argc, char **argv) {
     double gms = 0;
     uint32_t steps = 0, acc = 0, drafted = 0;
     total = spec_generate(b, &m, &gr, out, n_prompt, total, draft, eos_v, stop, tok, hrow, &sp, m.vocab, &gms, &steps, &acc,
-                          pmin, &drafted, NULL, NULL);
+                          pmin, &drafted, NULL, NULL, stop ? &eos_v : NULL, stop ? 1u : 0u, NULL, NULL);
     const uint32_t gen = total - n_prompt - 1; /* the tokens after the first */
     fprintf(stderr, "mtp: %u steps, %u drafts accepted of %u (%.1f%%), %.2f tokens per step\n", steps, acc, drafted,
             drafted ? 100.0 * acc / drafted : 0.0, steps ? (double)gen / steps : 0.0);

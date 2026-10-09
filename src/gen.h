@@ -53,7 +53,12 @@ uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32_t *tok
  * ends. Returns the number of tokens in out. */
 uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out, uint32_t n_prompt, uint32_t total, uint32_t D,
                        int64_t eos, int stop, uint32_t first, uint32_t hrow, sampler *sp, uint32_t V, double *gen_ms,
-                       uint32_t *n_steps, uint32_t *n_acc, float pmin, uint32_t *n_drafted, gen_emit emit, void *ectx);
+                       uint32_t *n_steps, uint32_t *n_acc, float pmin, uint32_t *n_drafted, gen_emit emit, void *ectx,
+                       const int64_t *stops, uint32_t n_stops, uint32_t *p_done, uint32_t *h_row);
+/* stops (n_stops ids, or NULL): a draft that is a stop token is not accepted,
+ * so the model does not run past the stop token (as in plain decoding); the
+ * output is the same. p_done (or NULL): the positions done at the end (the
+ * state is after out[0 .. *p_done)); h_row: the row of h_out that holds h(*p_done - 1). */
 
 /* ---- one request (ie-serve) ---- */
 typedef struct {
@@ -64,6 +69,9 @@ typedef struct {
   uint32_t draft;   /* 0: no MTP; 1 .. 7: drafts per step (GPU, the graph built with the MTP head) */
   float pmin;       /* --draft-pmin */
   uint32_t chunk;   /* prompt chunk (GPU) */
+  int cache;        /* use and update the prompt cache (needs backend.snap) */
+  const int64_t *stops; /* the stop token ids (n_stops; -1 entries are ignored) */
+  uint32_t n_stops;
   gen_emit emit;
   void *ctx;
 } gen_params;
@@ -72,6 +80,8 @@ typedef struct {
   uint32_t n_prompt, n_out; /* n_out: tokens made (also those after a stop) */
   double prefill_ms, gen_ms;
   uint32_t steps, acc, drafted; /* MTP */
+  uint32_t cached; /* prompt tokens taken from the prompt cache (not computed again) */
+  int cache_hit;   /* the snapshot used: -1 none, 0 the last prompt, 1 the last prompt and answer */
 } gen_stats;
 
 typedef struct {
@@ -80,13 +90,21 @@ typedef struct {
   const graph *g;
   sampler sp;   /* scratch arrays allocated by gen_init */
   float *logits; /* vocab floats */
+  /* The prompt cache: two snapshots of the last request, after its first
+   * snap_n[k] tokens snap_toks[k]: k = 0, the prompt but its last token;
+   * k = 1, the prompt and the answer (all tokens that were run). The KV
+   * caches still hold those positions: later runs write only higher ones. */
+  uint32_t *snap_toks[2], snap_n[2], snap_cap[2];
 } gen_ctx;
 
 void gen_init(gen_ctx *c, backend *b, const model *m, const graph *g);
 void gen_free(gen_ctx *c);
-/* Run the prompt (positions 0 .. n_prompt - 1; the old state is not used)
- * and generate up to p->max_new tokens. The caller checks that n_prompt +
- * max_new + draft <= the graph's n_ctx. */
+/* Run the prompt (positions 0 .. n_prompt - 1) and generate up to
+ * p->max_new tokens. With p->cache, a prompt that starts with the cached
+ * tokens continues from the snapshot (the result is close to, but not
+ * bitwise the same as, the full prompt: the chunks differ), and the snapshot
+ * is then taken for this prompt. The caller checks that n_prompt + max_new
+ * + draft <= the graph's n_ctx. */
 void gen_run(gen_ctx *c, const uint32_t *prompt, uint32_t n_prompt, const gen_params *p, gen_stats *st);
 
 #endif

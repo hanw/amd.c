@@ -39,6 +39,7 @@ make build/ie-serve build/ie_kernels.hsaco
 | `--no-think` | 关 | 提示末尾加一个空的 `<think></think>`，模型不输出推理过程 |
 | `--effort E` | xhigh | 思考时的推理强度：xhigh、medium、low（模板里的 reasoning_effort） |
 | `--queue N` | 8 | 最多排队的请求数。超过时返回 HTTP 503 |
+| `--no-cache` | 关 | 关闭提示缓存，每个请求都从位置 0 计算 |
 | `--show-template` | - | 打印模型文件里的聊天模板，然后退出 |
 
 ## 3. 接口
@@ -79,6 +80,20 @@ make build/ie-serve build/ie_kernels.hsaco
 curl -sN http://127.0.0.1:8000/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"用三段话介绍上海的历史"}],"stream":true}'
 ```
+
+### 提示缓存
+
+名词：**提示缓存**指新请求的提示开头和上一个请求相同时，服务跳过相同的部分，只计算新增的 token。
+
+1. 线性注意力（GDN）的状态不能退回到中间位置，所以服务在两个时刻各保存一份快照（只在显存里复制线性注意力的状态、卷积环和 MTP 的 h 输入；KV 缓存不复制，因为后面的计算只写更高的位置）：
+   - 快照 0：提示的最后一个 token 之前。
+   - 快照 1：回答结束时（提示加上已经计算过的回答 token）。
+2. 新请求的 token 以快照 1 的 token 开头时，从快照 1 继续；否则以快照 0 的 token 开头时，从快照 0 继续；否则从位置 0 开始。
+3. 多轮对话时，上一轮的提示和回答（包括推理）都不再计算，只计算新的用户消息。
+4. 缓存只有一份，只对应最后一个请求。注意：Open WebUI 在每次聊天后会发一个生成标题的请求，它会替换缓存。如果你想让多轮对话一直命中缓存，可以在 Open WebUI 里关掉标题生成。
+5. 使用缓存时，提示的分块和不用缓存时不同，所以数值结果接近但不逐位相同。贪心解码时，检查中的回答相同（见第 6 节）。
+6. 使用 MTP 时，草稿里的停止 token 不再被接受，这样模型不会计算到停止 token 之后。输出不变。
+7. 日志里的 `cached N` 是跳过的 token 数，`with the last answer` 表示用了快照 1。设置 `IE_SERVE_DEBUG=1` 时，如果快照 1 没有命中，日志会打印两组 token 第一次不同的位置。
 
 ## 4. 连接 Open WebUI
 
@@ -133,6 +148,12 @@ amd-gpu-host 上的容器另外加了 `-e ENABLE_OLLAMA_API=false -e ENABLE_TAGS
 5. 工具调用的生成：模型一次调用了两个工具（上海、北京，`days` 是整数 2）；流式输出时返回了 `tool_calls`；
    把工具结果发回后，模型给出了正确的最终回答。
 
+6. 提示缓存：`build/cache_check` 先运行提示 A，再运行"A 加回答加 7 个 token"（用快照 1），再运行同一个提示（用快照 0），最后不用缓存运行同一个提示。
+   - CPU（逐个 token 计算）：Qwen3.5-0.8B（有线性注意力）和小模型的采样回答完全相同。`make test` 包含小模型的这项检查。
+   - GPU（27B）：贪心解码时，有无缓存、有无 MTP 的回答都相同。温度 1 的全词表采样时回答不同，原因是提示分块不同。
+   - 真实对话：5,385 个 token 的文档加一个问题，第二轮跳过 5,469 个 token，预填充从 6.7 秒降到 0.13 秒。
+   - `ie-run` 的输出不变（不用草稿、7 个草稿、7 个草稿加采样）。
+
 重复第 4 项检查：
 
 ```
@@ -164,7 +185,7 @@ python3 tools/make_tiny_chat_gguf.py ../llama.cpp/models/ggml-vocab-qwen35.gguf 
 ## 9. 限制
 
 - 一次只运行一个请求。其他请求排队。
-- 每个请求从位置 0 重新计算整个提示。多轮对话时，前面的对话每次都重新预填充。
+- 提示缓存只有一份，只对应最后一个请求。
 - 不支持图片、`stop` 字符串、`logprobs`、`n > 1`。`tool_choice` 只认 `"none"`；强制调用某个工具的写法不支持。
 - 只支持 GPT2 字节级词表和 ChatML 模板（Qwen2、Qwen3.5、Qwen3.8）。
 - 只监听 IPv4 地址。

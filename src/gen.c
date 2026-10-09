@@ -177,7 +177,8 @@ uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32_t *tok
  * is the prompt; returns the number of tokens in out. */
 uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out, uint32_t n_prompt, uint32_t total, uint32_t D,
                        int64_t eos, int stop, uint32_t first, uint32_t hrow, sampler *sp, uint32_t V, double *gen_ms,
-                       uint32_t *n_steps, uint32_t *n_acc, float pmin, uint32_t *n_drafted, gen_emit emit, void *ectx) {
+                       uint32_t *n_steps, uint32_t *n_acc, float pmin, uint32_t *n_drafted, gen_emit emit, void *ectx,
+                       const int64_t *stops, uint32_t n_stops, uint32_t *p_done, uint32_t *h_row) {
   /* With sampling (temp > 0): the model samples its token a_j after each
    * of t(P), d1, .., dD from its own logits, and d_(j+1) is accepted while
    * it equals a_j ("sample and match"). The drafts are fixed (the MTP
@@ -236,7 +237,12 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
     sample_ms += now_ms() - ts0;
     /* (4) accept */
     k = 0;
-    while (k < nd && d[k + 1] == a[k]) k++;
+    while (k < nd && d[k + 1] == a[k]) {
+      int st = 0;
+      for (uint32_t s = 0; s < n_stops; s++) st |= stops[s] >= 0 && (int64_t)d[k + 1] == stops[s];
+      if (st) break; /* the stop token is given out as a[k], not run */
+      k++;
+    }
     if (getenv("IE_SPEC_TRACE")) {
       fprintf(stderr, "step P=%u t=%u drafts", P, tP);
       for (uint32_t j = 1; j <= nd; j++) fprintf(stderr, " %u", d[j]);
@@ -257,6 +263,7 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
   }
   SPEC_EMIT(); /* the last step's tokens (the result does not matter now) */
 #undef SPEC_EMIT
+  if (p_done) *p_done = P, *h_row = hrow ? hrow : k; /* the last verify's row k holds h(P - 1) */
   *gen_ms = now_ms() - t0;
   if (lg) fprintf(stderr, "sampling: %.1f ms in all (%.3f ms per step)\n", sample_ms, *n_steps ? sample_ms / *n_steps : 0.0);
   free(lg);
@@ -279,8 +286,50 @@ void gen_init(gen_ctx *c, backend *b, const model *m, const graph *g) {
 }
 
 void gen_free(gen_ctx *c) {
-  free(c->sp.idx), free(c->sp.pr), free(c->sp.cv), free(c->sp.ci), free(c->logits);
+  free(c->sp.idx), free(c->sp.pr), free(c->sp.cv), free(c->sp.ci), free(c->logits), free(c->snap_toks[0]), free(c->snap_toks[1]);
   memset(c, 0, sizeof *c);
+}
+
+/* The prompt tokens toks[start .. end) at their positions, in chunks (GPU),
+ * as prefill does but from any start: the MTP h input for start (row 0 of
+ * mtp_h) is already set. Returns the greedy token after the last one;
+ * *hrow: the row of h_out that holds h(end - 1). */
+static uint32_t prefill_range(backend *b, const graph *g, const uint32_t *toks, uint32_t start, uint32_t end, uint32_t chunk,
+                              int mtp, uint32_t *hrow) {
+  uint32_t a[512], d[512], last = 0, T = 1;
+  if (chunk > 512) chunk = 512;
+  b->all_logits = 0;
+  for (uint32_t p0 = start; p0 < end; p0 += T) {
+    T = end - p0 < chunk ? end - p0 : chunk;
+    b->run(b, 0, toks + p0, T, p0, 1, a, NULL);
+    b->accept(b, T - 1);
+    last = a[T - 1];
+    if (mtp) {
+      if (T > 1) b->copy_rows(b, g->mtp_h, 1, g->h_out, 0, T - 1);
+      b->run(b, 1, toks + p0, T, p0, 1, d, NULL);
+      b->copy_rows(b, g->mtp_h, 0, g->h_out, T - 1, 1);
+    }
+  }
+  *hrow = T - 1;
+  return last;
+}
+
+/* Snapshot k: save the state, and keep the tokens a[0 .. na) and b[0 .. nb) that it is after. */
+static void cache_save(gen_ctx *c, int k, int hbuf, const uint32_t *a, uint32_t na, const uint32_t *b, uint32_t nb) {
+  const uint32_t n = na + nb;
+  if (n > c->snap_cap[k]) {
+    c->snap_cap[k] = n + 1024;
+    c->snap_toks[k] = realloc(c->snap_toks[k], (size_t)c->snap_cap[k] * 4);
+    if (!c->snap_toks[k]) ie_die("gen: out of memory");
+  }
+  c->b->snap(c->b, 1, k, hbuf);
+  memcpy(c->snap_toks[k], a, (size_t)na * 4);
+  if (nb) memcpy(c->snap_toks[k] + na, b, (size_t)nb * 4);
+  c->snap_n[k] = n;
+}
+/* 1 if the snapshot k can start this prompt: its tokens begin the prompt, and at least one more token follows */
+static int cache_fits(const gen_ctx *c, int k, const uint32_t *prompt, uint32_t n) {
+  return c->snap_n[k] && n > c->snap_n[k] && !memcmp(prompt, c->snap_toks[k], (size_t)c->snap_n[k] * 4);
 }
 
 void gen_run(gen_ctx *c, const uint32_t *prompt, uint32_t n_prompt, const gen_params *p, gen_stats *st) {
@@ -294,11 +343,39 @@ void gen_run(gen_ctx *c, const uint32_t *prompt, uint32_t n_prompt, const gen_pa
   st->n_prompt = n_prompt;
 
   /* the prompt: positions 0 .. n_prompt - 1 (position 0 starts a new
-   * sequence: the linear attention state and the conv ring read as zero) */
+   * sequence: the linear attention state and the conv ring read as zero).
+   * The prompt cache: if this prompt starts with the cached snap_n tokens
+   * (and has at least one more), restore the snapshot and start at snap_n. */
+  const int mtp = p->draft > 0, cache = p->cache && b->snap, hbuf = mtp ? g->mtp_h : -1;
+  uint32_t S = 0;
+  st->cache_hit = -1;
+  if (cache)
+    for (int k = 1; k >= 0; k--) /* the longer one first */
+      if (cache_fits(c, k, prompt, n_prompt)) { st->cache_hit = k, S = c->snap_n[k]; break; }
+  st->cached = S;
+  if (cache && st->cache_hit != 1 && c->snap_n[1] && getenv("IE_SERVE_DEBUG")) { /* why the last answer did not fit */
+    uint32_t i = 0;
+    while (i < c->snap_n[1] && i < n_prompt && prompt[i] == c->snap_toks[1][i]) i++;
+    fprintf(stderr, "cache: snapshot 1 (%u tokens) differs from the prompt (%u tokens) at %u:", c->snap_n[1], n_prompt, i);
+    for (uint32_t k = i > 3 ? i - 3 : 0; k < i + 5 && k < c->snap_n[1]; k++) fprintf(stderr, " %u", c->snap_toks[1][k]);
+    fprintf(stderr, " | prompt:");
+    for (uint32_t k = i > 3 ? i - 3 : 0; k < i + 5 && k < n_prompt; k++) fprintf(stderr, " %u", prompt[k]);
+    fprintf(stderr, "\n");
+  }
   uint32_t first, hrow = 0;
   const double t0 = now_ms();
-  if (b->run) { /* GPU: chunks, as ie-run */
-    first = prefill(b, g, V, prompt, n_prompt, p->chunk, p->draft > 0, NULL, &hrow);
+  if (S) b->snap(b, 0, st->cache_hit, hbuf);
+  if (cache) c->snap_n[1] = 0; /* this request changes the positions after the prompt */
+  else c->snap_n[0] = c->snap_n[1] = 0; /* and a run without the cache changes all positions */
+  if (b->run) { /* GPU: chunks */
+    if (!S && mtp) b->copy_rows(b, g->mtp_h, 0, -1, 0, 1); /* h(-1) = 0 */
+    if (!cache) first = prefill_range(b, g, prompt, 0, n_prompt, p->chunk, mtp, &hrow); /* as ie-run */
+    else { /* all but the last token, the snapshot, then the last token */
+      if (n_prompt - 1 > S) prefill_range(b, g, prompt, S, n_prompt - 1, p->chunk, mtp, &hrow);
+      if (n_prompt - 1 > S) cache_save(c, 0, hbuf, prompt, n_prompt - 1, NULL, 0);
+      else if (st->cache_hit == 1) cache_save(c, 0, hbuf, prompt, n_prompt - 1, NULL, 0); /* snapshot 0 is of another prompt */
+      first = prefill_range(b, g, prompt, n_prompt - 1, n_prompt, p->chunk, mtp, &hrow);
+    }
     if (sp->temp > 0.0f) {
       if (gpu_cands(sp, b, g, hrow, 1, V, sp->cv, sp->ci)) first = sample_cands(sp, sp->cv, sp->ci, sample_k(sp, V));
       else {
@@ -308,7 +385,8 @@ void gen_run(gen_ctx *c, const uint32_t *prompt, uint32_t n_prompt, const gen_pa
     }
   } else { /* CPU: one token per step */
     double ms;
-    for (uint32_t pos = 0; pos + 1 < n_prompt; pos++) b->step(b, prompt[pos], pos, NULL, &ms);
+    for (uint32_t pos = S; pos + 1 < n_prompt; pos++) b->step(b, prompt[pos], pos, NULL, &ms);
+    if (cache && (n_prompt - 1 > S || st->cache_hit == 1)) cache_save(c, 0, -1, prompt, n_prompt - 1, NULL, 0);
     first = b->step(b, prompt[n_prompt - 1], n_prompt - 1, sp->temp > 0.0f ? c->logits : NULL, &ms);
     if (sp->temp > 0.0f) first = sample(sp, c->logits, V);
   }
@@ -319,16 +397,22 @@ void gen_run(gen_ctx *c, const uint32_t *prompt, uint32_t n_prompt, const gen_pa
     uint32_t *out = malloc((size_t)total * 4);
     if (!out) ie_die("gen_run: out of memory");
     memcpy(out, prompt, (size_t)n_prompt * 4);
+    uint32_t done = 0, hr = 0;
     const uint32_t n = spec_generate(b, c->m, g, out, n_prompt, total, p->draft, -1, 0, first, hrow, sp, V, &st->gen_ms,
-                                     &st->steps, &st->acc, p->pmin, &st->drafted, p->emit, p->ctx);
+                                     &st->steps, &st->acc, p->pmin, &st->drafted, p->emit, p->ctx, p->stops, p->n_stops, &done, &hr);
     st->n_out = n - n_prompt;
+    if (cache && done > n_prompt) { /* snapshot 1: after the prompt and the answer tokens that were run */
+      b->copy_rows(b, g->mtp_h, 0, g->h_out, hr, 1); /* the MTP h input of the next position */
+      cache_save(c, 1, hbuf, out, done, NULL, 0);
+    }
     free(out);
     return;
   }
 
   /* one token per step, as the ie-run loop */
   const double t1 = now_ms();
-  uint32_t tok = first, pos = n_prompt;
+  uint32_t tok = first, pos = n_prompt, *ov = cache ? malloc((size_t)p->max_new * 4) : NULL;
+  if (ov) ov[0] = first;
   st->n_out = 1;
   if (!p->emit(p->ctx, &tok, 1)) {
     for (; st->n_out < p->max_new; st->n_out++, pos++) {
@@ -343,8 +427,12 @@ void gen_run(gen_ctx *c, const uint32_t *prompt, uint32_t n_prompt, const gen_pa
         }
       }
       tok = next;
+      if (ov) ov[st->n_out] = tok;
       if (p->emit(p->ctx, &tok, 1)) { st->n_out++; break; }
     }
   }
   st->gen_ms = now_ms() - t1;
+  /* snapshot 1: the last token given out was not run; all before it were */
+  if (ov && st->n_out > 1) cache_save(c, 1, hbuf, prompt, n_prompt, ov, st->n_out - 1);
+  free(ov);
 }

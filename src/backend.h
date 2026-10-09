@@ -32,6 +32,13 @@ struct backend {
    * idx get n * K entries, per row value descending, equal values smaller
    * index first. Returns 0 (and does nothing) if K is too large. */
   int (*topk)(backend *b, int id, uint32_t r0, uint32_t n, uint32_t nv, uint32_t K, float *val, uint32_t *idx);
+  /* The prompt cache (ie-serve). save = 1: copy the state that is not kept
+   * per position (the linear attention state of the current slot and the
+   * conv ring) and row 0 of buffer hbuf (-1: none; the MTP h input) to
+   * snapshot k (0 or 1); save = 0: copy snapshot k back. The KV caches are
+   * not copied: runs after the snapshot write only higher positions. NULL if
+   * the backend has no snapshots. */
+  void (*snap)(backend *b, int save, int k, int hbuf);
   /* 1: prompt chunks compute the logits of every token (perplexity); 0
    * (default): only of the last token */
   int all_logits;

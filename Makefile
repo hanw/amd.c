@@ -34,6 +34,10 @@ SERVE_HDR = $(HDR) src/tok.h src/tok_unicode.h src/json.h src/chat.h
 $(B)/ie-serve: $(SERVE_SRC) $(SERVE_HDR) | $(B)
 	$(CC) $(CFLAGS) -o $@ $(SERVE_SRC) $(LDLIBS) -lpthread
 
+# The prompt cache of gen_run (also in make test, on the CPU)
+$(B)/cache_check: tools/cache_check.c $(ENGINE_SRC) $(HDR) | $(B)
+	$(CC) $(CFLAGS) -o $@ tools/cache_check.c $(ENGINE_SRC) $(LDLIBS)
+
 # The chat template: tools/chat_check.py TEMPLATE.txt build/chat_render (SERVE.md section 6)
 $(B)/chat_render: tools/chat_render.c src/chat.c src/json.c src/chat.h src/json.h | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/chat_render.c src/chat.c src/json.c
@@ -72,7 +76,7 @@ MODELS = $(B)/tiny-qwen2.gguf $(B)/tiny-llama.gguf $(B)/tiny-llama-k.gguf
 $(MODELS) &: tools/make_tiny_gguf.py | $(B)
 	$(PYTHON) tools/make_tiny_gguf.py $(B)
 
-test: all $(B)/laws_test $(B)/kernel_test $(MODELS)
+test: all $(B)/laws_test $(B)/kernel_test $(B)/cache_check $(MODELS)
 	@echo "== laws_test (the laws of laws/ie_laws.cpp on random inputs)"
 	./$(B)/laws_test
 	@echo "== kernel_test (CPU GEMV vs plain dot products, repack vs GGUF)"
@@ -89,6 +93,9 @@ test: all $(B)/laws_test $(B)/kernel_test $(MODELS)
 	./$(B)/ie-run $(B)/tiny-llama-k.gguf --tokens 1,300,77,259,3 --n 10 --dump-logits $(B)/llamak.logits
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-llama-k.gguf $(B)/llamak.logits --mode q8 --tol-median 1e-5 --tol 2e-3
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-llama-k.gguf $(B)/llamak.logits --mode float --tol 5e-2
+	@echo "== prompt cache (gen_run): with and without the cache, the same answers (CPU)"
+	./$(B)/cache_check $(B)/tiny-qwen2.gguf
+	./$(B)/cache_check $(B)/tiny-llama-k.gguf
 	@echo "== GPU backend without a GPU: must fail with a clear message"
 	! ./$(B)/ie-run $(B)/tiny-qwen2.gguf --backend gpu --hsaco $(B)/ie_kernels.hsaco --n 1 2> $(B)/gpu.err
 	cat $(B)/gpu.err
