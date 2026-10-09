@@ -235,7 +235,8 @@ static jval *pval(jp *p) {
     char *end;
     jval *v = mk(J_NUM);
     v->num = strtod(tmp, &end);
-    if (*end) { free(v); return fail(p, "bad number"); }
+    if (*end || !k) { free(v); return fail(p, "bad number"); }
+    v->raw = strdup(tmp);
     return v;
   }
   return fail(p, "unexpected character");
@@ -255,7 +256,7 @@ void json_free(jval *v) {
   while (v) {
     jval *nx = v->next;
     json_free(v->kid);
-    free(v->str), free(v->key), free(v);
+    free(v->str), free(v->key), free(v->raw), free(v);
     v = nx;
   }
 }

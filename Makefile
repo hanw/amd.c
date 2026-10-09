@@ -29,10 +29,14 @@ $(B)/ie-run: $(SRC) $(HDR) | $(B)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
 
 # ie-serve: the OpenAI-compatible HTTP server (SERVE.md)
-SERVE_SRC = $(ENGINE_SRC) src/tok.c src/json.c src/serve.c
-SERVE_HDR = $(HDR) src/tok.h src/tok_unicode.h src/json.h
+SERVE_SRC = $(ENGINE_SRC) src/tok.c src/json.c src/chat.c src/serve.c
+SERVE_HDR = $(HDR) src/tok.h src/tok_unicode.h src/json.h src/chat.h
 $(B)/ie-serve: $(SERVE_SRC) $(SERVE_HDR) | $(B)
 	$(CC) $(CFLAGS) -o $@ $(SERVE_SRC) $(LDLIBS) -lpthread
+
+# The chat template: tools/chat_check.py TEMPLATE.txt build/chat_render (SERVE.md section 6)
+$(B)/chat_render: tools/chat_render.c src/chat.c src/json.c src/chat.h src/json.h | $(B)
+	$(CC) $(CFLAGS) -o $@ tools/chat_render.c src/chat.c src/json.c
 
 # The tokenizer against llama.cpp's tokenizer tests (needs a llama.cpp checkout):
 #   make tokcheck LLAMA_CPP=../llama.cpp

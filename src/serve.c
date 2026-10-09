@@ -30,6 +30,7 @@
 #include "common.h"
 #include "gen.h"
 #include "gguf.h"
+#include "chat.h"
 #include "json.h"
 #include "model.h"
 #include "tok.h"
@@ -89,13 +90,19 @@ typedef struct job {
   gen_params gp;
   char id[48];
   long created;
+  jval *req;           /* the request (the tools' schemas are used for the answer) */
+  const jval *tools;   /* its "tools" array, or NULL */
   struct job *next;
   /* while running */
-  sbuf pend, content; /* bytes not yet sent (a cut UTF-8 sequence), the whole text (not streaming) */
-  uint32_t n_tok;     /* output tokens, without the stop token */
-  int finish;         /* 0: length, 1: stop, 2: client gone */
-  int think;          /* the prompt ends with <think>\n: the answer text starts with it too */
-  int dead;           /* a write failed */
+  sbuf all;            /* the whole answer text (with "<think>\n" first when thinking) */
+  size_t sent;         /* streaming: bytes of all sent; else the end of the content */
+  size_t scan;         /* all is searched for </think> and <tool_call> from about here */
+  long think_end;      /* the end of "</think>" in all (0 without thinking; -1: not yet) */
+  long tc_at;          /* the start of the first "<tool_call>" (-1: none) */
+  uint32_t n_tok;      /* output tokens, without the stop token */
+  int finish;          /* 0: length, 1: stop, 2: client gone */
+  int think;           /* the prompt ends with <think>\n: the answer text starts with it too */
+  int dead;            /* a write failed */
 } job;
 
 static pthread_mutex_t QM = PTHREAD_MUTEX_INITIALIZER;
@@ -165,10 +172,18 @@ static int is_stop(uint32_t t) {
     if (STOP_IDS[i] >= 0 && (uint32_t)STOP_IDS[i] == t) return 1;
   return 0;
 }
+static void sse_begin(sbuf *b, const job *j) {
+  sb_printf(b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", j->id, j->created);
+  sb_json_str(b, MODEL_ID, strlen(MODEL_ID));
+}
+static void sse_send(job *j, sbuf *b) {
+  if (send_all(j->fd, b->p, b->n)) j->dead = 1;
+  sb_free(b);
+}
+/* text (NULL: the role chunk) or finish */
 static void sse_chunk(job *j, const char *text, size_t n, const char *finish) {
   sbuf b = {0};
-  sb_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", j->id, j->created);
-  sb_json_str(&b, MODEL_ID, strlen(MODEL_ID));
+  sse_begin(&b, j);
   sb_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{");
   if (!text) sb_puts(&b, "\"role\":\"assistant\",\"content\":\"\"");
   else if (n) sb_puts(&b, "\"content\":"), sb_json_str(&b, text, n);
@@ -176,17 +191,67 @@ static void sse_chunk(job *j, const char *text, size_t n, const char *finish) {
   if (finish) sb_printf(&b, "\"%s\"", finish);
   else sb_puts(&b, "null");
   sb_puts(&b, "}]}\n\n");
-  if (send_all(j->fd, b.p, b.n)) j->dead = 1;
-  sb_free(&b);
+  sse_send(j, &b);
 }
-/* the bytes pend[0 .. n): to the client (streaming) or to the content */
-static void out_text(job *j, size_t n) {
-  if (!n) return;
-  if (j->stream) sse_chunk(j, j->pend.p, n, NULL);
-  else sb_add(&j->content, j->pend.p, n);
-  memmove(j->pend.p, j->pend.p + n, j->pend.n - n);
-  j->pend.n -= n;
-  j->pend.p[j->pend.n] = 0;
+/* the tool calls (a JSON array from chat_tool_calls) as one delta, each with its index */
+static void sse_tool_calls(job *j, const char *arr, size_t n) {
+  char err[64];
+  jval *a = json_parse(arr, n, err, sizeof err);
+  sbuf b = {0};
+  sse_begin(&b, j);
+  sb_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[");
+  int k = 0;
+  for (const jval *c = a ? a->kid : NULL; c; c = c->next, k++) {
+    sbuf one = {0};
+    py_json(&one, c);
+    sb_printf(&b, "%s{\"index\":%d, ", k ? "," : "", k);
+    sb_add(&b, one.p + 1, one.n - 1); /* the object without its "{" */
+    sb_free(&one);
+  }
+  sb_puts(&b, "]},\"finish_reason\":null}]}\n\n");
+  sse_send(j, &b);
+  json_free(a);
+}
+
+static const char *find_in(const char *s, size_t from, size_t n, const char *pat) {
+  const size_t k = strlen(pat);
+  for (size_t i = from; i + k <= n; i++)
+    if (!memcmp(s + i, pat, k)) return s + i;
+  return NULL;
+}
+/* How much of all can go to the client now. With tools, the text from the
+ * first <tool_call> after the reasoning is held back (it becomes tool_calls),
+ * and so is an end of the text that could be the start of "<tool_call>". */
+static size_t safe_end(job *j, int final) {
+  const char *s = j->all.p;
+  const size_t n = j->all.n;
+  if (!s) return 0;
+  if (j->tools && j->tc_at < 0) {
+    const size_t from = j->scan > 16 ? j->scan - 16 : 0;
+    if (j->think_end < 0) {
+      const char *e = find_in(s, from, n, "</think>");
+      if (e) j->think_end = (long)(e - s) + 8;
+    }
+    if (j->think_end >= 0) {
+      const size_t f2 = from > (size_t)j->think_end ? from : (size_t)j->think_end;
+      const char *c = find_in(s, f2, n, "<tool_call>");
+      if (c) j->tc_at = (long)(c - s);
+    }
+    j->scan = n;
+  }
+  if (j->tc_at >= 0) return (size_t)j->tc_at;
+  if (final) return n;
+  size_t lim = n;
+  if (j->tools && j->think_end >= 0) /* hold back a possible start of <tool_call> */
+    for (size_t k = 10; k >= 1; k--)
+      if (n >= (size_t)j->think_end + k && !memcmp(s + n - k, "<tool_call>", k)) { lim = n - k; break; }
+  return utf8_whole(s, lim);
+}
+static void flush_text(job *j, int final) {
+  const size_t e = safe_end(j, final);
+  if (e <= j->sent) return;
+  if (j->stream) sse_chunk(j, j->all.p + j->sent, e - j->sent, NULL);
+  j->sent = e;
 }
 static int on_tokens(void *ctx, const uint32_t *t, uint32_t n) {
   job *j = ctx;
@@ -197,12 +262,11 @@ static int on_tokens(void *ctx, const uint32_t *t, uint32_t n) {
     }
     uint32_t len;
     char *s = model_detok(&M, t[i], &len);
-    sb_add(&j->pend, s, len);
+    sb_add(&j->all, s, len);
     free(s);
     j->n_tok++;
   }
-  if (!j->pend.p) sb_add(&j->pend, "", 0);
-  out_text(j, utf8_whole(j->pend.p, j->pend.n)); /* keep a cut UTF-8 sequence for the next token */
+  flush_text(j, 0);
   if (j->dead || (j->n_tok % 8 == 0 && peer_gone(j->fd))) {
     j->finish = 2;
     return 1;
@@ -211,7 +275,6 @@ static int on_tokens(void *ctx, const uint32_t *t, uint32_t n) {
 }
 
 static void run_job(job *j) {
-  const char *fin;
   if (peer_gone(j->fd)) { /* gone while it waited in the queue */
     fprintf(stderr, "[%lu] client gone before the start\n", j->rid);
     return;
@@ -221,51 +284,67 @@ static void run_job(job *j) {
     if (send_all(j->fd, h, strlen(h))) return;
     sse_chunk(j, NULL, 0, NULL); /* the role */
   }
-  if (j->think) { /* the prompt opened <think>: the client sees the whole block (Open WebUI folds it) */
-    sb_add(&j->pend, "<think>\n", 8);
-    out_text(j, j->pend.n);
-  }
+  j->think_end = j->think ? -1 : 0, j->tc_at = -1;
+  sb_add(&j->all, "", 0);
+  if (j->think) sb_add(&j->all, "<think>\n", 8); /* the prompt opened <think>: the client sees the whole block (Open WebUI folds it) */
+  flush_text(j, 0);
   j->gp.emit = on_tokens, j->gp.ctx = j;
   gen_stats st;
   gen_run(&GC, j->prompt.v, j->prompt.n, &j->gp, &st);
-  if (j->pend.n) out_text(j, j->pend.n); /* the rest (an invalid sequence becomes U+FFFD) */
-  fin = j->finish == 1 ? "stop" : "length";
+
+  /* tool calls: the text from the first <tool_call> */
+  sbuf calls = {0};
+  char idp[64];
+  snprintf(idp, sizeof idp, "call_%lx%lu_", (unsigned long)T_START, j->rid);
+  int n_calls = 0;
+  if (j->tc_at >= 0 && j->finish != 2) {
+    n_calls = chat_tool_calls(j->all.p + j->tc_at, j->all.n - (size_t)j->tc_at, j->tools, idp, &calls);
+    if (!n_calls) j->tc_at = -1; /* not valid: send it as text */
+  }
+  flush_text(j, 1); /* the rest of the text (an invalid UTF-8 sequence becomes U+FFFD) */
+  const char *fin = n_calls ? "tool_calls" : j->finish == 1 ? "stop" : "length";
 
   const uint32_t n_gen = j->n_tok;
   if (j->stream && j->finish != 2 && !j->dead) {
+    if (n_calls) sse_tool_calls(j, calls.p, calls.n);
     sse_chunk(j, "", 0, fin);
     if (j->usage) {
       sbuf b = {0};
-      sb_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", j->id, j->created);
-      sb_json_str(&b, MODEL_ID, strlen(MODEL_ID));
+      sse_begin(&b, j);
       sb_printf(&b, ",\"choices\":[],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}\n\n", j->prompt.n,
                 n_gen, j->prompt.n + n_gen);
-      send_all(j->fd, b.p, b.n);
-      sb_free(&b);
+      sse_send(j, &b);
     }
     send_all(j->fd, "data: [DONE]\n\n", 14);
   } else if (!j->stream && j->finish != 2) {
+    size_t cn = j->sent; /* the content: the text before the tool calls, without the white space before them */
+    if (n_calls)
+      while (cn && strchr(" \t\r\n", j->all.p[cn - 1])) cn--;
     sbuf b = {0};
     sb_printf(&b, "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":", j->id, j->created);
     sb_json_str(&b, MODEL_ID, strlen(MODEL_ID));
     sb_puts(&b, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
-    sb_json_str(&b, j->content.p ? j->content.p : "", j->content.n);
+    sb_json_str(&b, j->all.p ? j->all.p : "", cn);
+    if (n_calls) sb_puts(&b, ",\"tool_calls\":"), sb_add(&b, calls.p, calls.n);
     sb_printf(&b, "},\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}", fin,
               j->prompt.n, n_gen, j->prompt.n + n_gen);
     http_reply(j->fd, 200, "application/json", b.p, b.n);
     sb_free(&b);
   }
+  sb_free(&calls);
   const double gs = st.gen_ms / 1e3;
   fprintf(stderr, "[%lu] prompt %u tokens (%.0f tokens/s), output %u tokens in %.2f s (%.1f tokens/s)", j->rid, st.n_prompt,
           st.prefill_ms > 0 ? 1e3 * st.n_prompt / st.prefill_ms : 0.0, n_gen, gs, gs > 0 ? n_gen / gs : 0.0);
   if (st.steps) fprintf(stderr, ", mtp %.2f tokens per step", (double)st.n_out / st.steps);
+  if (n_calls) fprintf(stderr, ", %d tool calls", n_calls);
   fprintf(stderr, ", %s\n", j->finish == 2 ? "client gone" : fin);
 }
 
 static void job_free(job *j) {
-  close(j->fd);
+  if (j->fd >= 0) close(j->fd);
   tok_ids_free(&j->prompt);
-  sb_free(&j->pend), sb_free(&j->content);
+  sb_free(&j->all);
+  json_free(j->req);
   free(j);
 }
 
@@ -400,120 +479,15 @@ static int same_secret(const char *a, const char *b) {
 }
 
 /* ---- the request: chat ---- */
-/* The text of a message's content: a string, or an array of parts
- * {"type":"text","text":...}. NULL if another kind of part is in it. */
-static int content_text(const jval *c, sbuf *out) {
-  if (!c || c->t == J_NULL) return 1;
-  if (c->t == J_STR) { sb_add(out, c->str, c->slen); return 1; }
-  if (c->t != J_ARR) return 0;
-  for (const jval *p = c->kid; p; p = p->next) {
-    const jval *ty = json_get(p, "type"), *tx = json_get(p, "text");
-    if (!ty || ty->t != J_STR || strcmp(ty->str, "text") || !tx || tx->t != J_STR) return 0;
-    sb_add(out, tx->str, tx->slen);
+/* The prompt tokens: control tokens as ids, text without control tokens
+ * (a user cannot write <|im_start|> into the prompt). */
+static void prompt_tokens(const chat_prompt *p, tok_ids *out) {
+  for (size_t i = 0; i < p->n_seg; i++) {
+    const chat_seg *s = &p->seg[i];
+    if (s->kind == SEG_IM_START) tok_ids_push(out, (uint32_t)IM_START);
+    else if (s->kind == SEG_IM_END) tok_ids_push(out, (uint32_t)IM_END);
+    else tok_encode(TK, p->text.p + s->off, s->n, 0, out);
   }
-  return 1;
-}
-
-/* Strip ASCII white space at both ends (as Jinja's trim for this text). */
-static void trim_ws(const char **s, size_t *n) {
-  while (*n && strchr(" \t\n\r\v\f", (*s)[0])) (*s)++, (*n)--;
-  while (*n && strchr(" \t\n\r\v\f", (*s)[*n - 1])) (*n)--;
-}
-
-/* <|im_start|> TEXT <|im_end|> \n, with TEXT tokenized without control
- * tokens (a user cannot write <|im_start|> into the prompt) */
-static void turn(tok_ids *out, const sbuf *text, int close) {
-  tok_ids_push(out, (uint32_t)IM_START);
-  tok_encode(TK, text->p ? text->p : "", text->n, 0, out);
-  if (close) {
-    tok_ids_push(out, (uint32_t)IM_END);
-    tok_encode(TK, "\n", 1, 0, out);
-  }
-}
-
-/* The reasoning_effort instruction of the Qwen3.8 template ("" for medium). */
-static const char *effort_text(const char *e) {
-  if (!strcmp(e, "low") || !strcmp(e, "minimal"))
-    return "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without "
-           "unnecessary elaboration.";
-  if (!strcmp(e, "medium")) return "";
-  return "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider "
-         "plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
-}
-
-/* The chat template of the Qwen3.8 GGUF (tokenizer.chat_template; ie-serve
- * --show-template), without tools and images, as tokens:
- *   [<|im_start|>system\n(EFFORT\n\n)SYSTEM<|im_end|>\n]   (thinking on: always, for EFFORT)
- *   <|im_start|>user\nTEXT<|im_end|>\n
- *   <|im_start|>assistant\n<think>\nREASONING\n</think>\n\nTEXT<|im_end|>\n
- *   <|im_start|>assistant\n<think>\n              (thinking off: <think>\n\n</think>\n\n)
- * Contents are trimmed. For an earlier answer, REASONING is its
- * "reasoning_content", or the text before </think> in its content (Open
- * WebUI). 0 and a message in err if the messages are not valid. */
-static int chat_prompt(const jval *msgs, int think, const char *effort, tok_ids *out, char *err, size_t errn) {
-  if (!msgs || msgs->t != J_ARR || !msgs->kid) { snprintf(err, errn, "\"messages\" must be a non-empty array"); return 0; }
-  const char *ri = think ? effort_text(effort) : "";
-  int n_user = 0, first = 1;
-  for (const jval *m = msgs->kid; m; m = m->next, first = 0) {
-    const jval *role = json_get(m, "role");
-    if (!role || role->t != J_STR) { snprintf(err, errn, "a message has no \"role\""); return 0; }
-    const char *r = !strcmp(role->str, "developer") ? "system" : role->str;
-    if (strcmp(r, "system") && strcmp(r, "user") && strcmp(r, "assistant")) {
-      snprintf(err, errn, "role \"%.40s\" is not supported (system, user, assistant)", role->str);
-      return 0;
-    }
-    if (!strcmp(r, "system") && !first) { snprintf(err, errn, "a system message must be the first message"); return 0; }
-    n_user += !strcmp(r, "user");
-    sbuf c = {0}, s = {0};
-    if (!content_text(json_get(m, "content"), &c)) {
-      sb_free(&c);
-      snprintf(err, errn, "only text content is supported");
-      return 0;
-    }
-    const char *text = c.p ? c.p : "";
-    size_t tn = c.n;
-    if (!strcmp(r, "system")) {
-      trim_ws(&text, &tn);
-      if (tn || ri[0]) {
-        sb_puts(&s, "system\n");
-        if (ri[0]) sb_puts(&s, ri), sb_puts(&s, tn ? "\n\n" : "");
-        sb_add(&s, text, tn);
-        turn(out, &s, 1);
-      }
-    } else {
-      if (first && ri[0]) { /* no system message: the effort alone */
-        sb_puts(&s, "system\n"), sb_puts(&s, ri);
-        turn(out, &s, 1);
-        s.n = 0;
-      }
-      if (!strcmp(r, "user")) {
-        trim_ws(&text, &tn);
-        sb_puts(&s, "user\n"), sb_add(&s, text, tn);
-      } else {
-        const char *rs = "";
-        size_t rn = 0;
-        const jval *rc = json_get(m, "reasoning_content");
-        const char *e = NULL;
-        for (const char *p = text; (p = strstr(p, "</think>")); p++) e = p;
-        if (e) { /* Open WebUI style: <think>REASONING</think>TEXT */
-          rs = text, rn = (size_t)(e - text);
-          trim_ws(&rs, &rn);
-          if (rn >= 7 && !memcmp(rs, "<think>", 7)) rs += 7, rn -= 7;
-          tn -= (size_t)(e + 8 - text), text = e + 8;
-        } else if (rc && rc->t == J_STR) rs = rc->str, rn = rc->slen;
-        trim_ws(&rs, &rn), trim_ws(&text, &tn);
-        sb_puts(&s, "assistant\n<think>\n"), sb_add(&s, rs, rn), sb_puts(&s, "\n</think>\n\n"), sb_add(&s, text, tn);
-      }
-      turn(out, &s, 1);
-    }
-    sb_free(&s), sb_free(&c);
-  }
-  if (!n_user) { snprintf(err, errn, "no user message"); return 0; }
-  sbuf g = {0};
-  sb_puts(&g, think ? "assistant\n<think>\n" : "assistant\n<think>\n\n</think>\n\n");
-  turn(out, &g, 0);
-  sb_free(&g);
-  return 1;
 }
 
 static int num_field(const jval *o, const char *k, double *v) {
@@ -535,6 +509,7 @@ static void handle_chat(int fd, const request *r) {
   }
   job *j = calloc(1, sizeof *j);
   j->fd = fd;
+  j->req = root; /* the job frees it */
   double v;
   /* sampling: the request's values, else the server's defaults */
   j->gp.temp = O.temp, j->gp.top_p = O.top_p, j->gp.top_k = O.top_k;
@@ -561,10 +536,17 @@ static void handle_chat(int fd, const request *r) {
   if (ef && ef->t == J_STR) effort = ef->str;
   j->think = think;
 
-  if (!chat_prompt(json_get(root, "messages"), think, effort, &j->prompt, err, sizeof err)) {
+  /* tools: rendered into the prompt, and the answer's <tool_call> blocks become tool_calls */
+  const jval *tools = json_get(root, "tools"), *tc = json_get(root, "tool_choice");
+  if (!tools || tools->t != J_ARR || !tools->kid || (tc && tc->t == J_STR && !strcmp(tc->str, "none"))) tools = NULL;
+  j->tools = tools;
+  chat_prompt cp;
+  if (!chat_render(json_get(root, "messages"), tools, think, effort, &cp, err, sizeof err)) {
     http_error(fd, 400, "invalid_request_error", "%s", err);
     goto bad;
   }
+  prompt_tokens(&cp, &j->prompt);
+  chat_prompt_free(&cp);
   /* the room in the context: n_prompt + max_new + draft <= ctx */
   if (getenv("IE_SERVE_DEBUG")) { /* the prompt ids, to compare with llama-tokenize */
     sbuf b = {0};
@@ -580,7 +562,6 @@ static void handle_chat(int fd, const request *r) {
   uint32_t room = O.ctx - used;
   if ((num_field(root, "max_completion_tokens", &v) || num_field(root, "max_tokens", &v)) && v >= 1 && v < room) room = (uint32_t)v;
   j->gp.max_new = room;
-  json_free(root);
 
   pthread_mutex_lock(&QM);
   if (QN >= O.queue_max) {
@@ -600,11 +581,10 @@ static void handle_chat(int fd, const request *r) {
   const int waiting = QN - 1 + BUSY;
   pthread_cond_signal(&QC);
   pthread_mutex_unlock(&QM);
-  fprintf(stderr, "[%lu] queued: %u prompt tokens, max %u output tokens, %s, %d before it\n", j->rid, j->prompt.n, j->gp.max_new,
-          j->stream ? "stream" : "no stream", waiting);
+  fprintf(stderr, "[%lu] queued: %u prompt tokens, max %u output tokens, %s%s, %d before it\n", j->rid, j->prompt.n, j->gp.max_new,
+          j->stream ? "stream" : "no stream", j->tools ? ", tools" : "", waiting);
   return; /* the engine thread writes the response and closes fd */
 bad:
-  json_free(root);
   j->fd = -1;
   job_free(j);
   close(fd);

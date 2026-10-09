@@ -47,15 +47,31 @@ make build/ie-serve build/ie_kernels.hsaco
 |---|---|
 | `GET /health` | 返回 `{"status":"ok"}`。不检查密钥 |
 | `GET /v1/models` | 返回一个模型 |
-| `POST /v1/chat/completions` | 聊天。支持 `messages`、`stream`、`stream_options.include_usage`、`max_tokens`（或 `max_completion_tokens`）、`temperature`、`top_p`、`top_k`、`seed`、`reasoning_effort`、`chat_template_kwargs.enable_thinking` |
+| `POST /v1/chat/completions` | 聊天。支持 `messages`、`stream`、`stream_options.include_usage`、`max_tokens`（或 `max_completion_tokens`）、`temperature`、`top_p`、`top_k`、`seed`、`reasoning_effort`、`chat_template_kwargs.enable_thinking`、`tools`、`tool_choice`（只认 `"none"`） |
 
-`messages` 的角色只能是 system、user、assistant（developer 当作 system）。内容只能是文字。
+`messages` 的角色可以是 system、user、assistant、tool（developer 当作 system）。内容只能是文字。
 
 服务按模型文件里的模板（`--show-template`）生成提示，只是不处理工具和图片：
 
 - 思考打开时，提示开头有一条 system 消息，内容是推理强度说明（medium 时没有）。
 - 提示以 `<|im_start|>assistant\n<think>\n` 结束。所以服务在回答的开头补上 `<think>\n`，客户端能看到完整的 `<think>…</think>` 块。
 - 以前的回答写成 `<think>\n推理\n</think>\n\n回答`。推理来自 `reasoning_content` 字段，或者来自内容里 `</think>` 之前的文字（Open WebUI 的格式）。
+
+模板的代码在 `src/chat.c`。`build/chat_render 请求.json` 打印服务为一个请求生成的提示。
+
+### 工具调用
+
+名词：**工具调用**指模型不直接回答，而是要求客户端运行一个函数，再把结果发回给模型。
+
+1. 请求里有 `tools` 时，服务按模板把工具定义写进开头的 system 消息。每个工具写成一行 JSON，格式与 Python 的 `json.dumps(ensure_ascii=False)` 相同。
+2. 模型用自己的格式调用工具：`<tool_call>\n<function=名字>\n<parameter=参数>\n值\n</parameter>\n</function>\n</tool_call>`。
+3. 服务只在推理（`</think>`）之后找 `<tool_call>`。找到以后，后面的文字不再作为内容发送，而是在结束时转成 OpenAI 的 `tool_calls`，`finish_reason` 是 `tool_calls`。流式输出时，`tool_calls` 在最后一个分块里一次发送。
+4. 参数值按工具的 JSON Schema 转换：`string` 类型保持字符串；`integer`、`number`、`boolean`、`object`、`array` 类型的值如果是合法 JSON，就转成对应的 JSON 值。
+5. 历史里 assistant 的 `tool_calls`（`arguments` 是 JSON 字符串）和 `tool` 角色的结果，按模板写回提示。
+6. 如果 `<tool_call>` 块不完整（例如达到 `max_tokens`），服务把它当作普通文字返回。
+
+在 Open WebUI 里使用工具：管理员面板 → 设置 → 模型 → 编辑 Qwen3.8 27B → 高级参数 → 函数调用（Function Calling）设为"原生（Native）"。
+推测：这个菜单位置适用于当前版本，我没有在你的实例里核实过。
 
 例子：
 
@@ -111,6 +127,18 @@ amd-gpu-host 上的容器另外加了 `-e ENABLE_OLLAMA_API=false -e ENABLE_TAGS
 2. 提示与官方模板相同：4 段对话（思考打开、关闭、多轮加 low、medium）用 Jinja 渲染模板，
    再用 llama.cpp b11222 的 `llama-tokenize` 分词。结果与 ie-serve 的提示 ID 逐个相同。
 3. 生成：中文聊天（3 个草稿）每秒 51 个 token，写代码每秒 78 个 token。客户端断开后，生成会停止。
+4. 工具调用的提示：`tools/chat_check.py` 用 Jinja（与 transformers 的设置相同）渲染 5 段对话（带工具、带调用和结果、关闭思考、无工具），
+   与 `build/chat_render` 的输出逐字相同。用 `llama-tokenize --no-escape` 分词后，与 ie-serve 的提示 ID 也逐个相同。
+   注意：`llama-tokenize` 默认把文字里的 `\n` 转成换行，所以对比时必须加 `--no-escape`。
+5. 工具调用的生成：模型一次调用了两个工具（上海、北京，`days` 是整数 2）；流式输出时返回了 `tool_calls`；
+   把工具结果发回后，模型给出了正确的最终回答。
+
+重复第 4 项检查：
+
+```
+./build/ie-serve MODEL --show-template > /tmp/tpl.txt
+make build/chat_render && python3 tools/chat_check.py /tmp/tpl.txt build/chat_render
+```
 
 以后修改模板代码时，可以设置 `IE_SERVE_DEBUG=1`，服务会打印每个请求的提示 ID，用来重复第 2 项检查。
 
@@ -137,6 +165,6 @@ python3 tools/make_tiny_chat_gguf.py ../llama.cpp/models/ggml-vocab-qwen35.gguf 
 
 - 一次只运行一个请求。其他请求排队。
 - 每个请求从位置 0 重新计算整个提示。多轮对话时，前面的对话每次都重新预填充。
-- 不支持图片、工具调用（tools）、`stop` 字符串、`logprobs`、`n > 1`。
+- 不支持图片、`stop` 字符串、`logprobs`、`n > 1`。`tool_choice` 只认 `"none"`；强制调用某个工具的写法不支持。
 - 只支持 GPT2 字节级词表和 ChatML 模板（Qwen2、Qwen3.5、Qwen3.8）。
 - 只监听 IPv4 地址。

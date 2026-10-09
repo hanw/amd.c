@@ -10,6 +10,7 @@ typedef enum { J_NULL, J_FALSE, J_TRUE, J_NUM, J_STR, J_ARR, J_OBJ } jtype;
 typedef struct jval {
   jtype t;
   double num;
+  char *raw;    /* J_NUM: the number as written (for writing it back unchanged) */
   char *str;    /* J_STR: decoded UTF-8, 0-terminated */
   size_t slen;  /* J_STR: bytes (the string may hold 0 bytes) */
   char *key;    /* a member of an object: its key */
