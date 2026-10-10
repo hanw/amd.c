@@ -1361,9 +1361,10 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
  * (K step): the activations (512 x 32 fp16) and the dequantized weights
  * (64 x 32) to LDS, the next block's loads in registers during the math.
  * Rows % 64 == 0, nb % 8 == 0 (the host checks). Measured against
- * ie_gemm_q4kr (one harness, tools/tilelang/ab_q4k.py, 512 tokens): 34816 x
- * 5120 2.206 vs 1.953 ms, 5120 x 17408 1.312 vs 0.966 ms; TileLang's kernel
- * with the same tile (512 x 64 x 32) 1.83 ms: off by default (IE_GEMM_H=1). */
+ * ie_gemm_q4kr (one harness with warm-up, tools/tilelang/ab_q4k.py, 512
+ * tokens, without the prefetch): 34816 x 5120 1.982 vs 1.957 ms, 5120 x 17408
+ * 1.269 vs 1.006, 10240 x 5120 0.661 vs 0.586; TileLang (same tile) 1.988,
+ * 1.178, 0.610: not faster than int8, off by default (IE_GEMM_H=1). */
 KERNEL ie_q8_f16(const G u8 *q, G f16 *xh, u32 nb, u32 qs, u32 hs) {
   q = TOKC(q, qs), xh = TOK(xh, hs);
   const u32 i = wgid() * NT + tid();
@@ -1377,9 +1378,9 @@ KERNEL ie_q8_f16(const G u8 *q, G f16 *xh, u32 nb, u32 qs, u32 hs) {
 static LDS f16 qh_x[QH_T * QH_S] __attribute__((aligned(16)));
 static LDS f16 qh_w[QH_R * QH_S] __attribute__((aligned(16)));
 typedef unsigned int u32x2v __attribute__((ext_vector_type(2)));
-static inline __attribute__((always_inline)) void gemm_q4k_h(const G u32 *qw, const G u16 *qs, const G f16 *xh, G float *y, u32 rows,
+static inline __attribute__((always_inline)) void gemm_q4k_hx(const G u32 *qw, const G u16 *qs, const G f16 *xh, G float *y, u32 rows,
                                                             u32 nb, const G float *bias, const G float *res, u32 T, u32 hs, u32 ys,
-                                                            u32 rs, const u32 QT) {
+                                                            u32 rs, const u32 QT, const int PF, const int BATCH) {
   const u32 WT = QT / 8u, NJ = WT / 16u, NL = QT * 4u / NT; /* tokens per wave, its token tiles, 16-byte loads per thread */
   const u32 ntt = (T + QT - 1u) / QT, tt = wgid() % ntt, rt = wgid() / ntt;
   const u32 r0 = rt * QH_R, t0 = tt * QT, w = __builtin_amdgcn_readfirstlane(tid() >> 5), l = lane();
@@ -1414,9 +1415,10 @@ static inline __attribute__((always_inline)) void gemm_q4k_h(const G u32 *qw, co
     sm = sp[(kb_)];                                                                             \
     dd = (float)dp[((kb_) >> 3) * 2u], dm = (float)dp[((kb_) >> 3) * 2u + 1u];                  \
   } while (0)
-  QH_LOAD(0u);
+  if (PF) QH_LOAD(0u);
 #pragma unroll 1
   for (u32 kb = 0; kb < nb; kb++) {
+    if (!PF) QH_LOAD(kb);
 #pragma unroll
     for (u32 n = 0; n < NL; n++) {
       const u32 c = tid() + NT * n;
@@ -1434,8 +1436,21 @@ static inline __attribute__((always_inline)) void gemm_q4k_h(const G u32 *qw, co
       *(LDSP hk8 *)(qh_w + wr * QH_S + q4 * 8u) = wv;
     }
     barrier();
-    if (kb + 1u < nb) QH_LOAD(kb + 1u); /* in flight during the math */
-    if (won) {
+    if (PF && kb + 1u < nb) QH_LOAD(kb + 1u); /* in flight during the math */
+    if (won && BATCH) { /* all fragments of a K half first, then its 16 WMMA */
+#pragma unroll
+      for (u32 kk = 0; kk < 2u; kk++) {
+        hk8 a1[4], b1[4];
+#pragma unroll
+        for (u32 i = 0; i < 4u; i++) a1[i] = *(const LDSP hk8 *)(qh_w + (16u * i + rl) * QH_S + 16u * kk + 8u * hl);
+#pragma unroll
+        for (u32 j = 0; j < NJ; j++) b1[j] = *(const LDSP hk8 *)(qh_x + (WT * w + 16u * j + rl) * QH_S + 16u * kk + 8u * hl);
+#pragma unroll
+        for (u32 j = 0; j < NJ; j++)
+#pragma unroll
+          for (u32 i = 0; i < 4u; i++) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1[i], b1[j], acc[i][j]);
+      }
+    } else if (won) {
       hk8 a[4][2];
 #pragma unroll
       for (u32 i = 0; i < 4u; i++)
@@ -1469,13 +1484,18 @@ static inline __attribute__((always_inline)) void gemm_q4k_h(const G u32 *qw, co
       }
   }
 }
+
+/* PF = 0: the loads of a block at its start, not during the last block's
+ * math. Measured (512 tokens, one harness with warm-up): 34816 x 5120 1.982
+ * ms without vs 2.226 with the register prefetch; loading all fragments of a
+ * K half before its WMMA (BATCH = 1) 2.154 ms. */
 KERNEL ie_gemm_q4k_h(const G u32 *qw, const G u16 *qs, const G f16 *xh, G float *y, u32 rows, u32 nb,
                      const G float *bias, const G float *res, u32 T, u32 hs, u32 ys, u32 rs) {
-  gemm_q4k_h(qw, qs, xh, y, rows, nb, bias, res, T, hs, ys, rs, 512u);
+  gemm_q4k_hx(qw, qs, xh, y, rows, nb, bias, res, T, hs, ys, rs, 512u, 0, 0);
 }
 KERNEL ie_gemm_q4k_h256(const G u32 *qw, const G u16 *qs, const G f16 *xh, G float *y, u32 rows, u32 nb,
                         const G float *bias, const G float *res, u32 T, u32 hs, u32 ys, u32 rs) {
-  gemm_q4k_h(qw, qs, xh, y, rows, nb, bias, res, T, hs, ys, rs, 256u);
+  gemm_q4k_hx(qw, qs, xh, y, rows, nb, bias, res, T, hs, ys, rs, 256u, 0, 0);
 }
 
 /* ie_gemm_q4kr_sb: ie_gemm_q4kr for activations whose 8 blocks of a

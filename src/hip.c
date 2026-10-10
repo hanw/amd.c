@@ -528,7 +528,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
           if ((int)T >= gmin && nb % 8u == 0u) { /* WMMA */
             /* IE_GEMM_H=1: ie_gemm_q4k_h (fp16 activations, the weights dequantized to fp16). Off by default:
-             * slower than ie_gemm_q4kr (512 tokens, 34816 x 5120: 2.206 vs 1.953 ms; 5120 x 17408: 1.312 vs 0.966) */
+             * not faster than ie_gemm_q4kr (512 tokens: 34816 x 5120 1.982 vs 1.957 ms; 5120 x 17408 1.269 vs 1.006) */
             static int gh = -1;
             if (gh < 0) gh = getenv("IE_GEMM_H") && getenv("IE_GEMM_H")[0] == '1';
             if (gh && b->xh && rows % 64u == 0u && (size_t)T * nb * 64u <= b->xh_bytes) {

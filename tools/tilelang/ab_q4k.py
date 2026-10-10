@@ -1,5 +1,6 @@
 # int8 ie_gemm_q4kr vs fp16 ie_gemm_q4k_h / _h256 (our hsaco, via hipModuleLaunchKernel) vs TileLang, same harness
-import ctypes, torch, sys
+import ctypes, torch, sys, tilelang
+import tilelang.language as TL
 torch.manual_seed(0)
 dev = "cuda"
 hip = ctypes.CDLL("/opt/rocm/core-7.14/lib/libamdhip64.so")
@@ -24,6 +25,38 @@ def bench(f, n=20):
     e.record(); torch.cuda.synchronize()
     return s.elapsed_time(e) / n
 
+
+def q4k_fp16(M, N, K, bM, bN, bK, st, th):
+    nb = K // 32
+    @TL.prim_func
+    def main(A: TL.Tensor((M, K), "float16"), Wq: TL.Tensor((N, nb * 16), "uint8"), Wsm: TL.Tensor((N, nb), "int16"),
+             Wdd: TL.Tensor((N, nb // 8 * 2), "float16"), C: TL.Tensor((M, N), "float32")):
+        with TL.Kernel(TL.ceildiv(N, bN), TL.ceildiv(M, bM), threads=th) as (bx, by):
+            As = TL.alloc_shared((bM, bK), "float16")
+            Bs = TL.alloc_shared((bN, bK), "float16")
+            Cl = TL.alloc_fragment((bM, bN), "float32")
+            TL.clear(Cl)
+            for k in TL.Pipelined(TL.ceildiv(K, bK), num_stages=st):
+                TL.copy(A[by * bM, k * bK], As)
+                for n, e in TL.Parallel(bN, bK):
+                    r = bx * bN + n
+                    b = k * (bK // 32) + e // 32
+                    ee = e % 32
+                    byte = TL.cast(Wq[r, b * 16 + ee % 16], "int32")
+                    q = TL.if_then_else(ee < 16, byte & 15, byte >> 4)
+                    sm = TL.cast(Wsm[r, b], "int32") & 0xFFFF
+                    d = TL.cast(Wdd[r, (b // 8) * 2], "float32")
+                    dm = TL.cast(Wdd[r, (b // 8) * 2 + 1], "float32")
+                    Bs[n, e] = TL.cast(d * TL.cast(sm & 63, "float32") * TL.cast(q, "float32") - dm * TL.cast(sm >> 8, "float32"), "float16")
+                TL.gemm(As, Bs, Cl, transpose_B=True)
+            TL.copy(Cl, C[by * bM, bx * bN])
+    return main
+
+_wa = torch.randn(4096, 4096, device=dev, dtype=torch.float16)
+import time as _t
+_t0 = _t.time()
+while _t.time() - _t0 < 3.0: _wa @ _wa
+torch.cuda.synchronize()
 for (T, R, K) in [(512, 34816, 5120), (512, 5120, 17408), (512, 10240, 5120)]:
     nb = K // 32
     Wq = torch.randint(0, 256, (R, nb * 16), device=dev, dtype=torch.uint8)
@@ -49,6 +82,9 @@ for (T, R, K) in [(512, 34816, 5120), (512, 5120, 17408), (512, 10240, 5120)]:
     xh = torch.empty(T, K, device=dev, dtype=torch.float16)
     flop = 2.0 * T * R * K
     f_q4kr, f_h, f_h256, f_cv = fn("ie_gemm_q4kr"), fn("ie_gemm_q4k_h"), fn("ie_gemm_q4k_h256"), fn("ie_q8_f16")
+    f_x1, f_x2, f_x3 = fn("ie_gemm_q4k_hx1"), fn("ie_gemm_q4k_hx2"), fn("ie_gemm_q4k_hx3")
+    ktl = tilelang.compile(q4k_fp16(T, R, K, 512, 64, 32, 2, 256), target="auto")
+    Wdd = dd.reshape(R, -1).contiguous()
     def run_q4kr():
         launch(f_q4kr, ((R + 127) // 128) * ((T + 63) // 64), [("p", Wq.data_ptr()), ("p", qs.data_ptr()), ("p", xq.data_ptr()), ("p", y.data_ptr()), ("u", R), ("u", nb), ("p", 0), ("p", 0), ("u", T), ("u", xs), ("u", R), ("u", 0)])
     def conv():
@@ -57,7 +93,9 @@ for (T, R, K) in [(512, 34816, 5120), (512, 5120, 17408), (512, 10240, 5120)]:
     def run_h(f, qt):
         launch(f, (R // 64) * ((T + qt - 1) // qt), [("p", Wq.data_ptr()), ("p", qs.data_ptr()), ("p", xh.data_ptr()), ("p", y.data_ptr()), ("u", R), ("u", nb), ("p", 0), ("p", 0), ("u", T), ("u", K), ("u", R), ("u", 0)])
     print(f"== T {T} rows {R} K {K}")
-    for name, f in [("int8 ie_gemm_q4kr", run_q4kr), ("q8->f16 only", conv), ("fp16 ie_gemm_q4k_h (512)", lambda: (conv(), run_h(f_h, 512))), ("fp16 ie_gemm_q4k_h256", lambda: (conv(), run_h(f_h256, 256)))]:
+    for name, f in [("int8 ie_gemm_q4kr", run_q4kr), ("q8->f16 only", conv), ("fp16 ie_gemm_q4k_h (512)", lambda: (conv(), run_h(f_h, 512))), ("fp16 ie_gemm_q4k_h256", lambda: (conv(), run_h(f_h256, 256))),
+        ("hx1 no prefetch", lambda: (conv(), run_h(f_x1, 512))), ("hx2 no prefetch, batched", lambda: (conv(), run_h(f_x2, 512))),
+        ("hx3 prefetch, batched", lambda: (conv(), run_h(f_x3, 512))), ("TileLang 512x64x32", lambda: (conv(), ktl(xh, Wq, sm16, Wdd, y)))]:
         f(); torch.cuda.synchronize()
         err = (y - ref).abs().max().item() / ref.abs().max().item() if "only" not in name else 0
         ms = bench(f)
