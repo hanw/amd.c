@@ -124,7 +124,20 @@ GPU 后端只在 gfx1201 上编译。核函数需要 `v_dot4_i32_iu8` 指令和 
 硬件追踪：用 `rocprofv3 --kernel-trace` 运行引擎，再用 `tools/rocprof_ops.py` 把追踪结果对应到算子（见脚本开头的说明）。
 按核函数的时间：在 rocprofv3 下运行一次 `ie-run`（带 `IE_TRACE`），再用 `tools/rocprof_kernels.py 日志.csv 追踪.csv [阶段]` 汇总。
 线程追踪：`rocprofv3 --att`（一次 kernel 调用）之后，用 `tools/att_summary.py` 按指令类别汇总延迟和停顿（用法见脚本开头）。
-注意：R9700（这台机器的驱动）上 SQ 的指令和等待计数器读出来都是 0，只有 `GRBM_GUI_ACTIVE`、`SQ_BUSY_CYCLES`、`SQ_WAVES` 有值；线程追踪可以用。
+注意：硬件计数器（`rocprofv3 --pmc`）要先把显卡的性能等级设成 `profile_standard`：
+`echo profile_standard | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level`，用完改回 `auto`。
+在默认的 `auto` 下，SQ 的指令、等待、LDS 冲突和 L2 计数器读出来都是 0（只有 `GRBM_GUI_ACTIVE`、`SQ_BUSY_CYCLES`、`SQ_WAVES` 有值），线程追踪不受影响。
+硬件计数器（2026-10-10，4K 提示，每块 512 个 token；周期的比例对 `SQ_WAVE_CYCLES`）：
+
+| kernel | 向量指令周期 | 等待指令 | 等待（全部） | LDS 存储体冲突 | L2 命中 |
+|---|---|---|---|---|---|
+| `ie_gemm_q4kr` | 10.2% | 48.7% | 42.9% | 10.6% | 98.8% |
+| `ie_gemm_q6kr` | 13.2% | 39.7% | 48.2% | 33.8% | 98.5% |
+| `ie_gemm_q8r` | 16.4% | 32.3% | 56.1% | 9.2% | 95.9% |
+| `ie_gdn_seq` | 13.6% | 24.8% | 59.0% | 1.1% | 89.1% |
+| `ie_attn_fa2` | 11.5% | 8.5% | 84.0% | 28.2% | 92.9% |
+| `ie_swiglu` | 2.9% | 2.0% | 94.2% | 0 | 83.5% |
+
 核函数时间轴：`tools/viz.sh 模型.gguf [步数] [输出.html]` 在 rocprofv3 下运行一次 `ie-run`（带 `IE_TRACE`），
 再用 `tools/ie_viz.py` 生成一个独立的 HTML 页面和一个 Perfetto 追踪文件（`.json`，在 ui.perfetto.dev 打开）。
 页面按运行（一个解码步骤、一个提示块……）显示每个核函数的时间段和核函数之间的空隙，泳道可以按类别、按层或单条；
