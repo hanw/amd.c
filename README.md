@@ -91,6 +91,7 @@ GPU 后端只在 gfx1201 上编译。核函数需要 `v_dot4_i32_iu8` 指令和 
 |---|---|
 | `IE_PROFILE=1` | 每个核函数后记录一个 GPU 事件，结束时打印按核函数和按层的时间表 |
 | `IE_PROFILE_CSV=文件` | 与 `IE_PROFILE=1` 一起用：把每个算子的时间写进 CSV 文件 |
+| `IE_TRACE=文件` | 按启动顺序把每次核函数启动写进 CSV：运行序号、阶段（decode、prefill、verify、mtp、sample）、位置、算子、层、核函数、工作组数、权重字节数。不加 GPU 事件，不改变时间 |
 | `IE_ATTN=old` | 用旧的注意力核函数 `ie_attn`（每个头一个工作组） |
 | `IE_ATTN=check` | 每层同时运行新旧两个注意力核函数，结束时打印两者输出的最大相对差 |
 | `IE_ATTN=split` | 不用 `ie_attn_kv`，只用 `ie_attn_split` 和 `ie_attn_split_t`（结果逐位相同，用来对比） |
@@ -120,6 +121,11 @@ GPU 后端只在 gfx1201 上编译。核函数需要 `v_dot4_i32_iu8` 指令和 
 | `IE_GDN_CHECK=1` | 调试：每个提示块的线性注意力层先用 `ie_gdn` 算一遍，再用分块并行算法算，打印输出和状态的最大差 |
 
 硬件追踪：用 `rocprofv3 --kernel-trace` 运行引擎，再用 `tools/rocprof_ops.py` 把追踪结果对应到算子（见脚本开头的说明）。
+核函数时间轴：`tools/viz.sh 模型.gguf [步数] [输出.html]` 在 rocprofv3 下运行一次 `ie-run`（带 `IE_TRACE`），
+再用 `tools/ie_viz.py` 生成一个独立的 HTML 页面和一个 Perfetto 追踪文件（`.json`，在 ui.perfetto.dev 打开）。
+页面按运行（一个解码步骤、一个提示块……）显示每个核函数的时间段和核函数之间的空隙，泳道可以按类别、按层或单条；
+颜色可以按类别或按带宽（权重字节 ÷ 时长，占标称 640 GB/s 的比例）。页面还给出每个运行的空隙时间、启动次数、
+权重读取的下限时间，以及按核函数、按类别、按层的平均值。`VIZ_ARGS="--draft 7"` 可以看 MTP 的草稿和验证步骤。
 矩阵向量乘基准测试：`tools/gemv_bench.c` 对不同形状单独计时（见文件开头的说明；`KIND=q4k`、`q6k`：K 系列格式）。
 `tools/gemv_eq.c` 检查多 token 核函数与单 token 核函数逐位相同（随机 Q4_K、Q6_K 或 Q8_0 数据），并给两者计时。
 `tools/gemm_bench.c` 每次启动换一份权重（共约 512 MB），权重从显存读，不从 64 MB 缓存读。
