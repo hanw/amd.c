@@ -38,7 +38,7 @@
 /* ---- options ---- */
 typedef struct {
   const char *path, *backend, *hsaco, *host, *api_key, *mtp, *name, *effort;
-  int port, think, queue_max, cache;
+  int port, think, queue_max, cache, raw_think;
   uint32_t ctx, draft, chunk, top_k, max_body;
   float pmin, temp, top_p;
 } options;
@@ -65,6 +65,7 @@ static void usage(void) {
           "  --no-think          end the prompt with an empty <think></think> block (no reasoning text)\n"
           "  --effort E          reasoning effort when thinking: xhigh (default), medium, low\n"
           "  --no-cache          compute every prompt from the start (no prompt cache)\n"
+          "  --think-in-content  send the reasoning in content as <think>...</think> (default: in reasoning_content)\n"
           "  --queue N           the most waiting requests (default 8; more: HTTP 503)\n"
           "  --show-template     print the chat template of the model file and exit\n");
   exit(2);
@@ -103,6 +104,7 @@ typedef struct job {
   uint32_t n_tok;      /* output tokens, without the stop token */
   int finish;          /* 0: length, 1: stop, 2: client gone */
   int think;           /* the prompt ends with <think>\n: the answer text starts with it too */
+  int content_started; /* split reasoning: a content character after </think> was sent */
   int dead;            /* a write failed */
 } job;
 
@@ -194,6 +196,16 @@ static void sse_chunk(job *j, const char *text, size_t n, const char *finish) {
   sb_puts(&b, "}]}\n\n");
   sse_send(j, &b);
 }
+/* one delta with text in field ("content" or "reasoning_content") */
+static void sse_field(job *j, const char *field, const char *text, size_t n) {
+  if (!n) return;
+  sbuf b = {0};
+  sse_begin(&b, j);
+  sb_printf(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"%s\":", field);
+  sb_json_str(&b, text, n);
+  sb_puts(&b, "},\"finish_reason\":null}]}\n\n");
+  sse_send(j, &b);
+}
 /* the tool calls (a JSON array from chat_tool_calls) as one delta, each with its index */
 static void sse_tool_calls(job *j, const char *arr, size_t n) {
   char err[64];
@@ -220,38 +232,53 @@ static const char *find_in(const char *s, size_t from, size_t n, const char *pat
     if (!memcmp(s + i, pat, k)) return s + i;
   return NULL;
 }
-/* How much of all can go to the client now. With tools, the text from the
- * first <tool_call> after the reasoning is held back (it becomes tool_calls),
- * and so is an end of the text that could be the start of "<tool_call>". */
+/* How much of all can go to the client now. The text from the first
+ * <tool_call> after the reasoning is held back (with tools it becomes
+ * tool_calls), and so is an end of the text that could be the start of
+ * "</think>" (while thinking) or "<tool_call>". */
 static size_t safe_end(job *j, int final) {
   const char *s = j->all.p;
   const size_t n = j->all.n;
   if (!s) return 0;
-  if (j->tools && j->tc_at < 0) {
-    const size_t from = j->scan > 16 ? j->scan - 16 : 0;
-    if (j->think_end < 0) {
-      const char *e = find_in(s, from, n, "</think>");
-      if (e) j->think_end = (long)(e - s) + 8;
-    }
-    if (j->think_end >= 0) {
-      const size_t f2 = from > (size_t)j->think_end ? from : (size_t)j->think_end;
-      const char *c = find_in(s, f2, n, "<tool_call>");
-      if (c) j->tc_at = (long)(c - s);
-    }
-    j->scan = n;
+  const size_t from = j->scan > 16 ? j->scan - 16 : 0;
+  if (j->think_end < 0) {
+    const char *e = find_in(s, from, n, "</think>");
+    if (e) j->think_end = (long)(e - s) + 8;
   }
+  if (j->tools && j->tc_at < 0 && j->think_end >= 0) {
+    const size_t f2 = from > (size_t)j->think_end ? from : (size_t)j->think_end;
+    const char *c = find_in(s, f2, n, "<tool_call>");
+    if (c) j->tc_at = (long)(c - s);
+  }
+  j->scan = n;
   if (j->tc_at >= 0) return (size_t)j->tc_at;
   if (final) return n;
   size_t lim = n;
-  if (j->tools && j->think_end >= 0) /* hold back a possible start of <tool_call> */
-    for (size_t k = 10; k >= 1; k--)
-      if (n >= (size_t)j->think_end + k && !memcmp(s + n - k, "<tool_call>", k)) { lim = n - k; break; }
+  const char *pat = j->think_end < 0 ? "</think>" : j->tools ? "<tool_call>" : NULL;
+  const size_t base = j->think_end < 0 ? 0 : (size_t)j->think_end;
+  if (pat)
+    for (size_t k = strlen(pat) - 1; k >= 1; k--)
+      if (n >= base + k && !memcmp(s + n - k, pat, k)) { lim = n - k; break; }
   return utf8_whole(s, lim);
 }
+/* split reasoning: all = "<think>\n" reasoning "</think>" white space content */
+static int split_think(const job *j) { return j->think && !O.raw_think; }
+static size_t reason_end(const job *j, size_t e) { return j->think_end >= 0 && (size_t)j->think_end - 8 < e ? (size_t)j->think_end - 8 : e; }
 static void flush_text(job *j, int final) {
   const size_t e = safe_end(j, final);
   if (e <= j->sent) return;
-  if (j->stream) sse_chunk(j, j->all.p + j->sent, e - j->sent, NULL);
+  if (j->stream && !split_think(j)) sse_chunk(j, j->all.p + j->sent, e - j->sent, NULL);
+  else if (j->stream) {
+    const char *s = j->all.p;
+    size_t a = j->sent > 8 ? j->sent : 8, re = reason_end(j, e);
+    if (a < re) sse_field(j, "reasoning_content", s + a, re - a);
+    if (j->think_end >= 0) {
+      size_t c = j->sent > (size_t)j->think_end ? j->sent : (size_t)j->think_end;
+      if (!j->content_started)
+        while (c < e && strchr(" \t\r\n", s[c])) c++;
+      if (c < e) sse_field(j, "content", s + c, e - c), j->content_started = 1;
+    }
+  }
   j->sent = e;
 }
 static int on_tokens(void *ctx, const uint32_t *t, uint32_t n) {
@@ -341,7 +368,16 @@ static void run_job(job *j) {
     sb_printf(&b, "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":", j->id, j->created);
     sb_json_str(&b, MODEL_ID, strlen(MODEL_ID));
     sb_puts(&b, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
-    sb_json_str(&b, j->all.p ? j->all.p : "", cn);
+    if (!split_think(j)) sb_json_str(&b, j->all.p ? j->all.p : "", cn);
+    else { /* content after </think> (without the white space), then reasoning_content */
+      const char *s = j->all.p;
+      size_t c = j->think_end >= 0 ? (size_t)j->think_end : cn, re = reason_end(j, cn);
+      while (c < cn && strchr(" \t\r\n", s[c])) c++;
+      while (re > 8 && strchr(" \t\r\n", s[re - 1])) re--;
+      sb_json_str(&b, c < cn ? s + c : "", c < cn ? cn - c : 0);
+      sb_puts(&b, ",\"reasoning_content\":");
+      sb_json_str(&b, re > 8 ? s + 8 : "", re > 8 ? re - 8 : 0);
+    }
     if (n_calls) sb_puts(&b, ",\"tool_calls\":"), sb_add(&b, calls.p, calls.n);
     sb_printf(&b, "},\"finish_reason\":\"%s\"}],\"usage\":%s}", fin, us.p);
     http_reply(j->fd, 200, "application/json", b.p, b.n);
@@ -675,6 +711,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--no-think")) O.think = 0;
     else if (!strcmp(a, "--effort")) O.effort = ARG;
     else if (!strcmp(a, "--no-cache")) O.cache = 0;
+    else if (!strcmp(a, "--think-in-content")) O.raw_think = 1;
     else if (!strcmp(a, "--queue")) O.queue_max = atoi(ARG);
     else if (!strcmp(a, "--show-template")) show_template = 1;
     else if (a[0] != '-' && !O.path) O.path = a;

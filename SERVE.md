@@ -40,6 +40,7 @@ make build/ie-serve build/ie_kernels.hsaco
 | `--effort E` | xhigh | 思考时的推理强度：xhigh、medium、low（模板里的 reasoning_effort） |
 | `--queue N` | 8 | 最多排队的请求数。超过时返回 HTTP 503 |
 | `--no-cache` | 关 | 关闭提示缓存，每个请求都从位置 0 计算 |
+| `--think-in-content` | 关 | 把推理写在 `content` 里，用 `<think>…</think>` 包住（旧格式）。默认：推理在 `reasoning_content` 字段里，`content` 只有回答 |
 | `--show-template` | - | 打印模型文件里的聊天模板，然后退出 |
 
 ## 3. 接口
@@ -148,6 +149,38 @@ amd-gpu-host 上的容器另外加了 `-e ENABLE_OLLAMA_API=false -e ENABLE_TAGS
 原因：ie-serve 一次只运行一个请求，这些后台任务会让聊天排队。标题生成仍然打开。
 
 注意：Open WebUI 第一次启动时会下载一个文本向量模型，下载慢时要等 5 到 10 分钟，8080 端口才会打开。
+
+## 4b. 连接 omp（oh-my-pi 编程助手）
+
+已确认（2026-10-09）：主机上 Tailscale Serve 的 `https://amd-gpu-host.tail1aaa84.ts.net/` 现在转发到 ie-serve（127.0.0.1:8000）。Open WebUI 已经停止。
+
+1. 你在自己的电脑上编辑 `~/.omp/agent/models.yml`，写入下面的内容。
+2. 你运行 `omp --model amd/Qwen3.8-27B`，或者在 omp 里用 `/model` 选择它。
+
+```yaml
+providers:
+  amd:
+    baseUrl: https://amd-gpu-host.tail1aaa84.ts.net/v1
+    api: openai-completions
+    auth: none
+    compat:
+      maxTokensField: max_tokens
+      supportsDeveloperRole: false
+      supportsReasoningEffort: true
+      supportsStore: false
+    models:
+      - id: Qwen3.8-27B
+        name: Qwen3.8 27B (amd-gpu-host)
+        reasoning: true
+        input: [text]
+        contextWindow: 65536
+        maxTokens: 16384
+        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
+```
+
+- 推理在 `reasoning_content` 里返回，工具调用在 `tool_calls` 里返回。
+- `reasoning_effort`：low 或 minimal 让推理变短；medium 不加说明；其他值（high、xhigh）让推理变长。
+- 编程助手的系统提示和工具说明很长（常常超过 1 万个 token）。第一个请求的预填充要几秒；以后的请求命中提示缓存。
 
 ## 5. 开机自动启动（systemd）
 
