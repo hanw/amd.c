@@ -100,6 +100,9 @@ GPU 后端只在 gfx1201 上编译。核函数需要 `v_dot4_i32_iu8` 指令和 
 | `IE_ATTN_FA=0` | 预填充不用 `ie_attn_fa`，改用 `ie_attn_pfg` |
 | `IE_ATTN_FA_MIN=N` | 位置数大于 N 时预填充用 `ie_attn_fa`（默认 1024） |
 | `IE_ATTN_FA2=0` | 预填充不用 `ie_attn_fa2`（S 只算一次的版本），改用 `ie_attn_fa` |
+| `IE_GEMM_F32_S=0` | 预填充的小 f32 矩阵不用 `ie_gemm_f32_s` |
+| `IE_Q4K_SB=1` | 预填充的 Q4_K 矩阵乘法先把激活值重新量化成每 256 个元素一个缩放系数，再用整数累加（`ie_gemm_q4kr_sb`，快约 2%，默认关） |
+| `IE_PROFILE=2` | 按预填充块统计每个算子的时间（配合 `IE_STREAM=0`） |
 | `--tokens-file 文件`、`--ppl`、`--ppl-first N`（命令行选项） | 从文件读 token；计算从第 N 个位置开始的困惑度 |
 | `IE_GRAPH_BENCH=N` | 调试：把一个解码步骤录成 HIP 图，重放 N 次，和普通流比较每步时间，然后退出（27B Q4_K_M：30.87 对 30.42 毫秒） |
 | `IE_NORM_FUSE=1` | 把 RMSNorm 合进前一个带残差的矩阵向量乘（最后完成的工作组做）。在 R9700 上更慢，所以默认关闭（27B：48.2 对 46.0 毫秒/token） |
