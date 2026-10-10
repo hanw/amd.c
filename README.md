@@ -161,6 +161,24 @@ Q5_K 和 Q4_K 的词嵌入在加载时再量化成 Q8_0（近似）。Q4_K 和 Q
 由 Lean 证明（11 条定律，见“什么被验证”）。qwen35 的 Q4_0 矩阵（Q4_K_M 文件里的 MTP 层）按 Q8_0 加载（精确：int8 = q − 8，同一缩放）。
 已确认：`make test` 的 tiny-llama-k（Q4_K、Q5_K、Q6_K）与 numpy 参考（gguf 包自己的反量化）相对差 3e-7。
 
+**Qwen3.8-27B-Coder390-EfficientThink Q6_K-MTP**（nerkyor 的微调版，23.2 GB，2026-10-10）：结构与 Qwen3.8-27B 相同；
+矩阵几乎全是 Q6_K（原生读取），输出层和词嵌入是 Q8_0，ssm_alpha / ssm_beta 是 BF16（加载时精确转成 f32），MTP 层 Q6_K。
+
+| 项目 | Coder390 Q6_K | 官方 Q4_K_M |
+|---|---|---|
+| 每个 token 读的权重 | 21.4 GB | 16.5 GB |
+| 困惑度（wikitext-2，4 段） | 5.084 | 5.173 |
+| 解码，不用草稿（个/秒） | 24.0（514 GB/s） | 33.0 |
+| 写代码，7 个草稿 | 108.5 | 112.7 |
+| 续写，7 个草稿 | 63.2 | 89.8 |
+| 聊天，7 个草稿 | 71.0 | 68.3 |
+| 中文，7 个草稿 | 41.5 | 48.9 |
+| 预填充 512 个 token | 1222 | 1439 |
+
+四个提示、3 和 7 个草稿，输出都与不用草稿时逐个 token 相同。困惑度的差别同时来自微调和量化（Q6_K 比 Q4_K_M 精度高），无法分开。
+同一仓库的 Q8_0-MTP 也能加载（全是 Q8_0 加 BF16）；Q4LynnStyle 含 Q5_K（转成 Q8_0，近似）；Q3LynnStyle（Q3_K）和 Q2LynnStyle（IQ 系列）不支持。
+注意：测量前 GPU 曾处于低功耗状态（`power_dpm_force_performance_level` 不是 auto），所有核函数慢约 3.5 倍。
+
 **Qwen3.8-27B Q4_K_M**（bartowski，17.4 GB；主体 Q4_K，另有 Q6_K、Q8_0、Q5_K，自带 MTP 层 blk.64）。2026-10-08，同一台 R9700：
 
 | 项目 | 本引擎 Q8_0 | 本引擎 Q4_K_M | llama.cpp Q4_K_M |
