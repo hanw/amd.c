@@ -8,7 +8,7 @@
 #include <stdlib.h>
 
 /* GGML tensor types that the engine reads. */
-enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14 };
+enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30 };
 
 /* Print a message and exit(1). */
 void ie_die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));

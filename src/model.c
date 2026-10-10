@@ -28,7 +28,7 @@ static void q4k_scale_min(int j, const uint8_t *q, uint8_t *sc, uint8_t *m) {
   }
 }
 
-/* Dequantize n elements of tensor data (F32 / F16 / Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K) to float. */
+/* Dequantize n elements of tensor data (F32 / F16 / BF16 / Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K) to float. */
 static void dequant(const gguf_tensor *t, uint64_t first, uint64_t n, float *out) {
   const uint8_t *p = t->data;
   switch (t->type) {
@@ -38,6 +38,14 @@ static void dequant(const gguf_tensor *t, uint64_t first, uint64_t n, float *out
         uint16_t h;
         memcpy(&h, p + (first + i) * 2, 2);
         out[i] = ie_f16_to_f32(h);
+      }
+      break;
+    case GGML_BF16: /* the high 16 bits of an f32: exact */
+      for (uint64_t i = 0; i < n; i++) {
+        uint16_t h;
+        memcpy(&h, p + (first + i) * 2, 2);
+        const uint32_t u = (uint32_t)h << 16;
+        memcpy(&out[i], &u, 4);
       }
       break;
     case GGML_Q8_0:

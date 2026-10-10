@@ -55,6 +55,8 @@ def dequant(t):
         a = raw.view(np.float32).astype(np.float64)
     elif tt == F16:
         a = raw.view(np.float16).astype(np.float64)
+    elif tt == 30:  # BF16: the high 16 bits of an f32
+        a = (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32).astype(np.float64)
     elif tt == Q8_0:
         b = raw.reshape(-1, 34)
         d = b[:, :2].copy().view(np.float16).astype(np.float64)

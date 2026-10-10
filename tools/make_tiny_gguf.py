@@ -14,7 +14,7 @@ import sys
 
 import numpy as np
 
-GGML_F32, GGML_F16, GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K = 0, 1, 2, 8, 12, 13, 14
+GGML_F32, GGML_F16, GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_BF16 = 0, 1, 2, 8, 12, 13, 14, 30
 T_U32, T_I32, T_F32, T_BOOL, T_STR, T_ARR, T_U64, T_F64 = 4, 5, 6, 7, 8, 9, 10, 12
 ALIGN = 32
 
@@ -115,6 +115,11 @@ def f32(a):
     return np.asarray(a, dtype=np.float32).tobytes()
 
 
+def bf16(a):
+    """BF16: the high 16 bits of each f32 (truncated)"""
+    return (np.asarray(a, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16).tobytes()
+
+
 def gpt2_vocab(n):
     """GPT2 byte-level token strings: 256 single bytes, then some merges."""
     bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
@@ -210,7 +215,7 @@ def make(path, arch, seed, n_layer, dim, ffn, n_head, n_kv, vocab, ctx, biases, 
 
 def make_k(path, seed, n_layer=2, dim=512, ffn=1536, n_head=8, n_kv=4, vocab=301, ctx=256):
     """llama with K-quant matrices: Q4_K (embedding too), one Q5_K, Q6_K up
-    and output (gate and up of different kinds: not merged)."""
+    and output (gate and up of different kinds: not merged); blk.1.attn_k BF16."""
     rng = np.random.default_rng(seed)
     hd = dim // n_head
     kvd = n_kv * hd
@@ -228,7 +233,10 @@ def make_k(path, seed, n_layer=2, dim=512, ffn=1536, n_head=8, n_kv=4, vocab=301
         p = "blk.%d." % l
         T.append((p + "attn_norm.weight", [dim], GGML_F32, f32(1 + 0.1 * rng.standard_normal(dim))))
         T.append((p + "attn_q.weight", [dim, dim], GGML_Q4_K, kq(rng, dim, dim, sc(dim), GGML_Q4_K)))
-        T.append((p + "attn_k.weight", [dim, kvd], GGML_Q4_K, kq(rng, kvd, dim, sc(dim), GGML_Q4_K)))
+        if l == 1:  # one BF16 matrix (Qwen3.8 fine-tunes store ssm_alpha / ssm_beta as BF16)
+            T.append((p + "attn_k.weight", [dim, kvd], GGML_BF16, bf16(sc(dim) * rng.standard_normal((kvd, dim)))))
+        else:
+            T.append((p + "attn_k.weight", [dim, kvd], GGML_Q4_K, kq(rng, kvd, dim, sc(dim), GGML_Q4_K)))
         T.append((p + "attn_v.weight", [dim, kvd], GGML_Q5_K, kq(rng, kvd, dim, sc(dim), GGML_Q5_K)))
         T.append((p + "attn_output.weight", [dim, dim], GGML_Q4_K, kq(rng, dim, dim, sc(dim), GGML_Q4_K)))
         T.append((p + "ffn_norm.weight", [dim], GGML_F32, f32(1 + 0.1 * rng.standard_normal(dim))))
