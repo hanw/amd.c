@@ -12,7 +12,7 @@ User=hanwang
 WorkingDirectory=/home/hanwang/amd.c
 # Only Open WebUI on this host talks to ie-serve, so it listens on 127.0.0.1.
 ExecStart=/home/hanwang/amd.c/build/ie-serve /home/hanwang/models/q4/Qwen3.8-27B-Q4_K_M.gguf \
-    --host 127.0.0.1 --port 8000 --ctx 131072 --draft 3
+    --host 127.0.0.1 --port 8000 --ctx 131072 --draft 3 --chunk 512
 Restart=on-failure
 RestartSec=5
 
