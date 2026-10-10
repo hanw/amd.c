@@ -198,7 +198,7 @@ static inline uint32_t ie_att_max_split(uint32_t n_ctx) {
 }
 #define IE_ATT_MAX_HD 256u
 /* ie_attn_split keeps the weights of up to this many splits in LDS. */
-#define IE_ATT_MAX_SPLIT 2048u
+#define IE_ATT_MAX_SPLIT 4096u
 typedef struct {
   const char *name;
   /* stride: bytes per token (256-aligned); size = stride * graph.T; or

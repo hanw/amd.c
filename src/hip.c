@@ -136,7 +136,9 @@ typedef struct {
   /* host time spent issuing the launches of a step (not waiting) */
   double host_ms;
   uint32_t host_n;
-  float *kc, *vc, *rcos, *rsin;
+  void *kc, *vc;    /* KV cache: kvb bytes per element (2: fp16, the kernels have ie_kv_f16; 4: f32) */
+  u32 kvb;
+  float *rcos, *rsin;
   float *ring, *st; /* qwen35 linear attention state (see cpu.c) */
   float *snap_ring[2], *snap_st[2]; /* the prompt cache snapshots (gpu_snap), allocated at the first save */
   char *snap_h[2];
@@ -278,6 +280,10 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   HIP(H.ModuleLoadData(&b->mod, img));
   free(img);
   for (int i = 0; i < K_N; i++) HIP(H.ModuleGetFunction(&b->k[i], b->mod, kname[i]));
+  {
+    hipFunction_t f;
+    b->kvb = H.ModuleGetFunction(&f, b->mod, "ie_kv_f16") == 0 ? 2u : 4u;
+  }
 
   HIP(H.Malloc((void **)&b->arena, g->arena));
   HIP(H.Memset(b->arena, 0, g->arena));
@@ -303,7 +309,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     b->chk_a = ie_alloc(m->n_head * m->hd * 4u);
     b->chk_b = ie_alloc(m->n_head * m->hd * 4u);
   }
-  const size_t kv = (size_t)m->n_kvl * g->n_ctx * m->n_kv * m->hd * 4 + 4;
+  const size_t kv = (size_t)m->n_kvl * g->n_ctx * m->n_kv * m->hd * b->kvb + 4;
   HIP(H.Malloc((void **)&b->kc, kv));
   HIP(H.Malloc((void **)&b->vc, kv));
   const size_t rbytes = (size_t)m->n_rec * GDN_RING * m->conv_dim * 4 + 4,
@@ -602,7 +608,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
       case OP_ROPE_KV: {
         float *cs = b->rcos + (size_t)pos * h2, *sn = b->rsin + (size_t)pos * h2;
         const size_t base = ((size_t)m->l[o->layer].kvi * nctx + pos) * kvd;
-        float *kc = b->kc + base, *vc = b->vc + base;
+        void *kc = (char *)b->kc + base * b->kvb, *vc = (char *)b->vc + base * b->kvb;
         u32 nq = o->nh, neox = m->rope == ROPE_NEOX;
         void *args[] = {&A, &B, &C, &kc, &vc, &cs, &sn, &nq, (void *)&nkv, (void *)&hd, &neox};
         launch(b, K_ROPE_KV, ((nq + nkv) * h2 + kvd + 255u) / 256u, args);
@@ -611,7 +617,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
       case OP_QKN_ROPE_KV: {
         float *cs = b->rcos + (size_t)pos * h2, *sn = b->rsin + (size_t)pos * h2;
         const size_t base = ((size_t)m->l[o->layer].kvi * nctx + pos) * kvd;
-        float *kc = b->kc + base, *vc = b->vc + base;
+        void *kc = (char *)b->kc + base * b->kvb, *vc = (char *)b->vc + base * b->kvb;
         u32 nq = o->nh, nrot = m->n_rot;
         u32 ins = g->bufs[o->a].stride, qos = g->bufs[o->b].stride;
         void *args[] = {&A, &B, &kc, &vc, &w0, &NW, &cs, &sn, &nq, (void *)&nkv, (void *)&hd, &nrot, &eps, &ins, &qos};
@@ -698,14 +704,14 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
       }
       case OP_KV: {
         const size_t base = ((size_t)m->l[o->layer].kvi * nctx + pos) * kvd;
-        float *kc = b->kc + base, *vc = b->vc + base;
+        void *kc = (char *)b->kc + base * b->kvb, *vc = (char *)b->vc + base * b->kvb;
         void *args[] = {&A, &B, &kc, &vc, &n};
         launch(b, K_KV, elem_groups, args);
         break;
       }
       case OP_ATTN: {
         const size_t base = (size_t)m->l[o->layer].kvi * nctx * kvd;
-        float *kc = b->kc + base, *vc = b->vc + base;
+        void *kc = (char *)b->kc + base * b->kvb, *vc = (char *)b->vc + base * b->kvb;
         void *GT = o->gt >= 0 ? b->arena + g->bufs[o->gt].off + o->gtoff + (size_t)t * g->bufs[o->gt].stride : NULL;
         u32 gs = o->gstride;
         static int agmin = -1;

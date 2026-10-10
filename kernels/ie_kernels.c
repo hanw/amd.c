@@ -25,6 +25,18 @@ typedef unsigned char u8;
 typedef unsigned short u16;
 typedef signed char i8;
 typedef _Float16 f16;
+/* The KV cache element: fp16 (half the memory of f32: 128K positions of
+ * Qwen3.8-27B in 9.1 GB), or f32 with -DIE_KV_F32. The attention kernels
+ * read it as f32 (exact), so only the store rounds. The host finds the type
+ * by the kernel ie_kv_f16 (present only in the fp16 build). */
+#ifdef IE_KV_F32
+typedef float kvt;
+typedef float kv4 __attribute__((ext_vector_type(4)));
+#else
+typedef _Float16 kvt;
+typedef _Float16 kv4 __attribute__((ext_vector_type(4)));
+#endif
+#define KV4(p, i) __builtin_convertvector(((const G kv4 *)(p))[i], f32x4) /* 4 elements as f32 */
 
 static inline u32 tid(void) { return __builtin_amdgcn_workitem_id_x(); }
 static inline u32 wgid(void) { return __builtin_amdgcn_workgroup_id_x(); }
@@ -1667,7 +1679,7 @@ KERNEL ie_rope(G float *x, const G float *cs, const G float *sn, u32 nh, u32 hd,
  * caches kc/vc (already offset to this layer and position). Threads
  * 0 .. (nq+nkv)*h2 - 1 rotate one pair each (a k pair also writes kc); the
  * next kvd threads copy v. */
-KERNEL ie_rope_kv(G float *q, G float *k, const G float *v, G float *kc, G float *vc, const G float *cs,
+KERNEL ie_rope_kv(G float *q, G float *k, const G float *v, G kvt *kc, G kvt *vc, const G float *cs,
                   const G float *sn, u32 nq, u32 nkv, u32 hd, u32 neox) {
   const u32 h2 = hd >> 1, t = wgid() * NT + tid(), nrot = (nq + nkv) * h2;
   if (t < nrot) {
@@ -1690,7 +1702,7 @@ KERNEL ie_rope_kv(G float *q, G float *k, const G float *v, G float *kc, G float
 
 /* Store k and v (n floats each) into the caches at kc/vc (already offset to
  * the row of this layer and position). */
-KERNEL ie_kv_store(const G float *k, const G float *v, G float *kc, G float *vc, u32 n) {
+KERNEL ie_kv_store(const G float *k, const G float *v, G kvt *kc, G kvt *vc, u32 n) {
   const u32 i = wgid() * NT + tid();
   if (i < n) {
     kc[i] = k[i];
@@ -1700,12 +1712,16 @@ KERNEL ie_kv_store(const G float *k, const G float *v, G float *kc, G float *vc,
 
 /* --------------------------------------------------------------- attention */
 
+#ifndef IE_KV_F32
+KERNEL ie_kv_f16(void) {} /* marker: the KV cache is fp16 */
+#endif
+
 /* One decode token. One workgroup per query head h (GQA: KV head h / grp).
  * kc, vc: the caches of this layer, [n_ctx][n_kv * hd]. sc: scores
  * [n_head][n_ctx]. Positions 0..pos. */
 static inline float sigmoidf(float x) { return 1.0f / (1.0f + __builtin_expf(-x)); }
 
-KERNEL ie_attn(const G float *q, const G float *kc, const G float *vc, G float *sc, G float *out, u32 pos,
+KERNEL ie_attn(const G float *q, const G kvt *kc, const G kvt *vc, G float *sc, G float *out, u32 pos,
                u32 n_ctx, u32 hd, u32 n_head, u32 n_kv, G u8 *oq, const G float *gate, u32 gstride) {
   const u32 h = wgid(), kh = h / (n_head / n_kv), kvd = n_kv * hd;
   const G float *qh = q + h * hd;
@@ -1713,7 +1729,7 @@ KERNEL ie_attn(const G float *q, const G float *kc, const G float *vc, G float *
   const float scale = 1.0f / __builtin_sqrtf((float)hd);
   float mx = -__builtin_inff();
   for (u32 p = tid(); p <= pos; p += NT) {
-    const G float *k = kc + (unsigned long)p * kvd + kh * hd;
+    const G kvt *k = kc + (unsigned long)p * kvd + kh * hd;
     float d = 0.0f;
     for (u32 i = 0; i < hd; i++) d += qh[i] * k[i];
     d *= scale;
@@ -1754,8 +1770,8 @@ static LDS float at_m[8], at_l[8];
 static LDS float at_o[8][256];
 static LDS u32 at_last;
 /* the weights of the splits in the merge (nsplit <= IE_ATT_MAX_SPLIT) */
-static LDS float at_w[2048];
-static inline void attn_split_body(const G float *q, const G float *kc, const G float *vc, G float *part, G float *out,
+static LDS float at_w[4096];
+static inline void attn_split_body(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out,
                                    u32 pos, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq,
                                    const G float *gate, u32 gstride, u32 h, u32 s) {
   const u32 kh = h / (n_head / n_kv), kvd = n_kv * hd;
@@ -1770,8 +1786,8 @@ static inline void attn_split_body(const G float *q, const G float *kc, const G 
   float m = -__builtin_inff(), sum = 0.0f;
   const u32 p0 = s * ch, p1 = p0 + ch < pos + 1u ? p0 + ch : pos + 1u;
   for (u32 p = p0 + w; p < p1; p += 8u) {
-    const G float *k = kc + (unsigned long)p * kvd + kh * hd;
-    const G float *v = vc + (unsigned long)p * kvd + kh * hd;
+    const G kvt *k = kc + (unsigned long)p * kvd + kh * hd;
+    const G kvt *v = vc + (unsigned long)p * kvd + kh * hd;
     float d = 0.0f;
     for (u32 j = 0; j < 8u; j++)
       if (l + 32u * j < hd) d += qv[j] * k[l + 32u * j];
@@ -1832,7 +1848,7 @@ static inline void attn_split_body(const G float *q, const G float *kc, const G 
   }
   if (tid() == 0u) count[h] = 0u;
 }
-KERNEL ie_attn_split(const G float *q, const G float *kc, const G float *vc, G float *part, G float *out, u32 pos,
+KERNEL ie_attn_split(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 pos,
                      u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *gate,
                      u32 gstride) {
   attn_split_body(q, kc, vc, part, out, pos, hd, n_head, n_kv, nsplit, ch, count, oq, gate, gstride, wgid() / nsplit,
@@ -1845,7 +1861,7 @@ KERNEL ie_attn_split(const G float *q, const G float *kc, const G float *vc, G f
  * smax (smax: the splits of the last token); a workgroup past the splits of
  * its token returns at once. Per token: its part area (pstride floats), its
  * counters (n_head) and the byte strides of q, out, oq and gate. */
-KERNEL ie_attn_split_t(const G float *q, const G float *kc, const G float *vc, G float *part, G float *out, u32 pos,
+KERNEL ie_attn_split_t(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 pos,
                        u32 hd, u32 n_head, u32 n_kv, u32 smax, u32 ch, G u32 *count, G u8 *oq, const G float *gate,
                        u32 gstride, u32 qst, u32 ost, u32 oqst, u32 gst, u32 pstride) {
   const u32 j = __builtin_amdgcn_workgroup_id_y(), pj = pos + j;
@@ -1877,11 +1893,11 @@ KERNEL ie_attn_split_t(const G float *q, const G float *kc, const G float *vc, G
  * merges the splits with all 256 threads, as attn_split_body (the same sums
  * in the same order, its loads issued 8 at a time). LDS: the K/V buffer also
  * holds the merge weights (16 KB in all). hd <= 256, hd % 4 == 0,
- * ch % 8 == 0, kc and vc 16-byte aligned. */
+ * ch % 8 == 0, kc and vc 8-byte aligned. */
 #define AKV_P 8u
 static LDS float akv_kv[2][AKV_P][256]; /* K, V; in the merge: the weights of the splits (<= 4096) */
 static LDS u32 akv_last[8];
-KERNEL ie_attn_kv(const G float *q, const G float *kc, const G float *vc, G float *part, G float *out, u32 pos, u32 hd,
+KERNEL ie_attn_kv(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 pos, u32 hd,
                   u32 n_head, u32 n_kv, u32 smax, u32 ch, G u32 *count, G u8 *oq, const G float *gate, u32 gstride, u32 qst,
                   u32 ost, u32 oqst, u32 gst, u32 pstride, u32 T, u32 nb, u32 spw) {
   const u32 grp = n_head / n_kv, kvd = n_kv * hd, ngs = (smax + spw - 1u) / spw;
@@ -1912,8 +1928,8 @@ KERNEL ie_attn_kv(const G float *q, const G float *kc, const G float *vc, G floa
     kr[u] = vr[u] = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};                                          \
     if (i4 < n4 && (c) + r < PE) {                                                           \
       const unsigned long o = ((unsigned long)((c) + r) * kvd + kh * hd) / 4u + e4;          \
-      kr[u] = ((const G f32x4 *)kc)[o];                                                      \
-      vr[u] = ((const G f32x4 *)vc)[o];                                                      \
+      kr[u] = KV4(kc, o);                                                                    \
+      vr[u] = KV4(vc, o);                                                                    \
     }                                                                                        \
   }
   AKV_LOAD(P0)
@@ -2034,12 +2050,12 @@ KERNEL ie_attn_kv(const G float *q, const G float *kc, const G float *vc, G floa
  * t), then RoPE of the first nrot values (pairs (i, i + nrot/2)); q goes to
  * qo + g * hd, k to the cache kc. */
 static LDS float qk_buf[256];
-KERNEL ie_qkn_rope_kv(const G float *qkv, G float *qo, G float *kc, G float *vc, const G float *qw, const G float *kw,
+KERNEL ie_qkn_rope_kv(const G float *qkv, G float *qo, G kvt *kc, G kvt *vc, const G float *qw, const G float *kw,
                       const G float *cs, const G float *sn, u32 nq, u32 nkv, u32 hd, u32 nrot, float eps, u32 ins,
                       u32 qos) {
   /* token y of a multi-token launch: position + y (KV rows and RoPE tables) */
   qkv = TOKC(qkv, ins), qo = TOK(qo, qos);
-  kc = TOK(kc, nkv * hd * 4u), vc = TOK(vc, nkv * hd * 4u);
+  kc = TOK(kc, nkv * hd * (u32)sizeof(kvt)), vc = TOK(vc, nkv * hd * (u32)sizeof(kvt));
   cs = TOKC(cs, (nrot >> 1) * 4u), sn = TOKC(sn, (nrot >> 1) * 4u);
   const u32 g = wgid(), t = tid();
   if (g >= nq + nkv) { /* value head */
@@ -2063,7 +2079,10 @@ KERNEL ie_qkn_rope_kv(const G float *qkv, G float *qo, G float *kc, G float *vc,
     const float a = qk_buf[i], b = qk_buf[i + h2];
     r = t < h2 ? a * cs[i] - b * sn[i] : a * sn[i] + b * cs[i];
   }
-  if (t < hd) (is_k ? kc + h * hd : qo + h * hd)[t] = r;
+  if (t < hd) {
+    if (is_k) kc[h * hd + t] = (kvt)r;
+    else qo[h * hd + t] = r;
+  }
 }
 
 /* Linear attention (Gated DeltaNet) of T <= 16 tokens at positions pos ..
@@ -2561,7 +2580,7 @@ KERNEL ie_ring_store(const G float *in, G float *ring, u32 pos, u32 T, u32 cd, u
  * in LDS (as ie_attn_split, with one split). Output gate and Q8 copy as
  * ie_attn_split. Strides (bytes) between the tokens: qs (q), os (out), oqs
  * (oq), gs (gate). hd <= 256, hd % 32 == 0 when oq is set. */
-KERNEL ie_attn_pf(const G float *q, const G float *kc, const G float *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
+KERNEL ie_attn_pf(const G float *q, const G kvt *kc, const G kvt *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
                   u32 n_kv, G u8 *oq, const G float *gate, u32 gstride, u32 qs, u32 os, u32 oqs, u32 gs) {
   q = TOKC(q, qs), out = TOK(out, os), oq = TOK(oq, oqs), gate = TOK(gate, gs);
   const u32 h = wgid(), pos = pos0 + tokid(), kh = h / (n_head / n_kv), kvd = n_kv * hd;
@@ -2575,8 +2594,8 @@ KERNEL ie_attn_pf(const G float *q, const G float *kc, const G float *vc, G floa
   }
   float m = -__builtin_inff(), sum = 0.0f;
   for (u32 p = w; p <= pos; p += 8u) {
-    const G float *k = kc + (unsigned long)p * kvd + kh * hd;
-    const G float *v = vc + (unsigned long)p * kvd + kh * hd;
+    const G kvt *k = kc + (unsigned long)p * kvd + kh * hd;
+    const G kvt *v = vc + (unsigned long)p * kvd + kh * hd;
     float d = 0.0f;
     for (u32 j = 0; j < 8u; j++)
       if (l + 32u * j < hd) d += qv[j] * k[l + 32u * j];
@@ -2622,7 +2641,7 @@ KERNEL ie_rmsnorm_t(const G float *x, const G float *w, G float *y, u32 n, float
  * time in LDS. As ie_attn_pf otherwise. */
 #define GA_MAX 8u
 static LDS float ag_m[8][GA_MAX], ag_l[8][GA_MAX];
-KERNEL ie_attn_pfg(const G float *q, const G float *kc, const G float *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
+KERNEL ie_attn_pfg(const G float *q, const G kvt *kc, const G kvt *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
                    u32 n_kv, G u8 *oq, const G float *gate, u32 gstride, u32 qs, u32 os, u32 oqs, u32 gs) {
   q = TOKC(q, qs), out = TOK(out, os), oq = TOK(oq, oqs), gate = TOK(gate, gs);
   const u32 kh = wgid(), pos = pos0 + tokid(), ga = n_head / n_kv, kvd = n_kv * hd;
@@ -2639,8 +2658,8 @@ KERNEL ie_attn_pfg(const G float *q, const G float *kc, const G float *vc, G flo
     }
   }
   for (u32 p = w; p <= pos; p += 8u) {
-    const G float *k = kc + (unsigned long)p * kvd + kh * hd;
-    const G float *v = vc + (unsigned long)p * kvd + kh * hd;
+    const G kvt *k = kc + (unsigned long)p * kvd + kh * hd;
+    const G kvt *v = vc + (unsigned long)p * kvd + kh * hd;
     float kr[8], vr[8];
     for (u32 j = 0; j < 8u; j++) {
       kr[j] = l + 32u * j < hd ? k[l + 32u * j] : 0.0f;
@@ -2714,7 +2733,7 @@ KERNEL ie_attn_pfg(const G float *q, const G float *kc, const G float *vc, G flo
 static LDS f16 fa_k[FA_NB * FA_KS];
 static LDS f16 fa_vt[FA_DC * FA_VS];
 static LDS f16 fa_p[8u][16u * FA_VS];
-KERNEL ie_attn_fa(const G float *q, const G float *kc, const G float *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
+KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
                   u32 n_kv, const G float *gate, u32 gstride, u32 qs, u32 os, u32 gs, u32 T) {
   const u32 ntile = (T + 15u) / 16u, nparts = (hd + FA_DC - 1u) / FA_DC;
   const u32 tile = wgid() % ntile, part = (wgid() / ntile) % nparts, kh = wgid() / (ntile * nparts), t0 = 16u * tile;
@@ -2743,14 +2762,14 @@ KERNEL ie_attn_fa(const G float *q, const G float *kc, const G float *vc, G floa
     for (u32 i4 = tid(); i4 < n4; i4 += NT) {
       const u32 r = i4 / h4, e4 = i4 - r * h4, p = kb + r;
       f32x4 kv = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};
-      if (p < kend) kv = ((const G f32x4 *)kc)[((unsigned long)p * kvd + kh * hd) / 4u + e4];
+      if (p < kend) kv = KV4(kc, ((unsigned long)p * kvd + kh * hd) / 4u + e4);
       LDSP f16 *kd = fa_k + r * FA_KS + 4u * e4;
       kd[0] = (f16)kv.x, kd[1] = (f16)kv.y, kd[2] = (f16)kv.z, kd[3] = (f16)kv.w;
     }
     for (u32 i4 = tid(); i4 < FA_NB * c4; i4 += NT) {
       const u32 r = i4 / c4, e4 = i4 - r * c4, p = kb + r;
       f32x4 vv = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};
-      if (p < kend) vv = ((const G f32x4 *)vc)[((unsigned long)p * kvd + kh * hd + c0) / 4u + e4];
+      if (p < kend) vv = KV4(vc, ((unsigned long)p * kvd + kh * hd + c0) / 4u + e4);
       fa_vt[(4u * e4 + 0u) * FA_VS + r] = (f16)vv.x;
       fa_vt[(4u * e4 + 1u) * FA_VS + r] = (f16)vv.y;
       fa_vt[(4u * e4 + 2u) * FA_VS + r] = (f16)vv.z;
