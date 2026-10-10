@@ -2844,6 +2844,158 @@ KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *o
   }
 }
 
+/* ie_attn_fa with S computed once (hd == 256): workgroup (kh, tile) = KV
+ * head kh and the 16 tokens 16 tile .. + 15, all 256 output columns. Per
+ * block of FA_NB keys: K and all of V^T to LDS; phase A: wave w < GA
+ * computes S = Q K^T of head kh * GA + w (Q in its registers), the online
+ * softmax of its rows, and writes P (fp16) and the rescale c of each row to
+ * LDS; phase B: the GA * 16 output tiles (head, 16 columns) are spread
+ * over all 8 waves, in registers: FA2_OA per wave w < GA (it also holds Q),
+ * the rest on the other 8 - GA waves (<= FA2_OB each). Each does O = O * c
+ * + P V for its tiles. At the end wave w < GA writes 1 / l of its rows to
+ * LDS for the owners of the tiles. The two kinds of waves run separate
+ * copies of the loop (fa2_run, the same barriers), so that their registers
+ * are allocated apart. The same arithmetic per output element as ie_attn_fa
+ * (S, P, the sums in the same order), so the same result. Needs GA <= 6. */
+#define FA2_OA 10u
+#define FA2_OB 18u
+#define FA2_VS (FA_NB + 8u)
+static LDS f16 fa2_vt[256u * FA2_VS];
+static LDS float fa2_c[8u][16u];
+static inline __attribute__((always_inline)) void fa2_run(const G float *q, const G kvt *kc, const G kvt *vc,
+                                                         G float *out, u32 pos0, u32 n_head, u32 n_kv,
+                                                         const G float *gate, u32 gstride, u32 qs, u32 os, u32 gs,
+                                                         u32 T, const int dos, const u32 OT, u32 tb, u32 tn) {
+  const u32 ntile = (T + 15u) / 16u, tile = wgid() % ntile, kh = wgid() / ntile, t0 = 16u * tile;
+  const u32 hd = 256u, ga = n_head / n_kv, kvd = n_kv * hd, w = __builtin_amdgcn_readfirstlane(tid() >> 5), l = lane();
+  const u32 hl = l >> 4, rl = l & 15u;
+  const u32 tlast = t0 + 15u < T ? t0 + 15u : T - 1u, kend = pos0 + tlast + 1u; /* keys 0 .. kend - 1 */
+  h8 qa[16];
+  if (dos) {
+    const float scale = 1.0f / 16.0f; /* 1 / sqrt(256) */
+    const u32 tq = t0 + rl < T ? t0 + rl : T - 1u;
+    const G float *qr = (const G float *)((const G u8 *)q + (unsigned long)tq * qs) + (kh * ga + w) * hd;
+#pragma unroll
+    for (u32 ks = 0; ks < 16u; ks++)
+      #pragma unroll
+      for (u32 e = 0; e < 8u; e++) qa[ks][e] = (f16)(qr[16u * ks + 8u * hl + e] * scale);
+  }
+  v8f o[FA2_OB], zero = (v8f)(0.0f);
+  float m[8], ls[8];
+#pragma unroll
+  for (u32 t = 0; t < OT; t++) o[t] = zero;
+  #pragma unroll
+  for (u32 v = 0; v < 8u; v++) m[v] = -__builtin_inff(), ls[v] = 0.0f;
+  const u32 n4 = FA_NB * 64u;
+  for (u32 kb = 0; kb < kend; kb += FA_NB) {
+    /* opaque copies of the lane numbers: the LDS addresses are computed in the loop, not kept in registers */
+    u32 hlo = hl, rlo = rl;
+    __asm__ volatile("" : "+v"(hlo), "+v"(rlo));
+#pragma unroll 1
+    for (u32 i4 = tid(); i4 < n4; i4 += NT) {
+      const u32 r = i4 >> 6, e4 = i4 & 63u, p = kb + r;
+      f32x4 kv = (f32x4){0.0f, 0.0f, 0.0f, 0.0f}, vv = kv;
+      if (p < kend) {
+        const unsigned long o4 = ((unsigned long)p * kvd + kh * hd) / 4u + e4;
+        kv = KV4(kc, o4), vv = KV4(vc, o4);
+      }
+      LDSP f16 *kd = fa_k + r * FA_KS + 4u * e4;
+      kd[0] = (f16)kv.x, kd[1] = (f16)kv.y, kd[2] = (f16)kv.z, kd[3] = (f16)kv.w;
+      fa2_vt[(4u * e4 + 0u) * FA2_VS + r] = (f16)vv.x;
+      fa2_vt[(4u * e4 + 1u) * FA2_VS + r] = (f16)vv.y;
+      fa2_vt[(4u * e4 + 2u) * FA2_VS + r] = (f16)vv.z;
+      fa2_vt[(4u * e4 + 3u) * FA2_VS + r] = (f16)vv.w;
+    }
+    barrier();
+    if (dos) { /* phase A */
+      v8f s[2];
+#pragma unroll
+      for (u32 j = 0; j < 2u; j++) {
+        s[j] = zero;
+#pragma unroll
+        for (u32 ks = 0; ks < 16u; ks++) {
+          const h8 kb8 = *(const LDSP h8 *)(fa_k + (16u * j + rlo) * FA_KS + 16u * ks + 8u * hlo);
+          s[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qa[ks], kb8, s[j]);
+        }
+      }
+#pragma unroll
+      for (u32 v = 0; v < 8u; v++) {
+        const u32 tp = pos0 + t0 + 8u * hlo + v;
+        const u32 k0 = kb + rlo, k1 = kb + 16u + rlo;
+        const float s0 = k0 <= tp ? s[0][v] : -__builtin_inff(), s1 = k1 <= tp ? s[1][v] : -__builtin_inff();
+        float rm = __builtin_fmaxf(s0, s1);
+        #pragma unroll
+        for (u32 x = 1u; x < 16u; x <<= 1) rm = __builtin_fmaxf(rm, shfl_xor_f(rm, x));
+        const float mn = __builtin_fmaxf(m[v], rm);
+        const float c = __builtin_expf(m[v] - mn);
+        const float p0 = __builtin_expf(s0 - mn), p1 = __builtin_expf(s1 - mn);
+        ls[v] = ls[v] * c + p0 + p1;
+        m[v] = mn;
+        LDSP f16 *pr = fa_p[w] + (8u * hlo + v) * FA_VS;
+        pr[rlo] = (f16)p0;
+        pr[16u + rlo] = (f16)p1;
+        if (rlo == 0u) fa2_c[w][8u * hlo + v] = c;
+      }
+    }
+    barrier();
+#pragma unroll
+    for (u32 t = 0; t < OT; t++) { /* phase B: tiles tb .. tb + tn - 1 (head i / 16, columns 16 (i % 16) ..) */
+      if (t < tn) {
+        const u32 i = tb + t, hh = i >> 4, nt = i & 15u;
+        h8 pa[2];
+        #pragma unroll
+        for (u32 kk = 0; kk < 2u; kk++) pa[kk] = *(const LDSP h8 *)(fa_p[hh] + rlo * FA_VS + 16u * kk + 8u * hlo);
+        #pragma unroll
+        for (u32 v = 0; v < 8u; v++) o[t][v] *= fa2_c[hh][8u * hlo + v];
+#pragma unroll
+        for (u32 kk = 0; kk < 2u; kk++) {
+          const h8 vb = *(const LDSP h8 *)(fa2_vt + (16u * nt + rlo) * FA2_VS + 16u * kk + 8u * hlo);
+          o[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pa[kk], vb, o[t]);
+        }
+      }
+    }
+    barrier();
+  }
+  u32 hle = hl, rle = rl; /* opaque: the epilogue's addresses are not computed before the loop */
+  __asm__ volatile("" : "+v"(hle), "+v"(rle));
+  if (dos)
+#pragma unroll
+    for (u32 v = 0; v < 8u; v++) {
+      float x = ls[v];
+      #pragma unroll
+      for (u32 s = 1u; s < 16u; s <<= 1) x += shfl_xor_f(x, s);
+      if (rl == 0u) fa2_c[w][8u * hl + v] = 1.0f / x;
+    }
+  barrier();
+#pragma unroll
+  for (u32 t = 0; t < OT; t++)
+    if (t < tn) {
+      const u32 i = tb + t, hh = i >> 4, nt = i & 15u, h = kh * ga + hh;
+      #pragma unroll
+      for (u32 v = 0; v < 8u; v++) {
+        const u32 tk = t0 + 8u * hle + v, d = 16u * nt + rle;
+        if (tk >= T) continue;
+        float x = o[t][v] * fa2_c[hh][8u * hle + v];
+        if (gate) x = x * sigmoidf(((const G float *)((const G u8 *)gate + (unsigned long)tk * gs))[h * gstride + d]);
+        ((G float *)((G u8 *)out + (unsigned long)tk * os))[h * hd + d] = x;
+      }
+    }
+}
+KERNEL ie_attn_fa2(const G float *q, const G kvt *kc, const G kvt *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
+                   u32 n_kv, const G float *gate, u32 gstride, u32 qs, u32 os, u32 gs, u32 T) {
+  (void)hd;
+  const u32 ga = n_head / n_kv, w = __builtin_amdgcn_readfirstlane(tid() >> 5), ntot = 16u * ga;
+  const u32 na = FA2_OA * ga < ntot ? FA2_OA * ga : ntot; /* the tiles of the S waves */
+  const u32 nbw = 8u - ga, per = (ntot - na + nbw - 1u) / nbw; /* the others: per wave (<= FA2_OB) */
+  if (w < ga) {
+    const u32 tb = w * FA2_OA, tn = tb < na ? (na - tb < FA2_OA ? na - tb : FA2_OA) : 0u;
+    fa2_run(q, kc, vc, out, pos0, n_head, n_kv, gate, gstride, qs, os, gs, T, 1, FA2_OA, tb, tn);
+  } else {
+    const u32 tb = na + (w - ga) * per, tn = tb < ntot ? (ntot - tb < per ? ntot - tb : per) : 0u;
+    fa2_run(q, kc, vc, out, pos0, n_head, n_kv, gate, gstride, qs, os, gs, T, 0, FA2_OB, tb, tn);
+  }
+}
+
 /* The Q8 copy of ie_attn_fa's output (fused into ie_attn_pfg, a separate
  * pass here: the parts of a head are in different workgroups). Workgroup y
  * = token, wave = block of 32, as ie_quant_q8. */
