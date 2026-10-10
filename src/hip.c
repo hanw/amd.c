@@ -90,11 +90,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_ATTN_FA, K_ATTN_FA_Q8, K_ATTN_FA2, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_ATTN_FA, K_ATTN_FA_Q8, K_ATTN_FA2, K_GEMM_F32_S, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv", "ie_attn_fa", "ie_attn_fa_q8", "ie_attn_fa2"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv", "ie_attn_fa", "ie_attn_fa_q8", "ie_attn_fa2", "ie_gemm_f32_s"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 /* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
  * linear layer are gpu_backend.ns: at least the tokens of a verify run */
@@ -349,7 +349,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   HIP(H.EventCreate(&b->e0));
   HIP(H.EventCreate(&b->e1));
   const char *pe = getenv("IE_PROFILE");
-  b->prof = pe && pe[0] == '1';
+  b->prof = pe && (pe[0] == '1' || pe[0] == '2') ? pe[0] - '0' : 0; /* 1: decode steps; 2: prompt chunks */
   if (b->prof) {
     b->pev = calloc(b->g->n_ops, sizeof(hipEvent_t));
     b->pms = calloc(b->g->n_ops, sizeof(double));
@@ -574,7 +574,13 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           void *ta[] = {&w0, &A, &B, &rows, &cols, &bias, &R, &xs, &ys, &rs};
           static int gmin = -1;
           if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
-          if ((int)T >= gmin) launch_t(b, K_GEMV_F32_TW, gemv_groups(rows), T, ta); /* prompt chunk: one row per wave */
+          static int fs = -1; /* IE_GEMM_F32_S=0: off */
+          if (fs < 0) fs = !(getenv("IE_GEMM_F32_S") && getenv("IE_GEMM_F32_S")[0] == '0');
+          if ((int)T >= gmin && fs && rows <= 1024u) { /* small matrix: 8 rows x 8 tokens per workgroup */
+            u32 TT = T;
+            void *sa[] = {&w0, &A, &B, &rows, &cols, &bias, &R, &xs, &ys, &rs, &TT};
+            launch(b, K_GEMM_F32_S, ((rows + 7u) / 8u) * ((T + 7u) / 8u), sa);
+          } else if ((int)T >= gmin) launch_t(b, K_GEMV_F32_TW, gemv_groups(rows), T, ta); /* prompt chunk: one row per wave */
           else launch_t(b, K_GEMV_F32_T, rows >= 253u && rows <= 256u ? 257u : rows, T, ta); /* one row per workgroup */
           break;
         }
@@ -911,7 +917,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   float t = 0;
   HIP(H.EventElapsedTime(&t, b->e0, b->e1));
   if (ms) *ms = t;
-  if (b->prof && pos > 0) { /* skip the first step (warm up) */
+  if (b->prof == 1 && pos > 0) { /* skip the first step (warm up) */
     for (uint32_t i = 0; i < g->n_main; i++) {
       float d = 0;
       HIP(H.EventElapsedTime(&d, i ? b->pev[i - 1] : b->e0, b->pev[i]));
@@ -930,7 +936,19 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
   gpu_backend *b = (gpu_backend *)bk;
   const graph *g = b->g;
   if (sec == 1 && g->mtp_argmax < 0) ie_die("the graph has no MTP ops");
+  /* IE_PROFILE=2: the ops of the prompt chunks (ms per chunk in the report) */
+  const int pc = b->prof == 2 && !sec && T > 1u;
+  if (pc) HIP(H.EventRecord(b->e0, NULL));
   run_ops(b, sec ? g->n_main : 0, sec ? g->n_ops : g->n_main, toks, T, pos, last_only ? T - 1 : 0);
+  if (pc) {
+    HIP(H.DeviceSynchronize()); /* the events are on the NULL stream: run with IE_STREAM=0 for exact times */
+    hipEvent_t prev = b->e0;
+    for (uint32_t i = 0; i < g->n_main; i++) { /* an op a chunk skips has no event: time 0 */
+      float d = 0;
+      if (H.EventElapsedTime(&d, prev, b->pev[i]) == 0) b->pms[i] += d, prev = b->pev[i];
+    }
+    b->psteps++;
+  }
   const buf *am = &g->bufs[sec ? g->mtp_argmax : g->argmax];
   u32 *tmp = malloc((size_t)T * am->stride);
   if (!tmp) ie_die("out of memory");

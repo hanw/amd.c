@@ -1637,6 +1637,49 @@ KERNEL ie_gemv_f32_tw(const G float *w, const G float *x, G float *y, u32 rows, 
   if (l == 0u) y[r] = epilogue(acc, r, bias, res);
 }
 
+/* f32 matrix x prompt chunk, for small matrices (the 96 x 5120 projections
+ * of qwen35): workgroup (g, tt) = rows 8 g .. + 7 (one per wave) and tokens
+ * 8 tt .. + 7. Per chunk of 256 columns the 8 tokens' x go to LDS once for
+ * the 8 waves; lane l takes the columns l, l + 32, .. of its row, each
+ * weight used for the 8 tokens. Then a wave sum per token. Not bitwise equal
+ * to ie_gemv_f32. */
+#define GS_T 8u
+#define GS_C 256u
+static LDS float gs_x[GS_T][GS_C];
+KERNEL ie_gemm_f32_s(const G float *w, const G float *x, G float *y, u32 rows, u32 cols, const G float *bias,
+                     const G float *res, u32 xs, u32 ys, u32 rs, u32 T) {
+  const u32 ntt = (T + GS_T - 1u) / GS_T, tt = wgid() % ntt, g = wgid() / ntt, wv = tid() >> 5, l = lane();
+  const u32 r = 8u * g + wv, t0 = GS_T * tt;
+  const G float *row = w + (unsigned long)(r < rows ? r : rows - 1u) * cols;
+  float acc[GS_T];
+#pragma unroll
+  for (u32 t = 0; t < GS_T; t++) acc[t] = 0.0f;
+  for (u32 c0 = 0; c0 < cols; c0 += GS_C) {
+    const u32 nc = cols - c0 < GS_C ? cols - c0 : GS_C;
+#pragma unroll
+    for (u32 n = 0; n < GS_T * GS_C / NT; n++) { /* 8 tokens x 256 columns */
+      const u32 i = tid() + NT * n, t = i / GS_C, c = i % GS_C, tk = t0 + t < T ? t0 + t : T - 1u;
+      gs_x[t][c] = c < nc ? ((const G float *)((const G u8 *)x + (unsigned long)tk * xs))[c0 + c] : 0.0f;
+    }
+    barrier();
+#pragma unroll
+    for (u32 k = 0; k < GS_C / 32u; k++) {
+      const u32 c = l + 32u * k;
+      const float wk = c < nc ? row[c0 + c] : 0.0f;
+#pragma unroll
+      for (u32 t = 0; t < GS_T; t++) acc[t] += wk * gs_x[t][c];
+    }
+    barrier();
+  }
+#pragma unroll
+  for (u32 t = 0; t < GS_T; t++) {
+    const float a = wave_tree_f(acc[t]);
+    const u32 tk = t0 + t;
+    if (l == 0u && r < rows && tk < T)
+      ((G float *)((G u8 *)y + (unsigned long)tk * ys))[r] = epilogue(a, r, bias, res ? (const G float *)((const G u8 *)res + (unsigned long)tk * rs) : res);
+  }
+}
+
 /* ---------------------------------------------------------- elementwise */
 
 KERNEL ie_bias(G float *a, const G float *w, u32 n) {
