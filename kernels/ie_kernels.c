@@ -1350,6 +1350,134 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
 #undef GK_STORE_X
 }
 
+/* Q4_K x fp16 activations for prompt chunks (ie_gemm_q4k_h). The Q8
+ * activations of the chunk first become fp16 (ie_q8_f16: q d, exact up to
+ * the fp16 rounding); the weights are dequantized to fp16 in LDS (w = d sc q
+ * - dmin m, once per weight and workgroup) and fp16 WMMA sums in f32 over
+ * all of K: no per-block scale math on the sums (ie_gemm_q4kr: 3 VALU per
+ * output element and block). Workgroup = 64 rows x 512 tokens, so a chunk
+ * of up to 512 tokens reads each weight once; wave w: the 64 rows x tokens
+ * 64 w .. + 63 (4 x 4 tiles of 16 x 16, 128 f32 registers). Per block of 32
+ * (K step): the activations (512 x 32 fp16) and the dequantized weights
+ * (64 x 32) to LDS, the next block's loads in registers during the math.
+ * Rows % 64 == 0, nb % 8 == 0 (the host checks). Measured against
+ * ie_gemm_q4kr (one harness, tools/tilelang/ab_q4k.py, 512 tokens): 34816 x
+ * 5120 2.206 vs 1.953 ms, 5120 x 17408 1.312 vs 0.966 ms; TileLang's kernel
+ * with the same tile (512 x 64 x 32) 1.83 ms: off by default (IE_GEMM_H=1). */
+KERNEL ie_q8_f16(const G u8 *q, G f16 *xh, u32 nb, u32 qs, u32 hs) {
+  q = TOKC(q, qs), xh = TOK(xh, hs);
+  const u32 i = wgid() * NT + tid();
+  if (i >= nb * 32u) return;
+  const float d = ((const G float *)(q + 32u * nb))[i >> 5];
+  xh[i] = (f16)((float)((const G i8 *)q)[i] * d);
+}
+#define QH_R 64u
+#define QH_T 512u
+#define QH_S 40u /* LDS row stride, halves (80 bytes: the 16 rows of a lane group hit distinct banks) */
+static LDS f16 qh_x[QH_T * QH_S] __attribute__((aligned(16)));
+static LDS f16 qh_w[QH_R * QH_S] __attribute__((aligned(16)));
+typedef unsigned int u32x2v __attribute__((ext_vector_type(2)));
+static inline __attribute__((always_inline)) void gemm_q4k_h(const G u32 *qw, const G u16 *qs, const G f16 *xh, G float *y, u32 rows,
+                                                            u32 nb, const G float *bias, const G float *res, u32 T, u32 hs, u32 ys,
+                                                            u32 rs, const u32 QT) {
+  const u32 WT = QT / 8u, NJ = WT / 16u, NL = QT * 4u / NT; /* tokens per wave, its token tiles, 16-byte loads per thread */
+  const u32 ntt = (T + QT - 1u) / QT, tt = wgid() % ntt, rt = wgid() / ntt;
+  const u32 r0 = rt * QH_R, t0 = tt * QT, w = __builtin_amdgcn_readfirstlane(tid() >> 5), l = lane();
+  const u32 hl = l >> 4, rl = l & 15u, wt0 = t0 + WT * w;
+  const int won = wt0 < T; /* wave-uniform: this wave has tokens */
+  f8 acc[4][4]; /* [row tile][token tile < NJ] */
+#pragma unroll
+  for (u32 i = 0; i < 4u; i++)
+#pragma unroll
+    for (u32 j = 0; j < 4u; j++) acc[i][j] = (f8)(0.0f);
+  /* loaders: activations, 16 bytes (8 halves) per chunk c = tid + 256 n: token c / 4, part c % 4 */
+  const G f16 *xp[8];
+#pragma unroll
+  for (u32 n = 0; n < NL; n++) {
+    const u32 c = tid() + NT * n, tk = t0 + (c >> 2);
+    xp[n] = xh + (unsigned long)(tk < T ? tk : T - 1u) * hs + (c & 3u) * 8u;
+  }
+  /* weights: thread = row tid / 4, quarter q4 = tid % 4: weights 8 q4 .. + 7 of each block
+   * (q4 < 2: low nibbles of bytes 8 q4 .. ; q4 >= 2: high nibbles of bytes 8 (q4 - 2) ..) */
+  const u32 wr = tid() >> 2, q4 = tid() & 3u;
+  const G u8 *wp = (const G u8 *)qw + (unsigned long)(r0 + wr) * nb * 16u + (q4 & 1u) * 8u;
+  const G u16 *sp = qs + (unsigned long)(r0 + wr) * nb;
+  const G f16 *dp = (const G f16 *)qs + (unsigned long)rows * nb + (unsigned long)(r0 + wr) * (nb >> 3) * 2u;
+  u32x4 xr[8];
+  u32x2v wb;
+  u32 sm;
+  float dd, dm;
+#define QH_LOAD(kb_)                                                                            \
+  do {                                                                                          \
+    _Pragma("unroll") for (u32 n = 0; n < NL; n++) xr[n] = *(const G u32x4 *)(xp[n] + (kb_) * 32u); \
+    wb = *(const G u32x2v *)(wp + (kb_) * 16u);                                                 \
+    sm = sp[(kb_)];                                                                             \
+    dd = (float)dp[((kb_) >> 3) * 2u], dm = (float)dp[((kb_) >> 3) * 2u + 1u];                  \
+  } while (0)
+  QH_LOAD(0u);
+#pragma unroll 1
+  for (u32 kb = 0; kb < nb; kb++) {
+#pragma unroll
+    for (u32 n = 0; n < NL; n++) {
+      const u32 c = tid() + NT * n;
+      *(LDSP u32x4 *)(qh_x + (c >> 2) * QH_S + (c & 3u) * 8u) = xr[n];
+    }
+    {
+      const float a = dd * (float)(sm & 63u), mb = dm * (float)((sm >> 8) & 255u);
+      hk8 wv;
+#pragma unroll
+      for (u32 e = 0; e < 8u; e++) {
+        const u32 byte = ((e < 4u ? wb.x : wb.y) >> (8u * (e & 3u))) & 255u;
+        const u32 qv = q4 >= 2u ? byte >> 4 : byte & 15u;
+        wv[e] = (f16)(a * (float)qv - mb);
+      }
+      *(LDSP hk8 *)(qh_w + wr * QH_S + q4 * 8u) = wv;
+    }
+    barrier();
+    if (kb + 1u < nb) QH_LOAD(kb + 1u); /* in flight during the math */
+    if (won) {
+      hk8 a[4][2];
+#pragma unroll
+      for (u32 i = 0; i < 4u; i++)
+#pragma unroll
+        for (u32 kk = 0; kk < 2u; kk++) a[i][kk] = *(const LDSP hk8 *)(qh_w + (16u * i + rl) * QH_S + 16u * kk + 8u * hl);
+#pragma unroll
+      for (u32 j = 0; j < NJ; j++) {
+        hk8 bx[2];
+#pragma unroll
+        for (u32 kk = 0; kk < 2u; kk++) bx[kk] = *(const LDSP hk8 *)(qh_x + (WT * w + 16u * j + rl) * QH_S + 16u * kk + 8u * hl);
+#pragma unroll
+        for (u32 i = 0; i < 4u; i++)
+#pragma unroll
+          for (u32 kk = 0; kk < 2u; kk++) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a[i][kk], bx[kk], acc[i][j]);
+      }
+    }
+    barrier();
+  }
+#undef QH_LOAD
+  if (!won) return;
+#pragma unroll
+  for (u32 j = 0; j < NJ; j++) {
+    const u32 t = wt0 + 16u * j + rl;
+    if (t >= T) continue;
+#pragma unroll
+    for (u32 i = 0; i < 4u; i++)
+#pragma unroll
+      for (u32 v = 0; v < 8u; v++) {
+        const u32 r = r0 + 16u * i + 8u * hl + v;
+        y[(unsigned long)t * ys + r] = epilogue(acc[i][j][v], r, bias, res ? res + (unsigned long)t * rs : res);
+      }
+  }
+}
+KERNEL ie_gemm_q4k_h(const G u32 *qw, const G u16 *qs, const G f16 *xh, G float *y, u32 rows, u32 nb,
+                     const G float *bias, const G float *res, u32 T, u32 hs, u32 ys, u32 rs) {
+  gemm_q4k_h(qw, qs, xh, y, rows, nb, bias, res, T, hs, ys, rs, 512u);
+}
+KERNEL ie_gemm_q4k_h256(const G u32 *qw, const G u16 *qs, const G f16 *xh, G float *y, u32 rows, u32 nb,
+                        const G float *bias, const G float *res, u32 T, u32 hs, u32 ys, u32 rs) {
+  gemm_q4k_h(qw, qs, xh, y, rows, nb, bias, res, T, hs, ys, rs, 256u);
+}
+
 /* ie_gemm_q4kr_sb: ie_gemm_q4kr for activations whose 8 blocks of a
  * super-block of 256 share one scale da (ie_requant_sb). Then the sum over
  * the blocks of a chunk is exact in int32: sum sc dq (sc: the 6-bit block

@@ -90,11 +90,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_ATTN_FA, K_ATTN_FA_Q8, K_ATTN_FA2, K_GEMM_F32_S, K_GEMM_Q4KR_SB, K_REQUANT_SB, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_ATTN_FA, K_ATTN_FA_Q8, K_ATTN_FA2, K_GEMM_F32_S, K_GEMM_Q4KR_SB, K_REQUANT_SB, K_Q8_F16, K_GEMM_Q4K_H, K_GEMM_Q4K_H256, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv", "ie_attn_fa", "ie_attn_fa_q8", "ie_attn_fa2", "ie_gemm_f32_s", "ie_gemm_q4kr_sb", "ie_requant_sb"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv", "ie_attn_fa", "ie_attn_fa_q8", "ie_attn_fa2", "ie_gemm_f32_s", "ie_gemm_q4kr_sb", "ie_requant_sb", "ie_q8_f16", "ie_gemm_q4k_h", "ie_gemm_q4k_h256"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 /* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
  * linear layer are gpu_backend.ns: at least the tokens of a verify run */
@@ -136,6 +136,8 @@ typedef struct {
   /* host time spent issuing the launches of a step (not waiting) */
   double host_ms;
   uint32_t host_n;
+  void *xh;         /* ie_gemm_q4k_h: the fp16 activations of a chunk (T x the largest Q4_K K) */
+  size_t xh_bytes;
   void *rq;         /* ie_requant_sb output (prompt chunks): T x the largest Q4_K input row */
   size_t rq_bytes;
   void *kc, *vc;    /* KV cache: kvb bytes per element (2: fp16, the kernels have ie_kv_f16; 4: f32) */
@@ -344,6 +346,13 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
       b->rq_bytes = mx * g->T;
       HIP(H.Malloc(&b->rq, b->rq_bytes));
     }
+    size_t mk = 0; /* the largest Q4_K K (fp16 bytes per token) */
+    for (uint32_t i = 0; i < g->n_ops; i++)
+      if (g->ops[i].kind == OP_GEMV_Q4K && (size_t)g->ops[i].w->nb * 64u > mk) mk = (size_t)g->ops[i].w->nb * 64u;
+    if (mk) {
+      b->xh_bytes = mk * g->T;
+      HIP(H.Malloc(&b->xh, b->xh_bytes));
+    }
   }
   const size_t kv = (size_t)m->n_kvl * g->n_ctx * m->n_kv * m->hd * b->kvb + 4;
   HIP(H.Malloc((void **)&b->kc, kv));
@@ -518,6 +527,23 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           static int gmin = -1;
           if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
           if ((int)T >= gmin && nb % 8u == 0u) { /* WMMA */
+            /* IE_GEMM_H=1: ie_gemm_q4k_h (fp16 activations, the weights dequantized to fp16). Off by default:
+             * slower than ie_gemm_q4kr (512 tokens, 34816 x 5120: 2.206 vs 1.953 ms; 5120 x 17408: 1.312 vs 0.966) */
+            static int gh = -1;
+            if (gh < 0) gh = getenv("IE_GEMM_H") && getenv("IE_GEMM_H")[0] == '1';
+            if (gh && b->xh && rows % 64u == 0u && (size_t)T * nb * 64u <= b->xh_bytes) {
+              void *X = b->xh;
+              u32 hsb = nb * 64u, hs = nb * 32u; /* fp16 row: bytes, halves */
+              void *ca[] = {&A, &X, &nb, &xs, &hsb};
+              launch_t(b, K_Q8_F16, (nb * 32u + 255u) / 256u, T, ca);
+              void *ga[] = {&w0, &w1, &X, &B, &rows, &nb, &bias, &R, &T, &hs, &ys, &rs};
+              static int ht = -1; /* IE_GEMM_HT=256|512: tokens per workgroup (default: by the shape) */
+              if (ht < 0) ht = getenv("IE_GEMM_HT") ? atoi(getenv("IE_GEMM_HT")) : 0;
+              const int t256 = ht ? ht == 256 : rows < 16384u;
+              if (t256) launch(b, K_GEMM_Q4K_H256, (rows / 64u) * ((T + 255u) / 256u), ga);
+              else launch(b, K_GEMM_Q4K_H, (rows / 64u) * ((T + 511u) / 512u), ga);
+              break;
+            }
             static int sb = -1; /* IE_Q4K_SB=1: activations requantized with one scale per 256 (ie_gemm_q4kr_sb) */
             if (sb < 0) sb = getenv("IE_Q4K_SB") && getenv("IE_Q4K_SB")[0] == '1';
             if (sb && b->rq && (size_t)T * xs <= b->rq_bytes) {
