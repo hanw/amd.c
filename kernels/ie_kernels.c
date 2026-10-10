@@ -2855,10 +2855,20 @@ KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *o
  * + P V for its tiles. At the end wave w < GA writes 1 / l of its rows to
  * LDS for the owners of the tiles. The two kinds of waves run separate
  * copies of the loop (fa2_run, the same barriers), so that their registers
- * are allocated apart. The same arithmetic per output element as ie_attn_fa
+ * are allocated apart. Per block, all K and V loads are issued before the
+ * LDS stores (one wait for the memory, not one per load). The same arithmetic
+ * per output element as ie_attn_fa
  * (S, P, the sums in the same order), so the same result. Needs GA <= 6. */
-#define FA2_OA 10u
-#define FA2_OB 18u
+/* 4 KV elements as fp16 (the fp16 cache: as stored) */
+static inline hk4 kv_h4(const G kvt *p, unsigned long i4) {
+#ifdef IE_KV_F32
+  return __builtin_convertvector(((const G kv4 *)p)[i4], hk4);
+#else
+  return ((const G kv4 *)p)[i4];
+#endif
+}
+#define FA2_OA 12u
+#define FA2_OB 12u
 #define FA2_VS (FA_NB + 8u)
 static LDS f16 fa2_vt[256u * FA2_VS];
 static LDS float fa2_c[8u][16u];
@@ -2877,7 +2887,7 @@ static inline __attribute__((always_inline)) void fa2_run(const G float *q, cons
     const G float *qr = (const G float *)((const G u8 *)q + (unsigned long)tq * qs) + (kh * ga + w) * hd;
 #pragma unroll
     for (u32 ks = 0; ks < 16u; ks++)
-      #pragma unroll
+#pragma unroll
       for (u32 e = 0; e < 8u; e++) qa[ks][e] = (f16)(qr[16u * ks + 8u * hl + e] * scale);
   }
   v8f o[FA2_OB], zero = (v8f)(0.0f);
@@ -2886,25 +2896,41 @@ static inline __attribute__((always_inline)) void fa2_run(const G float *q, cons
   for (u32 t = 0; t < OT; t++) o[t] = zero;
   #pragma unroll
   for (u32 v = 0; v < 8u; v++) m[v] = -__builtin_inff(), ls[v] = 0.0f;
-  const u32 n4 = FA_NB * 64u;
   for (u32 kb = 0; kb < kend; kb += FA_NB) {
     /* opaque copies of the lane numbers: the LDS addresses are computed in the loop, not kept in registers */
     u32 hlo = hl, rlo = rl;
     __asm__ volatile("" : "+v"(hlo), "+v"(rlo));
-#pragma unroll 1
-    for (u32 i4 = tid(); i4 < n4; i4 += NT) {
-      const u32 r = i4 >> 6, e4 = i4 & 63u, p = kb + r;
-      f32x4 kv = (f32x4){0.0f, 0.0f, 0.0f, 0.0f}, vv = kv;
-      if (p < kend) {
-        const unsigned long o4 = ((unsigned long)p * kvd + kh * hd) / 4u + e4;
-        kv = KV4(kc, o4), vv = KV4(vc, o4);
+    { /* all loads of the block first (one wait), then the LDS stores: K rows as fp16 (8-byte
+       * stores); V^T from 4 keys x 4 columns per job, transposed in registers */
+      hk4 xk[FA_NB * 64u / NT], xv[(FA_NB / 4u) * 64u / NT][4];
+#pragma unroll
+      for (u32 n = 0; n < FA_NB * 64u / NT; n++) {
+        const u32 i4 = tid() + NT * n, r = i4 >> 6, e4 = i4 & 63u, p = kb + r;
+        xk[n] = (hk4)(0.0f);
+        if (p < kend) xk[n] = kv_h4(kc, ((unsigned long)p * kvd + kh * hd) / 4u + e4);
       }
-      LDSP f16 *kd = fa_k + r * FA_KS + 4u * e4;
-      kd[0] = (f16)kv.x, kd[1] = (f16)kv.y, kd[2] = (f16)kv.z, kd[3] = (f16)kv.w;
-      fa2_vt[(4u * e4 + 0u) * FA2_VS + r] = (f16)vv.x;
-      fa2_vt[(4u * e4 + 1u) * FA2_VS + r] = (f16)vv.y;
-      fa2_vt[(4u * e4 + 2u) * FA2_VS + r] = (f16)vv.z;
-      fa2_vt[(4u * e4 + 3u) * FA2_VS + r] = (f16)vv.w;
+#pragma unroll
+      for (u32 n = 0; n < (FA_NB / 4u) * 64u / NT; n++) {
+        const u32 j = tid() + NT * n, kq = j >> 6, e4 = j & 63u;
+#pragma unroll
+        for (u32 u = 0; u < 4u; u++) {
+          const u32 p = kb + 4u * kq + u;
+          xv[n][u] = (hk4)(0.0f);
+          if (p < kend) xv[n][u] = kv_h4(vc, ((unsigned long)p * kvd + kh * hd) / 4u + e4);
+        }
+      }
+#pragma unroll
+      for (u32 n = 0; n < FA_NB * 64u / NT; n++) {
+        const u32 i4 = tid() + NT * n, r = i4 >> 6, e4 = i4 & 63u;
+        *(LDSP hk4 *)(fa_k + r * FA_KS + 4u * e4) = xk[n];
+      }
+#pragma unroll
+      for (u32 n = 0; n < (FA_NB / 4u) * 64u / NT; n++) {
+        const u32 j = tid() + NT * n, kq = j >> 6, e4 = j & 63u;
+#pragma unroll
+        for (u32 c = 0; c < 4u; c++)
+          *(LDSP hk4 *)(fa2_vt + (4u * e4 + c) * FA2_VS + 4u * kq) = (hk4){xv[n][0][c], xv[n][1][c], xv[n][2][c], xv[n][3][c]};
+      }
     }
     barrier();
     if (dos) { /* phase A */
@@ -2924,7 +2950,7 @@ static inline __attribute__((always_inline)) void fa2_run(const G float *q, cons
         const u32 k0 = kb + rlo, k1 = kb + 16u + rlo;
         const float s0 = k0 <= tp ? s[0][v] : -__builtin_inff(), s1 = k1 <= tp ? s[1][v] : -__builtin_inff();
         float rm = __builtin_fmaxf(s0, s1);
-        #pragma unroll
+#pragma unroll
         for (u32 x = 1u; x < 16u; x <<= 1) rm = __builtin_fmaxf(rm, shfl_xor_f(rm, x));
         const float mn = __builtin_fmaxf(m[v], rm);
         const float c = __builtin_expf(m[v] - mn);
@@ -2938,15 +2964,20 @@ static inline __attribute__((always_inline)) void fa2_run(const G float *q, cons
       }
     }
     barrier();
+    h8 pa[2];
+    float cr[8];
 #pragma unroll
     for (u32 t = 0; t < OT; t++) { /* phase B: tiles tb .. tb + tn - 1 (head i / 16, columns 16 (i % 16) ..) */
       if (t < tn) {
         const u32 i = tb + t, hh = i >> 4, nt = i & 15u;
-        h8 pa[2];
-        #pragma unroll
-        for (u32 kk = 0; kk < 2u; kk++) pa[kk] = *(const LDSP h8 *)(fa_p[hh] + rlo * FA_VS + 16u * kk + 8u * hlo);
-        #pragma unroll
-        for (u32 v = 0; v < 8u; v++) o[t][v] *= fa2_c[hh][8u * hlo + v];
+        if (t == 0u || nt == 0u) { /* a new head (uniform): its P and row rescales */
+#pragma unroll
+          for (u32 kk = 0; kk < 2u; kk++) pa[kk] = *(const LDSP h8 *)(fa_p[hh] + rlo * FA_VS + 16u * kk + 8u * hlo);
+#pragma unroll
+          for (u32 v = 0; v < 8u; v++) cr[v] = fa2_c[hh][8u * hlo + v];
+        }
+#pragma unroll
+        for (u32 v = 0; v < 8u; v++) o[t][v] *= cr[v];
 #pragma unroll
         for (u32 kk = 0; kk < 2u; kk++) {
           const h8 vb = *(const LDSP h8 *)(fa2_vt + (16u * nt + rlo) * FA2_VS + 16u * kk + 8u * hlo);
@@ -2962,7 +2993,7 @@ static inline __attribute__((always_inline)) void fa2_run(const G float *q, cons
 #pragma unroll
     for (u32 v = 0; v < 8u; v++) {
       float x = ls[v];
-      #pragma unroll
+#pragma unroll
       for (u32 s = 1u; s < 16u; s <<= 1) x += shfl_xor_f(x, s);
       if (rl == 0u) fa2_c[w][8u * hl + v] = 1.0f / x;
     }
@@ -2971,7 +3002,7 @@ static inline __attribute__((always_inline)) void fa2_run(const G float *q, cons
   for (u32 t = 0; t < OT; t++)
     if (t < tn) {
       const u32 i = tb + t, hh = i >> 4, nt = i & 15u, h = kh * ga + hh;
-      #pragma unroll
+#pragma unroll
       for (u32 v = 0; v < 8u; v++) {
         const u32 tk = t0 + 8u * hle + v, d = 16u * nt + rle;
         if (tk >= T) continue;
