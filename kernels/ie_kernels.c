@@ -1234,7 +1234,8 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
   u32x4 rx[GK_T * 8u / NT];
   u16 rsw[GK_KB];
   f16 rdd[2];
-  float rsx, rsa;
+  float rsx;
+  int rsa; /* asum as loaded: converted at the store, so the fetch does not wait for its loads */
 #define GK_FETCH_W(dst_, kb0_)                                                                                  \
   _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++)                                                             \
     _Pragma("unroll") for (u32 i = 0; i < GK_WI; i++) dst_[k][i] = *(const G u32x4 *)(wp[i] + ((kb0_) + k) * 16u);
@@ -1243,7 +1244,7 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
     _Pragma("unroll") for (u32 i = 0; i < GK_T * 8u / NT; i++) rx[i] = *(const G u32x4 *)(xp[i] + (kb0_) * 32u); \
     _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) rsw[k] = swp[(kb0_) + k];                                 \
     rdd[0] = ddp[((kb0_) >> 3) * 2u], rdd[1] = ddp[((kb0_) >> 3) * 2u + 1u]; /* GK_KB divides 8: one super-block */ \
-    rsa = t0 < GK_T * GK_KB ? (float)sap[(kb0_)] : 0.0f;                                                       \
+    rsa = t0 < GK_T * GK_KB ? sap[(kb0_)] : 0;                                                                 \
     rsx = t0 < GK_T * GK_KB ? sxp[(kb0_)] : 0.0f;                                                               \
   } while (0)
 #define GK_STORE_X(bf_)                                                                                         \
@@ -1260,7 +1261,7 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
       }                                                                                                         \
       gk_mh[bf_][t0] = mh_;                                                                                     \
     }                                                                                                           \
-    if (t0 < GK_T * GK_KB) ((LDSP f16 *)gk_sh[bf_])[t0] = (f16)(rsa * rsx);                                    \
+    if (t0 < GK_T * GK_KB) ((LDSP f16 *)gk_sh[bf_])[t0] = (f16)((float)rsa * rsx);                                    \
     if (t0 < GK_T * GK_KB) gk_sx[bf_][t0] = rsx;                                                                \
   } while (0)
   GK_FETCH_W(wa, 0u);
@@ -1580,7 +1581,8 @@ KERNEL ie_gemm_q4kr_sb(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float
   u32x4 rx[GK_T * 8u / NT];
   u16 rsw[GK_KB];
   f16 rdd[2];
-  float rsx, rsa;
+  float rsx;
+  int rsa; /* asum as loaded: converted at the store, so the fetch does not wait for its loads */
 #define GK_FETCH_W(dst_, kb0_)                                                                                  \
   _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++)                                                             \
     _Pragma("unroll") for (u32 i = 0; i < GK_WI; i++) dst_[k][i] = *(const G u32x4 *)(wp[i] + ((kb0_) + k) * 16u);
@@ -1589,7 +1591,7 @@ KERNEL ie_gemm_q4kr_sb(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float
     _Pragma("unroll") for (u32 i = 0; i < GK_T * 8u / NT; i++) rx[i] = *(const G u32x4 *)(xp[i] + (kb0_) * 32u); \
     _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) rsw[k] = swp[(kb0_) + k];                                 \
     rdd[0] = ddp[((kb0_) >> 3) * 2u], rdd[1] = ddp[((kb0_) >> 3) * 2u + 1u]; /* GK_KB divides 8: one super-block */ \
-    rsa = t0 < GK_T * GK_KB ? (float)sap[(kb0_)] : 0.0f;                                                       \
+    rsa = t0 < GK_T * GK_KB ? sap[(kb0_)] : 0;                                                                 \
     rsx = t0 < GK_T * GK_KB ? sxp[(kb0_)] : 0.0f;                                                               \
   } while (0)
 #define GK_STORE_X(bf_)                                                                                         \
@@ -1607,7 +1609,7 @@ KERNEL ie_gemm_q4kr_sb(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float
       gk_mh[bf_][t0] = mh_;                                                                                     \
       gk_dd[bf_][t0] = (float)rdd[0];                                                                           \
     }                                                                                                           \
-    if (t0 < GK_T * GK_KB) ((LDSP f16 *)gk_sh[bf_])[t0] = (f16)(rsa * rsx);                                    \
+    if (t0 < GK_T * GK_KB) ((LDSP f16 *)gk_sh[bf_])[t0] = (f16)((float)rsa * rsx);                                    \
     if (t0 < GK_T * GK_KB) gk_sx[bf_][t0] = rsx;                                                                \
   } while (0)
   GK_FETCH_W(wa, 0u);
