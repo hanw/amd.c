@@ -210,6 +210,31 @@ static void gpu_read_rows(backend *bk, int id, uint32_t r0, uint32_t n, float *d
 static int gpu_topk(backend *bk, int id, uint32_t r0, uint32_t n, uint32_t nv, uint32_t K, float *val, uint32_t *idx);
 static void gpu_copy_rows(backend *bk, int dst, uint32_t d0, int src, uint32_t r0, uint32_t n);
 static void gpu_close(backend *bk);
+static double op_wbytes(const op *o);
+
+/* IE_TRACE=FILE: one CSV row per kernel launch, in launch order (all
+ * launches go to one stream, so this is also the GPU order). The rows carry
+ * what a profiler does not know: the run (call, phase, first position, T),
+ * the op and its layer. tools/ie_viz.py joins them with a rocprofv3 kernel
+ * trace (the n-th ie_ dispatch is row n) and draws the timeline. */
+static FILE *tr_f;
+static const char *tr_phase = "-"; /* decode, prefill, verify, mtp, sample */
+static int tr_op = -1, tr_layer = -1, tr_first;
+static uint32_t tr_call, tr_n, tr_pos, tr_T;
+static double tr_wb;
+static void tr_launch(int k, unsigned groups, unsigned T) {
+  if (!tr_f) return;
+  /* the weight bytes of an op go on its first launch only */
+  fprintf(tr_f, "%u,%u,%u,%u,%s,%d,%d,%s,%u,%u,%.0f\n", tr_call, tr_pos, tr_T, tr_n++, tr_phase, tr_op, tr_layer, kname[k],
+          groups, T, tr_first ? tr_wb : 0.0);
+  tr_first = 0;
+}
+/* Start a run of the trace: phase, first position, tokens. */
+static void tr_run(const char *phase, uint32_t pos, uint32_t T) {
+  if (!tr_f) return;
+  tr_phase = phase, tr_pos = pos, tr_T = T, tr_call++;
+  tr_op = tr_layer = -1, tr_first = 0;
+}
 
 /* Streaming load: the device arrays of the streamed matrices (freed at close). */
 static void **sdev;
@@ -367,6 +392,11 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     if (!b->pev || !b->pms) ie_die("out of memory");
     for (uint32_t i = 0; i < b->g->n_ops; i++) HIP(H.EventCreate(&b->pev[i]));
   }
+  const char *te = getenv("IE_TRACE");
+  if (te && te[0]) {
+    if (!(tr_f = fopen(te, "w"))) ie_die("cannot write %s", te);
+    fprintf(tr_f, "call,pos,T_run,launch,phase,op,layer,kernel,groups,T,weight_bytes\n");
+  }
   if (n_sdev) fprintf(stderr, "gpu: %u arrays (%.2f GB) streamed at load\n", n_sdev, sdev_bytes / 1e9);
   fprintf(stderr, "gpu: %u arrays uploaded, arena %u bytes, KV cache %zu bytes, linear state %zu bytes\n", b->nh, g->arena,
           2 * kv, rbytes + sbytes);
@@ -374,10 +404,12 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
 }
 
 static void launch_lds(gpu_backend *b, int k, unsigned groups, unsigned lds_bytes, void **args) {
+  tr_launch(k, groups, 1);
   HIP(H.ModuleLaunchKernel(b->k[k], groups, 1, 1, 256, 1, 1, lds_bytes, cur_stream, args, NULL));
 }
 /* groups x T workgroups: grid dimension y is the token (kernels with byte strides) */
 static void launch_t(gpu_backend *b, int k, unsigned groups, unsigned T, void **args) {
+  tr_launch(k, groups, T);
   HIP(H.ModuleLaunchKernel(b->k[k], groups, T, 1, 256, 1, 1, 0, cur_stream, args, NULL));
 }
 static void launch(gpu_backend *b, int k, unsigned groups, void **args) { launch_lds(b, k, groups, 0, args); }
@@ -870,6 +902,7 @@ static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u
   if (T > g->T) ie_die("%u tokens in one run; the graph has room for %u", T, g->T);
   for (uint32_t i = i0; i < i1; i++) {
     const int k = g->ops[i].kind;
+    if (tr_f) tr_op = (int)i, tr_layer = g->ops[i].layer, tr_wb = op_wbytes(&g->ops[i]), tr_first = 1;
     if (chunk && i >= g->i_head && i < g->n_main) { /* last token only (its row T - 1) */
       launch_op(b, i, T - 1, toks[T - 1], pos + T - 1, 1, slot, wfrom);
       continue;
@@ -930,6 +963,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   HIP(H.EventRecord(b->e0, NULL));
   struct timespec h0, h1;
   clock_gettime(CLOCK_MONOTONIC, &h0);
+  tr_run("decode", pos, 1);
   run_ops(b, 0, g->n_main, &tok, 1, pos, 0); /* state: slot -> slot */
   clock_gettime(CLOCK_MONOTONIC, &h1);
   if (pos > 0) b->host_ms += (h1.tv_sec - h0.tv_sec) * 1e3 + (h1.tv_nsec - h0.tv_nsec) / 1e6, b->host_n++;
@@ -960,6 +994,7 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
   /* IE_PROFILE=2: the ops of the prompt chunks (ms per chunk in the report) */
   const int pc = b->prof == 2 && !sec && T > 1u;
   if (pc) HIP(H.EventRecord(b->e0, NULL));
+  tr_run(sec ? "mtp" : last_only && T > 1u ? "prefill" : "verify", pos, T);
   run_ops(b, sec ? g->n_main : 0, sec ? g->n_ops : g->n_main, toks, T, pos, last_only ? T - 1 : 0);
   if (pc) {
     HIP(H.DeviceSynchronize()); /* the events are on the NULL stream: run with IE_STREAM=0 for exact times */
@@ -1031,6 +1066,7 @@ static int gpu_topk(backend *bk, int id, uint32_t r0, uint32_t n, uint32_t nv, u
   void *x = b->arena + B->off + (size_t)r0 * B->stride;
   u32 xs = B->stride / 4u, cs = (nv + ng - 1u) / ng, nc = ng * K;
   void *a1[] = {&x, &nv, &xs, &K, &cs, (void *)&ng, &cv, &ci};
+  tr_run("sample", 0, n);
   launch_t(b, K_TOPK_PART, ng, n, a1);
   void *a2[] = {&cv, &ci, &nc, &K, &ov, &oi};
   launch(b, K_TOPK_MERGE, n, a2);
@@ -1206,6 +1242,7 @@ static void gpu_close(backend *bk) {
     H.Free(b->chk), free(b->chk_a), free(b->chk_b);
   }
   if (b->prof && b->psteps) prof_report(b), prof_layers(b);
+  if (tr_f) fprintf(stderr, "trace: wrote %u launches in %u runs\n", tr_n, tr_call), fclose(tr_f), tr_f = NULL;
   HIP(H.DeviceSynchronize());
   for (uint32_t i = 0; i < b->nh; i++) H.Free(b->hv[i]);
   for (uint32_t i = 0; i < n_sdev; i++) H.Free(sdev[i]);

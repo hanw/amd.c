@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>核函数时间轴</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --ink: #1f2328; --muted: #6a6f76; --line: #e3e3df; --grid: #eeeeea;
+  --c-gemv: #2f6fdb; --c-gemm: #6a4fd8; --c-attn: #d98b18; --c-gdn: #15936b; --c-norm: #b04bb8;
+  --c-elem: #7b8794; --c-sample: #d2453d; --c-none: #b9bec5;
+  --gap1: #d6d8dc; --gap2: #a8acb3; --gap3: #e0702a; --sel: #111;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171a; --panel: #1d2024; --ink: #e6e6e3; --muted: #9aa0a6; --line: #2e3237; --grid: #25292e;
+    --c-gemv: #5b8ff0; --c-gemm: #9079f0; --c-attn: #eaa53a; --c-gdn: #36b98c; --c-norm: #cc6fd3;
+    --c-elem: #8d98a5; --c-sample: #ee6a60; --c-none: #59606a;
+    --gap1: #3a3f45; --gap2: #5a6069; --gap3: #f08a45; --sel: #fff;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171a; --panel: #1d2024; --ink: #e6e6e3; --muted: #9aa0a6; --line: #2e3237; --grid: #25292e;
+  --c-gemv: #5b8ff0; --c-gemm: #9079f0; --c-attn: #eaa53a; --c-gdn: #36b98c; --c-norm: #cc6fd3;
+  --c-elem: #8d98a5; --c-sample: #ee6a60; --c-none: #59606a;
+  --gap1: #3a3f45; --gap2: #5a6069; --gap3: #f08a45; --sel: #fff;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", "Segoe UI", sans-serif; }
+.wrap { max-width: 1400px; margin: 0 auto; padding: 20px 16px 48px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0; }
+.sub { color: var(--muted); margin: 2px 0 14px; font-size: 13px; }
+.bar { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; margin-bottom: 12px; }
+.bar label { color: var(--muted); font-size: 12px; margin-right: 6px; }
+select, button { font: inherit; font-size: 13px; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+button { cursor: pointer; min-width: 30px; }
+button:hover, select:hover { border-color: var(--muted); }
+.seg button { border-radius: 0; margin-left: -1px; }
+.seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 6px 6px 0; }
+.seg button.on { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.card .k { color: var(--muted); font-size: 12px; }
+.card .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.card .n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 12px; }
+@media (max-width: 900px) { .main { grid-template-columns: 1fr; } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+#tlbox { position: relative; overflow: hidden; }
+canvas { display: block; width: 100%; cursor: grab; touch-action: none; }
+canvas.drag { cursor: grabbing; }
+.hint { color: var(--muted); font-size: 12px; padding: 6px 10px; border-top: 1px solid var(--line); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.legend i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+#tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.15); display: none;
+  white-space: nowrap; font-variant-numeric: tabular-nums; z-index: 2; }
+#detail { padding: 10px 12px; font-size: 13px; }
+#detail h3 { font-size: 13px; margin: 0 0 8px; font-weight: 600; word-break: break-all; }
+#detail table { width: 100%; border-collapse: collapse; }
+#detail td { padding: 2px 0; font-variant-numeric: tabular-nums; }
+#detail td:first-child { color: var(--muted); padding-right: 8px; }
+#detail td:last-child { text-align: right; }
+.empty { color: var(--muted); }
+h2 { font-size: 15px; font-weight: 600; margin: 22px 0 8px; }
+h2 small { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 6px; }
+.tables { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 900px) { .tables { grid-template-columns: 1fr; } }
+.tw { overflow-x: auto; }
+table.t { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+table.t th, table.t td { padding: 4px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+table.t th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); cursor: pointer; }
+table.t th:first-child, table.t td:first-child { text-align: left; }
+table.t tr:hover td { background: var(--grid); }
+table.t tr.click { cursor: pointer; }
+.b2 { display: inline-flex; flex-direction: column; gap: 2px; vertical-align: middle; }
+.b2 .mb { height: 5px; }
+.mb { display: inline-block; height: 9px; border-radius: 2px; vertical-align: middle; }
+.scroll { max-height: 420px; overflow-y: auto; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AMD InferEngine 核函数时间轴</h1>
+  <div class="sub" id="sub"></div>
+
+  <div class="bar">
+    <div><label>运行</label><button id="prev" title="上一个运行">◀</button>
+      <select id="run"></select><button id="next" title="下一个运行">▶</button></div>
+    <div><label>泳道</label><span class="seg" id="lanes">
+      <button data-v="class" class="on">按类别</button><button data-v="layer">按层</button><button data-v="one">单条</button></span></div>
+    <div><label>颜色</label><span class="seg" id="color">
+      <button data-v="class" class="on">按类别</button><button data-v="bw">按带宽</button></span></div>
+    <div><label>缩放</label><button id="zout">−</button> <button id="zin">+</button> <button id="zfit">全部</button></div>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="main">
+    <div class="panel">
+      <div class="legend" id="legend"></div>
+      <div id="tlbox"><canvas id="tl"></canvas><div id="tip"></div></div>
+      <div class="hint">滚轮：缩放。拖动或 Shift + 滚轮：平移。点击核函数：看详细数据。←/→：上一个/下一个运行。</div>
+    </div>
+    <div class="panel" id="detail"><div class="empty">点击一个核函数或空隙。</div></div>
+  </div>
+
+  <h2>按核函数<small id="kscope"></small></h2>
+  <div class="panel tw scroll"><table class="t" id="ktab"></table></div>
+
+  <div class="tables">
+    <div>
+      <h2>按类别<small id="cscope"></small></h2>
+      <div class="panel tw"><table class="t" id="ctab"></table></div>
+    </div>
+    <div>
+      <h2>按层<small id="lscope"></small></h2>
+      <div class="panel tw scroll"><table class="t" id="ltab"></table></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const D = /*__DATA__*/null;
+const CLS = ["gemv", "gemm", "attn", "gdn", "norm", "elem", "sample"];
+const CLS_NAME = { gemv: "矩阵向量乘 GEMV", gemm: "矩阵乘 GEMM（WMMA）", attn: "注意力", gdn: "线性注意力 GDN",
+  norm: "RMSNorm / 量化", elem: "逐元素 / RoPE / 嵌入", sample: "采样" };
+const PHASE = { decode: "解码", prefill: "预填充", verify: "验证", mtp: "MTP 草稿", sample: "采样", "-": "其他" };
+const BW = D.bw * 1e9; // bytes per second
+const K = D.kernels, KC = D.classes;
+// launch fields: [t, dur, kernel, op, layer, groups, T, wbytes]; times in ns from the run start
+const T_ = 0, DUR = 1, KER = 2, OP = 3, LAY = 4, GRP = 5, TT = 6, WB = 7;
+
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const us = ns => ns / 1e3;
+const f1 = x => x.toLocaleString("zh-CN", { maximumFractionDigits: 1, minimumFractionDigits: 1 });
+const f0 = x => Math.round(x).toLocaleString("zh-CN");
+const fus = ns => us(ns) >= 1000 ? f1(us(ns) / 1e3) + " ms" : f1(us(ns)) + " µs";
+const layerName = l => l < 0 ? "嵌入/输出" : (nLayer >= 0 && l >= nLayer ? "MTP 层 " + l : "层 " + l);
+
+// the largest layer of the main model: the MTP layer is the one past it
+let nLayer = -1;
+{
+  const main = new Set();
+  for (const r of D.runs) if (r.phase !== "mtp") for (const x of r.l) if (x[LAY] >= 0) main.add(x[LAY]);
+  nLayer = main.size ? Math.max(...main) + 1 : -1;
+}
+const end = r => r.l.length ? r.l[r.l.length - 1][T_] + r.l[r.l.length - 1][DUR] : 0;
+
+// ---------- state ----------
+const S = { ri: 0, lanes: "class", color: "class", v0: 0, v1: 1, sel: null };
+
+// ---------- run list ----------
+(function initRuns() {
+  $("sub").textContent = (D.title ? D.title + " · " : "") + `${D.runs.length} 个运行 · 标称带宽 ${D.bw} GB/s`;
+  const sel = $("run");
+  const groups = {};
+  D.runs.forEach((r, i) => (groups[r.phase] = groups[r.phase] || []).push(i));
+  for (const ph of Object.keys(groups)) {
+    const og = document.createElement("optgroup");
+    og.label = `${PHASE[ph] || ph}（${groups[ph].length}）`;
+    for (const i of groups[ph]) {
+      const r = D.runs[i], o = document.createElement("option");
+      o.value = i;
+      o.textContent = `#${r.call} ${PHASE[r.phase] || r.phase} 位置 ${r.pos} · ${r.T} 个 token · ${fus(end(r))}`;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+  // default: the second decode run (the first one warms up), else the second run
+  const dec = groups.decode || [];
+  S.ri = dec.length > 1 ? dec[1] : dec.length ? dec[0] : Math.min(1, D.runs.length - 1);
+  sel.value = S.ri;
+  sel.onchange = () => setRun(+sel.value);
+  $("prev").onclick = () => setRun(Math.max(0, S.ri - 1));
+  $("next").onclick = () => setRun(Math.min(D.runs.length - 1, S.ri + 1));
+})();
+
+function setRun(i) {
+  const keepPhase = D.runs[i].phase === D.runs[S.ri].phase;
+  S.ri = i; S.sel = null;
+  $("run").value = i;
+  fit();
+  renderCards();
+  if (!keepPhase) renderTables();
+  renderDetail();
+  draw();
+}
+
+// ---------- segmented controls ----------
+function seg(id, key, after) {
+  for (const b of $(id).querySelectorAll("button"))
+    b.onclick = () => {
+      for (const c of $(id).querySelectorAll("button")) c.classList.toggle("on", c === b);
+      S[key] = b.dataset.v; after && after(); draw();
+    };
+}
+seg("lanes", "lanes", () => resize());
+seg("color", "color", renderLegend);
+
+// ---------- colors ----------
+let COL = {};
+function readColors() {
+  COL = { line: css("--line"), grid: css("--grid"), muted: css("--muted"), ink: css("--ink"), panel: css("--panel"),
+    none: css("--c-none"), gap1: css("--gap1"), gap2: css("--gap2"), gap3: css("--gap3"), sel: css("--sel") };
+  for (const c of CLS) COL[c] = css("--c-" + c);
+}
+// share of the nominal bandwidth -> color: red (low) .. amber .. green (near the nominal)
+function bwColor(p) {
+  const stops = [[0, [210, 69, 61]], [0.5, [217, 139, 24]], [0.8, [190, 190, 60]], [1.0, [21, 147, 107]]];
+  p = Math.max(0, Math.min(1, p));
+  for (let i = 1; i < stops.length; i++)
+    if (p <= stops[i][0]) {
+      const [a, ca] = stops[i - 1], [b, cb] = stops[i], u = (p - a) / (b - a);
+      return `rgb(${ca.map((v, j) => Math.round(v + (cb[j] - v) * u)).join(",")})`;
+    }
+  return "rgb(21,147,107)";
+}
+function colorOf(x) {
+  if (S.color === "bw") return x[WB] > 0 && x[DUR] > 0 ? bwColor(x[WB] / (x[DUR] * 1e-9) / BW) : COL.none;
+  return COL[KC[x[KER]]];
+}
+function renderLegend() {
+  const L = $("legend");
+  if (S.color === "class") {
+    const used = new Set(D.runs[S.ri].l.map(x => KC[x[KER]]));
+    L.innerHTML = CLS.filter(c => used.has(c)).map(c => `<span><i style="background:${COL[c]}"></i>${CLS_NAME[c]}</span>`).join("")
+      + `<span><i style="background:${COL.gap3}"></i>空隙 ≥ 5 µs</span>`;
+  } else {
+    L.innerHTML = [0.3, 0.5, 0.7, 0.9].map(p => `<span><i style="background:${bwColor(p)}"></i>${Math.round(p * 100)}%</span>`).join("")
+      + `<span><i style="background:${COL.none}"></i>不读权重</span><span style="color:${COL.muted}">占标称带宽的比例（只算权重字节）</span>`;
+  }
+}
+
+// ---------- lanes ----------
+function laneList() {
+  const r = D.runs[S.ri];
+  if (S.lanes === "one") return { keys: ["all"], names: ["核函数"], h: 34, of: () => 0 };
+  if (S.lanes === "class") {
+    const used = new Set(r.l.map(x => KC[x[KER]]));
+    const keys = CLS.filter(c => used.has(c)), idx = Object.fromEntries(keys.map((k, i) => [k, i]));
+    return { keys, names: keys.map(k => CLS_NAME[k]), h: 22, of: x => idx[KC[x[KER]]] };
+  }
+  const ls = [...new Set(r.l.map(x => x[LAY]))].sort((a, b) => a - b), idx = new Map(ls.map((l, i) => [l, i]));
+  return { keys: ls, names: ls.map(layerName), h: Math.max(7, Math.min(16, Math.floor(640 / ls.length))), of: x => idx.get(x[LAY]) };
+}
+
+// ---------- canvas ----------
+const cv = $("tl"), ctx = cv.getContext("2d");
+const LW = 132, AX = 22, GAPH = 14, PADB = 6;
+let W = 800, H = 300, LN = null;
+function resize() {
+  LN = laneList();
+  W = cv.parentElement.clientWidth;
+  H = AX + LN.keys.length * LN.h + 6 + GAPH + PADB;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = W * dpr; cv.height = H * dpr; cv.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+function fit() { const e = end(D.runs[S.ri]); S.v0 = -e * 0.01; S.v1 = e * 1.01; }
+const xOf = t => LW + (t - S.v0) / (S.v1 - S.v0) * (W - LW - 8);
+const tOf = x => S.v0 + (x - LW) / (W - LW - 8) * (S.v1 - S.v0);
+function niceStep(span, px) {
+  const raw = span / Math.max(1, px / 90), p = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 5, 10]) if (m * p >= raw) return m * p;
+  return 10 * p;
+}
+function gapRowY() { return AX + LN.keys.length * LN.h + 6; }
+function draw() {
+  if (!LN) return;
+  const r = D.runs[S.ri], L = r.l;
+  ctx.clearRect(0, 0, W, H);
+  ctx.font = "11px -apple-system, 'PingFang SC', sans-serif";
+  ctx.textBaseline = "middle";
+  // lane stripes and labels
+  for (let i = 0; i < LN.keys.length; i++) {
+    const y = AX + i * LN.h;
+    if (i % 2) { ctx.fillStyle = COL.grid; ctx.fillRect(LW, y, W - LW, LN.h); }
+    if (LN.h >= 10 || i % Math.ceil(10 / LN.h) === 0) {
+      ctx.fillStyle = COL.muted; ctx.textAlign = "right";
+      ctx.fillText(LN.names[i], LW - 8, y + LN.h / 2, LW - 12);
+    }
+  }
+  const gy = gapRowY();
+  ctx.fillStyle = COL.muted; ctx.textAlign = "right"; ctx.fillText("空隙", LW - 8, gy + GAPH / 2);
+  // time axis
+  const step = niceStep(S.v1 - S.v0, W - LW);
+  ctx.textAlign = "center";
+  for (let t = Math.ceil(S.v0 / step) * step; t <= S.v1; t += step) {
+    const x = xOf(t);
+    if (x < LW) continue;
+    ctx.strokeStyle = COL.line; ctx.beginPath(); ctx.moveTo(x + 0.5, AX - 4); ctx.lineTo(x + 0.5, gy + GAPH); ctx.stroke();
+    const tv = Math.abs(t) < step / 2 ? 0 : t;
+    if (x >= LW) { ctx.fillStyle = COL.muted; ctx.fillText(step >= 1e6 ? f1(tv / 1e6) + " ms" : f0(tv / 1e3) + " µs", x, 10); }
+  }
+  ctx.save(); ctx.beginPath(); ctx.rect(LW, 0, W - LW, H); ctx.clip();
+  // kernels
+  const i0 = firstVisible(L);
+  for (let i = i0; i < L.length; i++) {
+    const x = L[i];
+    if (x[T_] > S.v1) break;
+    const lane = LN.of(x), y = AX + lane * LN.h + 1, h = LN.h - 2;
+    const a = xOf(x[T_]), b = xOf(x[T_] + x[DUR]);
+    ctx.fillStyle = colorOf(x);
+    ctx.fillRect(a, y, Math.max(1, b - a), h);
+    if (b - a > 46 && h >= 12) {
+      ctx.fillStyle = "#fff"; ctx.textAlign = "left";
+      ctx.save(); ctx.beginPath(); ctx.rect(a, y, b - a, h); ctx.clip();
+      ctx.fillText(K[x[KER]].slice(3), a + 3, y + h / 2); ctx.restore();
+    }
+  }
+  // gaps
+  for (let i = Math.max(1, i0); i < L.length; i++) {
+    const p = L[i - 1], x = L[i];
+    if (p[T_] > S.v1) break;
+    const g0 = p[T_] + p[DUR], g = x[T_] - g0;
+    if (g <= 0) continue;
+    ctx.fillStyle = g >= 5000 ? COL.gap3 : g >= 2000 ? COL.gap2 : COL.gap1;
+    const a = xOf(g0), b = xOf(x[T_]);
+    ctx.fillRect(a, gy + 1, Math.max(1, b - a), GAPH - 2);
+  }
+  // selection
+  if (S.sel) {
+    ctx.strokeStyle = COL.sel; ctx.lineWidth = 2;
+    if (S.sel.gap) {
+      const p = L[S.sel.i - 1], x = L[S.sel.i];
+      ctx.strokeRect(xOf(p[T_] + p[DUR]) - 1, gy, Math.max(2, xOf(x[T_]) - xOf(p[T_] + p[DUR])) + 2, GAPH);
+    } else {
+      const x = L[S.sel.i], lane = LN.of(x);
+      ctx.strokeRect(xOf(x[T_]) - 1, AX + lane * LN.h, Math.max(2, xOf(x[T_] + x[DUR]) - xOf(x[T_])) + 2, LN.h);
+    }
+    ctx.lineWidth = 1;
+  }
+  ctx.restore();
+}
+function firstVisible(L) { // binary search: the first launch that ends after v0
+  let lo = 0, hi = L.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (L[m][T_] + L[m][DUR] < S.v0) lo = m + 1; else hi = m; }
+  return Math.max(0, lo - 1);
+}
+function hit(mx, my) {
+  const L = D.runs[S.ri].l, t = tOf(mx), tol = (S.v1 - S.v0) / (W - LW) * 3;
+  const gy = gapRowY();
+  if (my >= gy && my <= gy + GAPH) {
+    for (let i = Math.max(1, firstVisible(L)); i < L.length; i++) {
+      const g0 = L[i - 1][T_] + L[i - 1][DUR], g1 = L[i][T_];
+      if (g0 > t + tol) break;
+      if (g1 > g0 && t >= g0 - tol && t <= g1 + tol) return { gap: true, i };
+    }
+    return null;
+  }
+  const lane = Math.floor((my - AX) / LN.h);
+  if (lane < 0 || lane >= LN.keys.length) return null;
+  let best = null, bd = Infinity;
+  for (let i = firstVisible(L); i < L.length; i++) {
+    const x = L[i];
+    if (x[T_] > t + tol) break;
+    if (LN.of(x) !== lane) continue;
+    const d = t < x[T_] ? x[T_] - t : t > x[T_] + x[DUR] ? t - x[T_] - x[DUR] : 0;
+    if (d <= tol && d < bd) { bd = d; best = { gap: false, i }; }
+  }
+  return best;
+}
+
+// ---------- interaction ----------
+let drag = null;
+cv.addEventListener("pointerdown", e => { drag = { x: e.clientX, v0: S.v0, v1: S.v1, moved: false }; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener("pointermove", e => {
+  const rc = cv.getBoundingClientRect(), mx = e.clientX - rc.left, my = e.clientY - rc.top;
+  if (drag) {
+    const dx = e.clientX - drag.x;
+    if (Math.abs(dx) > 2) { drag.moved = true; cv.classList.add("drag"); }
+    const dt = dx / (W - LW - 8) * (drag.v1 - drag.v0);
+    S.v0 = drag.v0 - dt; S.v1 = drag.v1 - dt; draw(); hideTip(); return;
+  }
+  const h = hit(mx, my);
+  h ? showTip(h, mx, my) : hideTip();
+});
+cv.addEventListener("pointerup", e => {
+  const moved = drag && drag.moved; drag = null; cv.classList.remove("drag");
+  if (moved) return;
+  const rc = cv.getBoundingClientRect();
+  S.sel = hit(e.clientX - rc.left, e.clientY - rc.top);
+  renderDetail(); draw();
+});
+cv.addEventListener("pointerleave", hideTip);
+cv.addEventListener("wheel", e => {
+  e.preventDefault();
+  const rc = cv.getBoundingClientRect(), mx = e.clientX - rc.left;
+  if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+    const d = (e.shiftKey ? e.deltaY : e.deltaX) / (W - LW) * (S.v1 - S.v0);
+    S.v0 += d; S.v1 += d;
+  } else zoomAt(mx < LW ? (LW + W) / 2 : mx, Math.exp(e.deltaY * 0.0015));
+  draw();
+}, { passive: false });
+function zoomAt(mx, f) {
+  const t = tOf(mx), span = Math.max(200, (S.v1 - S.v0) * f);
+  const u = (t - S.v0) / (S.v1 - S.v0);
+  S.v0 = t - u * span; S.v1 = S.v0 + span;
+}
+$("zin").onclick = () => { zoomAt((LW + W) / 2, 0.5); draw(); };
+$("zout").onclick = () => { zoomAt((LW + W) / 2, 2); draw(); };
+$("zfit").onclick = () => { fit(); draw(); };
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.key === "ArrowLeft") setRun(Math.max(0, S.ri - 1));
+  if (e.key === "ArrowRight") setRun(Math.min(D.runs.length - 1, S.ri + 1));
+  if (e.key === "+" || e.key === "=") $("zin").onclick();
+  if (e.key === "-") $("zout").onclick();
+  if (e.key === "0") $("zfit").onclick();
+});
+
+const tip = $("tip");
+function tipHtml(h) {
+  const L = D.runs[S.ri].l;
+  if (h.gap) {
+    const g = L[h.i][T_] - L[h.i - 1][T_] - L[h.i - 1][DUR];
+    return `<b>空隙 ${f1(us(g))} µs</b><br>${K[L[h.i - 1][KER]]} → ${K[L[h.i][KER]]}`;
+  }
+  const x = L[h.i];
+  let s = `<b>${K[x[KER]]}</b><br>${layerName(x[LAY])} · 操作 ${x[OP]} · ${f1(us(x[DUR]))} µs`;
+  if (x[WB] > 0) { const gbs = x[WB] / x[DUR]; s += `<br>${f1(x[WB] / 1e6)} MB · ${f0(gbs)} GB/s（${f0(gbs / D.bw * 100)}%）`; }
+  return s;
+}
+function showTip(h, mx, my) {
+  tip.innerHTML = tipHtml(h); tip.style.display = "block";
+  const bw = tip.offsetWidth, x = mx + 14 + bw > W ? mx - 14 - bw : mx + 14;
+  tip.style.left = x + "px"; tip.style.top = (my + 14) + "px";
+}
+function hideTip() { tip.style.display = "none"; }
+
+// ---------- detail ----------
+function renderDetail() {
+  const el = $("detail"), L = D.runs[S.ri].l;
+  if (!S.sel) { el.innerHTML = `<div class="empty">点击一个核函数或空隙。</div>`; return; }
+  const row = (k, v) => `<tr><td>${k}</td><td>${v}</td></tr>`;
+  if (S.sel.gap) {
+    const p = L[S.sel.i - 1], x = L[S.sel.i], g = x[T_] - p[T_] - p[DUR];
+    el.innerHTML = `<h3>空隙</h3><table>${row("长度", f1(us(g)) + " µs")}${row("开始", f1(us(p[T_] + p[DUR])) + " µs")}`
+      + `${row("前一个", K[p[KER]])}${row("后一个", K[x[KER]])}${row("后一个的层", layerName(x[LAY]))}</table>`;
+    return;
+  }
+  const i = S.sel.i, x = L[i], gap = i ? x[T_] - L[i - 1][T_] - L[i - 1][DUR] : 0;
+  let t = row("类别", CLS_NAME[KC[x[KER]]]) + row("层", layerName(x[LAY])) + row("操作序号", x[OP] < 0 ? "-" : x[OP])
+    + row("启动序号", i) + row("工作组", f0(x[GRP])) + row("token 数（网格 y）", x[TT])
+    + row("开始", f1(us(x[T_])) + " µs") + row("时长", f1(us(x[DUR])) + " µs") + row("前面的空隙", f1(us(gap)) + " µs");
+  if (x[WB] > 0) {
+    const gbs = x[WB] / x[DUR];
+    t += row("权重", f1(x[WB] / 1e6) + " MB") + row("带宽", f0(gbs) + " GB/s") + row("占标称", f0(gbs / D.bw * 100) + "%")
+      + row("下限时间", f1(x[WB] / BW * 1e6) + " µs");
+  }
+  el.innerHTML = `<h3>${K[x[KER]]}</h3><table>${t}</table>`;
+}
+
+// ---------- cards ----------
+function runStats(r) {
+  const wall = end(r);
+  let busy = 0, wb = 0, gmax = 0, g5 = 0;
+  r.l.forEach((x, i) => {
+    busy += x[DUR]; wb += x[WB];
+    if (i) { const g = x[T_] - r.l[i - 1][T_] - r.l[i - 1][DUR]; if (g > gmax) gmax = g; if (g >= 5000) g5++; }
+  });
+  return { wall, busy, gap: wall - busy, wb, floor: wb / BW * 1e9, n: r.l.length, gmax, g5 };
+}
+function renderCards() {
+  const r = D.runs[S.ri], s = runStats(r);
+  const card = (k, v, n) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${n || "&nbsp;"}</div></div>`;
+  $("cards").innerHTML =
+    card("运行时间（墙钟）", fus(s.wall), `${PHASE[r.phase] || r.phase} · 位置 ${r.pos} · ${r.T} 个 token`)
+    + card("核函数时间", fus(s.busy), f1(s.busy / s.wall * 100) + "% 的运行时间")
+    + card("空隙时间", fus(s.gap), `最长 ${f1(us(s.gmax))} µs · ${s.g5} 个 ≥ 5 µs`)
+    + card("启动次数", f0(s.n), `平均每次 ${f1(us(s.wall / s.n))} µs`)
+    + card("读取的权重", f1(s.wb / 1e6) + " MB", s.wb > 0 ? `平均 ${f0(s.wb / s.wall)} GB/s` : "")
+    + card("带宽下限时间", s.wb > 0 ? fus(s.floor) : "-", s.wb > 0 ? `是运行时间的 ${f1(s.floor / s.wall * 100)}%（${D.bw} GB/s）` : "");
+  renderLegend();
+}
+
+// ---------- tables (mean over the runs of the phase; the first one warms up) ----------
+function phaseRuns() {
+  const ph = D.runs[S.ri].phase, rs = D.runs.filter(r => r.phase === ph);
+  return { ph, rs: rs.length > 1 ? rs.slice(1) : rs, total: rs.length };
+}
+function sortable(tab, rows, cols, init, idir = -1) {
+  let key = init, dir = idir;
+  const paint = () => {
+    rows.sort((a, b) => (a[key] < b[key] ? -1 : a[key] > b[key] ? 1 : 0) * dir);
+    tab.innerHTML = "<tr>" + cols.map(c => `<th data-k="${c.k}">${c.h}${c.k === key ? (dir < 0 ? " ↓" : " ↑") : ""}</th>`).join("") + "</tr>"
+      + rows.map(r => `<tr${r._click ? ` class="click" data-i="${r._click}"` : ""}>` + cols.map(c => `<td>${c.f(r)}</td>`).join("") + "</tr>").join("");
+    for (const th of tab.querySelectorAll("th")) th.onclick = () => { dir = th.dataset.k === key ? -dir : -1; key = th.dataset.k; paint(); };
+  };
+  paint();
+}
+function renderTables() {
+  const { ph, rs, total } = phaseRuns(), n = rs.length;
+  const scope = `${PHASE[ph] || ph}：${n} 个运行的平均${total > n ? "（不算第 1 个）" : ""}`;
+  $("kscope").textContent = scope; $("cscope").textContent = scope; $("lscope").textContent = scope;
+  let wall = 0;
+  const byK = new Map(), byC = new Map(), byL = new Map();
+  for (const r of rs) {
+    wall += end(r);
+    for (const x of r.l) {
+      for (const [m, k] of [[byK, x[KER]], [byC, KC[x[KER]]], [byL, x[LAY]]]) {
+        let e = m.get(k); if (!e) m.set(k, e = { k, n: 0, t: 0, wb: 0 });
+        e.n++; e.t += x[DUR]; e.wb += x[WB];
+      }
+    }
+  }
+  wall /= n;
+  const norm = m => [...m.values()].map(e => ({ ...e, n: e.n / n, t: e.t / n, wb: e.wb / n,
+    share: e.t / n / wall, gbs: e.wb > 0 ? e.wb / e.t : 0, mean: e.t / e.n, floor: e.wb / n / BW * 1e9 }));
+  const pct = x => x > 0 ? f0(x / D.bw * 100) + "%" : "-";
+  const gb = x => x > 0 ? f0(x) : "-";
+  const bar = (v, max, c) => `<span class="mb" style="width:${Math.max(1, v / max * 90)}px;background:${c}"></span>`;
+
+  const kr = norm(byK);
+  const kmax = Math.max(...kr.map(e => e.t));
+  sortable($("ktab"), kr, [
+    { k: "k", h: "核函数", f: e => `<span class="dot" style="background:${COL[KC[e.k]]}"></span>${K[e.k]}` },
+    { k: "n", h: "次数", f: e => f1(e.n) },
+    { k: "mean", h: "每次 µs", f: e => f1(us(e.mean)) },
+    { k: "t", h: "合计 µs", f: e => f1(us(e.t)) },
+    { k: "share", h: "占运行", f: e => f1(e.share * 100) + "%" },
+    { k: "share", h: "", f: e => bar(e.t, kmax, COL[KC[e.k]]) },
+    { k: "gbs", h: "GB/s", f: e => gb(e.gbs) },
+    { k: "gbs", h: "占标称", f: e => pct(e.gbs) },
+  ], "t");
+
+  const cr = norm(byC);
+  const gapT = wall - cr.reduce((s, e) => s + e.t, 0);
+  const crows = [...cr, { k: "_gap", n: NaN, t: gapT, wb: 0, share: gapT / wall, gbs: 0, floor: 0 }];
+  sortable($("ctab"), crows, [
+    { k: "k", h: "类别", f: e => e.k === "_gap" ? `<span class="dot" style="background:${COL.gap2}"></span>空隙` : `<span class="dot" style="background:${COL[e.k]}"></span>${CLS_NAME[e.k]}` },
+    { k: "n", h: "次数", f: e => isNaN(e.n) ? "-" : f1(e.n) },
+    { k: "t", h: "合计 µs", f: e => f1(us(e.t)) },
+    { k: "share", h: "占运行", f: e => f1(e.share * 100) + "%" },
+    { k: "gbs", h: "GB/s", f: e => gb(e.gbs) },
+    { k: "floor", h: "下限 µs", f: e => e.floor > 0 ? f1(us(e.floor)) : "-" },
+  ], "t");
+
+  const lr = norm(byL).map(e => ({ ...e, name: e.k }));
+  const lmax = Math.max(...lr.map(e => e.t));
+  sortable($("ltab"), lr, [
+    { k: "name", h: "层", f: e => layerName(e.k) },
+    { k: "n", h: "次数", f: e => f1(e.n) },
+    { k: "t", h: "合计 µs", f: e => f1(us(e.t)) },
+    { k: "t", h: "时间 / 下限", f: e => `<span class="b2">${bar(e.t, lmax, COL.gemv)}${bar(e.floor, lmax, COL.none)}</span>` },
+    { k: "gbs", h: "GB/s", f: e => gb(e.gbs) },
+    { k: "gbs", h: "占标称", f: e => pct(e.gbs) },
+  ], "name", 1);
+}
+
+// ---------- start ----------
+readColors();
+fit();
+renderCards();
+renderTables();
+resize();
+window.addEventListener("resize", resize);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readColors(); renderCards(); renderTables(); draw(); });
+</script>
+</body>
+</html>
