@@ -18,7 +18,7 @@ make build/ie-serve build/ie_kernels.hsaco
 ## 2. 启动
 
 ```
-./build/ie-serve ~/models/q4/Qwen3.8-27B-Q4_K_M.gguf --host 127.0.0.1 --port 8000 --ctx 8192 --draft 3
+./build/ie-serve ~/models/q4/Qwen3.8-27B-Q4_K_M.gguf --host 127.0.0.1 --port 8000 --ctx 65536 --draft 3
 ```
 
 服务先绑定端口，再加载模型。加载完成后，日志里有一行 `ie-serve: http://127.0.0.1:8000/v1`。
@@ -31,7 +31,7 @@ make build/ie-serve build/ie_kernels.hsaco
 | `--host ADDR`、`--port N` | 127.0.0.1、8000 | 监听地址和端口 |
 | `--api-key KEY` | 无 | 请求必须带 `Authorization: Bearer KEY`。也可以用环境变量 `IE_API_KEY` |
 | `--name ID` | 模型文件的 `general.name` | `/v1/models` 返回的模型名。空白字符换成 `-`（Open WebUI 不接受带空格的模型名），例如 `Qwen3.8-27B` |
-| `--ctx N` | 8192 | 提示加输出的最多 token 数。KV 缓存按这个大小分配 |
+| `--ctx N` | 8192 | 提示加输出的最多 token 数。KV 缓存按这个大小分配（见下面"上下文长度"） |
 | `--draft D` | 0 | MTP 草稿数（1 到 7，只在 GPU 上）。聊天时 3 最快（见 `claude/progress.md`） |
 | `--draft-pmin P`、`--mtp FILE` | 0.6、无 | 与 `ie-run` 相同 |
 | `--chunk N` | 256 | 预填充每块的 token 数（1 到 512） |
@@ -94,6 +94,22 @@ curl -sN http://127.0.0.1:8000/v1/chat/completions \
 5. 使用缓存时，提示的分块和不用缓存时不同，所以数值结果接近但不逐位相同。贪心解码时，检查中的回答相同（见第 6 节）。
 6. 使用 MTP 时，草稿里的停止 token 不再被接受，这样模型不会计算到停止 token 之后。输出不变。
 7. 日志里的 `cached N` 是跳过的 token 数，`with the last answer` 表示用了快照 1。设置 `IE_SERVE_DEBUG=1` 时，如果快照 1 没有命中，日志会打印两组 token 第一次不同的位置。
+
+### 上下文长度
+
+KV 缓存是 32 位浮点，Qwen3.8-27B 每个 token 占 139,264 字节（16 个注意力层加 MTP 层）。在 R9700（32 GB）上实测（Q4_K_M，3 个草稿）：
+
+| `--ctx` | KV 缓存 | 显存占用 | 结果 |
+|---|---|---|---|
+| 8192 | 1.1 GB | 23.4 GB | 正常 |
+| 65536 | 9.1 GB | 31.75 GB | 正常（amd-gpu-host 现在用这个值） |
+| 81920 | 11.4 GB | 34.18 GB（只剩 29 MB） | 能启动，但提示缓存的快照分配时会失败；位置分段数超过 2048，分段注意力会关闭 |
+| 131072 | 18.3 GB | 约 40.6 GB | 放不下 |
+
+模型训练的上下文是 262,144（`qwen35.context_length`）。要用到 128K，需要把 KV 缓存改成 16 位，并把分段上限从 2048 提高到 4096。
+
+64K 上下文的实测（56,248 个 token 的代码加一个问题，不思考）：第一轮预填充 212 秒（每秒约 265 个 token），输出每秒 26.9 个；
+第二轮跳过 56,336 个 token，预填充 0.3 秒，输出每秒 22.4 个。
 
 ### 速度信息
 
