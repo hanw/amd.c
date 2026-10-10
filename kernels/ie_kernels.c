@@ -1710,6 +1710,11 @@ KERNEL ie_gemm_q4kr_sb(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float
  * bytes (ie_q6k_sw), in the standard K order so that each WMMA covers one
  * half (one int8 scale): c0 = sum over weights 0..15, c1 = over 16..31;
  * then acc += da ((d sc0) c0 + (d sc1) c1). */
+#ifndef G6_PAD
+#define G6_PAD 16u /* bytes after each token row of the activation tile in LDS */
+#endif
+#define G6_LS (GK_KB * 32u + G6_PAD)
+static LDS u8 g6_x[2][GK_T * G6_LS] __attribute__((aligned(16)));
 typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 KERNEL ie_gemm_q6kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G float *bias,
                    const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
@@ -1766,7 +1771,7 @@ KERNEL ie_gemm_q6kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
   do {                                                                                                          \
     _Pragma("unroll") for (u32 i = 0; i < GK_T * 8u / NT; i++) {                                                \
       const u32 p = t0 + NT * i;                                                                                \
-      *(LDSP u32x4 *)(gk_x[bf_] + (p >> 3) * GK_LS + (p & 7u) * 16u) = rx[i];                                   \
+      *(LDSP u32x4 *)(g6_x[bf_] + (p >> 3) * G6_LS + (p & 7u) * 16u) = rx[i];                                   \
     }                                                                                                           \
     if (t0 < GK_R) _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) {                                       \
       gk_sw[bf_][k * GK_R + t0] = (float)rdd * (float)(int)(signed char)(rsw[k] & 255u); /* d sc0 */           \
@@ -1789,7 +1794,7 @@ KERNEL ie_gemm_q6kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
       GK_FETCH_W(wn, kb0 + GK_KB);
       GK_FETCH_X(kb0 + GK_KB);
     }
-    const LDSP u8 *lx = gk_x[bf];
+    const LDSP u8 *lx = g6_x[bf];
     const LDSP float *lsw = gk_sw[bf], *lsx = gk_sx[bf], *lmw = gk_mw[bf];
     const u32 nk = nb - kb0 < GK_KB ? nb - kb0 : GK_KB; /* = GK_KB; the branch keeps the blocks apart for the scheduler */
 #pragma unroll
@@ -1800,7 +1805,7 @@ KERNEL ie_gemm_q6kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
       v2i b0[GK_WJ], b1[GK_WJ];
 #pragma unroll
       for (u32 j = 0; j < GK_WJ; j++) {
-        const LDSP u8 *pb = lx + (16u * j + (l & 15u)) * GK_LS + k * 32u + 8u * h;
+        const LDSP u8 *pb = lx + (16u * j + (l & 15u)) * G6_LS + k * 32u + 8u * h;
         b0[j] = *(const LDSP v2i *)pb, b1[j] = *(const LDSP v2i *)(pb + 16u);
       }
       const v8i zm = (v8i)(0x4B400000); /* see ie_gemm_q8 */
@@ -3127,8 +3132,17 @@ KERNEL ie_attn_pfg(const G float *q, const G kvt *kc, const G kvt *vc, G float *
  * copy as ie_attn_pfg (the Q8 copy by the workgroup of the last part). */
 #define FA_NB 32u
 #define FA_DC 128u
-#define FA_KS (256u + 8u) /* LDS row stride of K, halves */
-#define FA_VS (FA_NB + 8u) /* LDS row stride of V^T and of P, halves */
+#ifndef FA_KPAD
+#define FA_KPAD 8u
+#endif
+#ifndef FA_PPAD
+#define FA_PPAD 8u
+#endif
+#ifndef FA2_VPAD
+#define FA2_VPAD 8u
+#endif
+#define FA_KS (256u + FA_KPAD) /* LDS row stride of K, halves */
+#define FA_VS (FA_NB + FA_PPAD) /* LDS row stride of V^T and of P, halves */
 static LDS f16 fa_k[FA_NB * FA_KS];
 static LDS f16 fa_vt[FA_DC * FA_VS];
 static LDS f16 fa_p[8u][16u * FA_VS];
@@ -3268,7 +3282,7 @@ static inline hk4 kv_h4(const G kvt *p, unsigned long i4) {
 }
 #define FA2_OA 12u
 #define FA2_OB 12u
-#define FA2_VS (FA_NB + 8u)
+#define FA2_VS (FA_NB + FA2_VPAD)
 static LDS f16 fa2_vt[256u * FA2_VS];
 static LDS float fa2_c[8u][16u];
 static inline __attribute__((always_inline)) void fa2_run(const G float *q, const G kvt *kc, const G kvt *vc,
