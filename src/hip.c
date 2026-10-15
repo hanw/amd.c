@@ -618,8 +618,10 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     mk.free = !getenv("IE_MK_FREE") || atoi(getenv("IE_MK_FREE")) != 0; /* 0: the waves meet before every body */
     mk.pfall = getenv("IE_MK_PFALL") != NULL;
     mk.join = !getenv("IE_MK_JOIN") || atoi(getenv("IE_MK_JOIN")) != 0;
-    /* IE_MK_PF (MB): prefetch in the barriers; default 0 (no gain measured) */
-    mk.pf = (getenv("IE_MK_PF") ? (u32)atoi(getenv("IE_MK_PF")) : 0u) << 20;
+    /* IE_MK_PF (MB): in the barriers after small kernels the waiting
+     * workgroups prefetch the first bytes of the next GEMV's weights;
+     * default 16 (27B decode 29.13 -> 28.98 ms/token; 0: off) */
+    mk.pf = (getenv("IE_MK_PF") ? (u32)atoi(getenv("IE_MK_PF")) : 16u) << 20;
     for (int r = 0; r < MK_RING; r++) {
       HIP(H.HostMalloc((void **)&mk.ring[r], (size_t)MK_CAP * MK_CMD, 0));
       HIP(H.EventCreate(&mk.ev[r]));
