@@ -305,6 +305,7 @@ static struct {
   unsigned char *ring[MK_RING]; /* pinned */
   hipEvent_t ev[MK_RING];       /* the copy of a ring buffer is done */
   int slot, mtp, light;
+  int off[MK_NSETS]; /* a run of this kind had a kernel the build does not have */
   void *dring[MK_RING]; /* device lists (one per ring buffer: a launch reads its own) */
   u32 *ws;           /* device: barrier counter, abort flag */
   volatile u32 *hflag; /* pinned: the abort flag after the last launch */
@@ -336,6 +337,8 @@ static void mk_prefetch(void) {
     u32 rows, nb;
     memcpy(&qw, c + 16, 8), memcpy(&rows, c + 48, 4), memcpy(&nb, c + 52, 4);
     uint64_t bytes = (uint64_t)rows * nb * (mk.kof[j] == K_GEMV_Q8 ? 32u : 16u);
+    /* an s_prefetch_data reaches past its address: stay 64 KB inside the matrix */
+    bytes = bytes > 65536u ? bytes - 65536u : 0u;
     if (bytes > mk.pf) bytes = mk.pf;
     unsigned char *d = mk.cmd + (size_t)i * MK_CMD;
     const u32 w[4] = {(u32)qw, (u32)(qw >> 32), (u32)bytes, j};
@@ -469,6 +472,12 @@ static int mk_light(void) { return mk.rec && mk.set == MKSET_MTP && mk.light; }
 static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **args) {
   if (!mk.rec) return 0;
   if (lds_bytes || mk.id[k] < 0 || !mk_in_set[mk.set][mk.id[k]]) {
+    /* a kernel the build does not have: the runs of this kind go back to
+     * launches (a list cut at every such kernel is slower than launches) */
+    if (!mk.off[mk.set])
+      fprintf(stderr, "gpu: megakernel off for %s runs (%s is not in it)\n", mk.set == MKSET_DECODE ? "decode" : "verify",
+              kname[k]);
+    mk.off[mk.set] = 1;
     mk_flush();
     return 0;
   }
@@ -526,13 +535,29 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     hipFunction_t f;
     b->kvb = H.ModuleGetFunction(&f, b->mod, "ie_kv_f16") == 0 ? 2u : 4u;
   }
-  /* IE_MK=1: decode steps (ie_mk.hsaco) and verify runs (ie_mk_mtp.hsaco)
-   * through the megakernel; the files next to the kernels. IE_MK_NP,
+  /* The megakernel (default; IE_MK=0: off): decode steps (ie_mk.hsaco) and
+   * verify runs (ie_mk_mtp.hsaco) through it; the files next to the kernels. IE_MK_NP,
    * IE_MK_NP_MTP: the workgroups, default 128: two per CU, the most that are
    * resident with 192 VGPRs and 14 KB of LDS (the hardware places a
    * workgroup in one CU: the occupancy query, per WGP, says 4) */
+  /* on by default; IE_MK=0: off. Without the two files: off, with a note. */
   const char *mke = getenv("IE_MK");
-  if (mke && mke[0] == '1') {
+  int mkon = !(mke && mke[0] == '0');
+  if (mkon) {
+    const char *sl = strrchr(hsaco, '/');
+    const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
+    static const char *const mkf0[2] = {"ie_mk.hsaco", "ie_mk_mtp.hsaco"};
+    for (int st = 0; st < 2 && mkon; st++) {
+      char *path = malloc(dl + 32);
+      memcpy(path, hsaco, dl);
+      strcpy(path + dl, mkf0[st]);
+      FILE *mf = fopen(path, "rb");
+      if (!mf) fprintf(stderr, "gpu: megakernel off (no %s; IE_MK=0 to turn it off quietly)\n", path), mkon = 0;
+      else fclose(mf);
+      free(path);
+    }
+  }
+  if (mkon) {
     const char *sl = strrchr(hsaco, '/');
     const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
     static const char *const mkf[MK_NSETS] = {"ie_mk.hsaco", "ie_mk_mtp.hsaco"};
@@ -572,7 +597,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     mk.light = !getenv("IE_MK_LIGHT") || atoi(getenv("IE_MK_LIGHT")) != 0;
     mk.pfall = getenv("IE_MK_PFALL") != NULL;
     mk.join = !getenv("IE_MK_JOIN") || atoi(getenv("IE_MK_JOIN")) != 0;
-    mk.pf = (getenv("IE_MK_PF") ? (u32)atoi(getenv("IE_MK_PF")) : 16u) << 20;
+    /* IE_MK_PF (MB): prefetch in the barriers; default 0 (no gain measured) */
+    mk.pf = (getenv("IE_MK_PF") ? (u32)atoi(getenv("IE_MK_PF")) : 0u) << 20;
     for (int r = 0; r < MK_RING; r++) {
       HIP(H.HostMalloc((void **)&mk.ring[r], (size_t)MK_CAP * MK_CMD, 0));
       HIP(H.EventCreate(&mk.ev[r]));
@@ -587,9 +613,26 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
       HIP(H.Malloc((void **)&mk.dprof, (size_t)MK_CAP * 8u));
       mk.hprof = malloc((size_t)MK_CAP * 8u);
     }
+    /* the cooperative launch fails (720) when the workgroups cannot all be
+     * resident: try an empty list; halve np down to 32, else off */
+    for (int st = 0; st < MK_NSETS; st++) {
+      for (;;) {
+        u32 zero = 0;
+        void *a0[] = {&mk.dring[0], &zero, &mk.ws, &mk.base, &mk.dprof};
+        if (H.ModuleLaunchCooperativeKernel(mk.f[st], mk.np[st], 1, 1, 256, 1, 1, 0, cur_stream, a0) == 0) break;
+        if (mk.np[st] <= 32u) {
+          fprintf(stderr, "gpu: megakernel off for %s runs (no cooperative launch)\n", st == MKSET_DECODE ? "decode" : "verify");
+          mk.off[st] = 1;
+          break;
+        }
+        mk.np[st] /= 2u;
+      }
+    }
+    HIP(H.DeviceSynchronize());
     mk.on = 1;
-    fprintf(stderr, "gpu: megakernel on (decode: %u workgroups; verify and drafts: %s, %u workgroups)\n",
-            mk.np[MKSET_DECODE], mk.mtp ? "on" : "off", mk.np[MKSET_MTP]);
+    static const char *const mkm[4] = {"off", "verify runs and drafts", "drafts", "verify runs"};
+    fprintf(stderr, "gpu: megakernel on (decode: %u workgroups; MTP: %s, %u workgroups; IE_MK=0: off)\n",
+            mk.np[MKSET_DECODE], mk.mtp >= 0 && mk.mtp <= 3 ? mkm[mk.mtp] : "?", mk.np[MKSET_MTP]);
   }
 
   HIP(H.Malloc((void **)&b->arena, g->arena));
@@ -1272,7 +1315,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   struct timespec h0, h1;
   clock_gettime(CLOCK_MONOTONIC, &h0);
   tr_run("decode", pos, 1);
-  mk.rec = mk.on, mk.set = MKSET_DECODE;
+  mk.rec = mk.on && !mk.off[MKSET_DECODE], mk.set = MKSET_DECODE;
   run_ops(b, 0, g->n_main, &tok, 1, pos, 0); /* state: slot -> slot */
   mk.rec = 0;
   mk_flush();
@@ -1309,7 +1352,8 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
   tr_run(sec ? "mtp" : last_only && T > 1u ? "prefill" : "verify", pos, T);
   /* verify runs and MTP drafts (not prompt chunks): the MTP build of the
    * megakernel (IE_MK_MTP=0: off) */
-  mk.rec = mk.on && mk.mtp && !(last_only && T > 1u) && (mk.mtp == 1 || (mk.mtp == 2) == (sec != 0)), mk.set = MKSET_MTP;
+  mk.rec = mk.on && !mk.off[MKSET_MTP] && mk.mtp && !(last_only && T > 1u) && (mk.mtp == 1 || (mk.mtp == 2) == (sec != 0)),
+  mk.set = MKSET_MTP;
   run_ops(b, sec ? g->n_main : 0, sec ? g->n_ops : g->n_main, toks, T, pos, last_only ? T - 1 : 0);
   mk.rec = 0;
   mk_flush();
