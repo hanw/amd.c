@@ -23,6 +23,8 @@ static struct {
   hipError_t (*Malloc)(void **, size_t);
   hipError_t (*Free)(void *);
   hipError_t (*Memcpy)(void *, const void *, size_t, int);
+  hipError_t (*MemcpyAsync)(void *, const void *, size_t, int, hipStream_t);
+  hipError_t (*HostMalloc)(void **, size_t, unsigned);
   hipError_t (*Memset)(void *, int, size_t);
   hipError_t (*ModuleLoadData)(hipModule_t *, const void *);
   hipError_t (*ModuleGetFunction)(hipFunction_t *, hipModule_t, const char *);
@@ -88,6 +90,8 @@ static void hip_load(void) {
   SYM(GraphLaunch, "hipGraphLaunch");
   SYM(StreamSynchronize, "hipStreamSynchronize");
   SYM(ModuleLaunchCooperativeKernel, "hipModuleLaunchCooperativeKernel");
+  SYM(MemcpyAsync, "hipMemcpyAsync");
+  SYM(HostMalloc, "hipHostMalloc");
 #undef SYM
 }
 
@@ -282,22 +286,29 @@ void gpu_stream_init(void) {
 }
 
 /* The megakernel (IE_MK=1, kernels/ie_mk.c): while mk.rec is set, the
- * launches of the kernels it has go to a command list (256 bytes each:
- * {id, groups x, groups y, 0}, then the arguments packed as a launch packs
- * them); mk_flush runs the list as one cooperative launch of mk.np
- * workgroups. A launch of another kernel flushes the list first, so the
- * order is always the order of the launches. */
+ * launches of the kernels of the current build (mk.set: decode or MTP) go
+ * to a command list (256 bytes each: {id, groups x, groups y, join}, then
+ * the arguments packed as a launch packs them); mk_flush copies the list to
+ * the device (asynchronously, from a ring of pinned host buffers) and runs
+ * it as one cooperative launch of mk.np[set] workgroups. A launch of
+ * another kernel flushes the list first, so the order is always the order
+ * of the launches. */
 #include "ie_mk_gen.h"
-enum { MK_CMD = 256, MK_CAP = 4096, MK_ARGEND = 232 };
+enum { MK_CMD = 256, MK_CAP = 4096, MK_ARGEND = 232, MK_RING = 4 };
 static struct {
-  int on, rec;
-  hipModule_t mod;
-  hipFunction_t f;
+  int on, rec, set;
+  hipModule_t mod[MK_NSETS];
+  hipFunction_t f[MK_NSETS];
+  u32 np[MK_NSETS];
   int id[K_N];       /* kernel -> MK_ id, or -1 */
-  unsigned char *cmd; /* host list */
-  void *dcmd;        /* device list */
+  unsigned char *cmd; /* host list: mk.ring[mk.slot] */
+  unsigned char *ring[MK_RING]; /* pinned */
+  hipEvent_t ev[MK_RING];       /* the copy of a ring buffer is done */
+  int slot, mtp, light;
+  void *dring[MK_RING]; /* device lists (one per ring buffer: a launch reads its own) */
   u32 *ws;           /* device: barrier counter, abort flag */
-  u32 n, np, base, pf, pfall, join;
+  volatile u32 *hflag; /* pinned: the abort flag after the last launch */
+  u32 n, base, pf, pfall, join;
   uint64_t joined;
   uint64_t launches, cmds;
   /* IE_MK_PROF=1: per command the clock at its end; per kernel the sum */
@@ -332,33 +343,66 @@ static void mk_prefetch(void) {
   }
 }
 
-/* The data ranges of a GEMV command (MAT_Q4K / Q6K / Q8 or F32): the
- * activations it reads, the result it writes, bias and residual. 0: not a
- * GEMV of these, or with the fused RMSNorm (its counter). */
-typedef struct { uint64_t r0, r1, w0, w1, b0, b1, s0, s1; } mk_rng;
+/* A strided data range: n pieces of len bytes, piece t at base + t stride
+ * (n = 1: one interval). */
+typedef struct { uint64_t base, len, stride, n; } mk_sr;
+typedef struct { mk_sr r, w, b, s; } mk_rng; /* activations read, result written, bias, residual */
+static mk_sr mk_sr1(uint64_t base, uint64_t len, uint64_t stride, uint64_t n) {
+  mk_sr x = {base, base ? len : 0u, stride, n ? n : 1u};
+  return x;
+}
+static int mk_ivl(uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) { return a0 < b1 && b0 < a1; }
+/* 1: the ranges may overlap. Exact for one interval each and for two ranges
+ * with one stride whose pieces fit in it; else the hull intervals. */
+static int mk_ovl(const mk_sr *x, const mk_sr *y) {
+  if (!x->len || !y->len) return 0;
+  const uint64_t x1 = x->base + (x->n - 1u) * x->stride + x->len, y1 = y->base + (y->n - 1u) * y->stride + y->len;
+  if (!mk_ivl(x->base, x1, y->base, y1)) return 0;
+  if (x->n > 1u && x->stride == y->stride && x->len <= x->stride && y->len <= y->stride) {
+    const uint64_t S = x->stride, d = (y->base >= x->base ? y->base - x->base : x->base - y->base) % S;
+    const uint64_t lo = y->base >= x->base ? x->len : y->len, hi = y->base >= x->base ? y->len : x->len;
+    /* the later piece starts d after the earlier one, in every frame */
+    return !(lo <= d && d + hi <= S);
+  }
+  return 1;
+}
+/* The data ranges of a GEMV command (MAT_Q4K / Q6K / Q8 or F32, one token
+ * or several). 0: not a GEMV of these, or with the fused RMSNorm (its counter). */
 static int mk_gemv_rng(u32 i, mk_rng *g) {
   const int k = mk.kof[i];
   const unsigned char *c = mk.cmd + (size_t)i * MK_CMD + 16;
   uint64_t p[8];
-  u32 rows, n2;
+  u32 rows, n2, t[4];
   memset(g, 0, sizeof *g);
   if (k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8) {
     /* qw qs xq y rows nb bias res nw ... */
     memcpy(p, c, 32), memcpy(&rows, c + 32, 4), memcpy(&n2, c + 36, 4), memcpy(p + 4, c + 40, 24);
     if (p[6]) return 0;
-    g->r0 = p[2], g->r1 = p[2] + (uint64_t)n2 * 40u, g->w0 = p[3], g->w1 = p[3] + (uint64_t)rows * 4u;
+    g->r = mk_sr1(p[2], (uint64_t)n2 * 40u, 0, 1), g->w = mk_sr1(p[3], (uint64_t)rows * 4u, 0, 1);
+    g->s = mk_sr1(p[5], (uint64_t)rows * 4u, 0, 1);
   } else if (k == K_GEMV_F32) {
     /* w x y rows cols bias res nw ... */
     memcpy(p, c, 24), memcpy(&rows, c + 24, 4), memcpy(&n2, c + 28, 4), memcpy(p + 4, c + 32, 24);
     if (p[6]) return 0;
-    g->r0 = p[1], g->r1 = p[1] + (uint64_t)n2 * 4u, g->w0 = p[2], g->w1 = p[2] + (uint64_t)rows * 4u;
+    g->r = mk_sr1(p[1], (uint64_t)n2 * 4u, 0, 1), g->w = mk_sr1(p[2], (uint64_t)rows * 4u, 0, 1);
+    g->s = mk_sr1(p[5], (uint64_t)rows * 4u, 0, 1);
+  } else if (k == K_GEMV_Q4K_TR || k == K_GEMV_Q6K_TR || k == K_GEMV_Q8_TR) {
+    /* qw qs xq y rows nb bias res T xs ys rs: T tokens; xs in bytes, ys and rs in floats */
+    memcpy(p, c, 32), memcpy(&rows, c + 32, 4), memcpy(&n2, c + 36, 4), memcpy(p + 4, c + 40, 16), memcpy(t, c + 56, 16);
+    g->r = mk_sr1(p[2], (uint64_t)n2 * 40u, t[1], t[0]), g->w = mk_sr1(p[3], (uint64_t)rows * 4u, t[2] * 4ull, t[0]);
+    g->s = mk_sr1(p[5], (uint64_t)rows * 4u, t[3] * 4ull, t[0]);
+  } else if (k == K_GEMV_F32_T) {
+    /* w x y rows cols bias res xs ys rs (bytes); grid y: the tokens */
+    u32 gy;
+    memcpy(p, c, 24), memcpy(&rows, c + 24, 4), memcpy(&n2, c + 28, 4), memcpy(p + 4, c + 32, 16), memcpy(t, c + 48, 12);
+    memcpy(&gy, c - 8, 4);
+    g->r = mk_sr1(p[1], (uint64_t)n2 * 4u, t[0], gy), g->w = mk_sr1(p[2], (uint64_t)rows * 4u, t[1], gy);
+    g->s = mk_sr1(p[5], (uint64_t)rows * 4u, t[2], gy);
   } else
     return 0;
-  if (p[4]) g->b0 = p[4], g->b1 = p[4] + (uint64_t)rows * 4u;
-  if (p[5]) g->s0 = p[5], g->s1 = p[5] + (uint64_t)rows * 4u;
+  g->b = mk_sr1(p[4], (uint64_t)rows * 4u, 0, 1);
   return 1;
 }
-static int mk_ovl(uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) { return a0 < b1 && b0 < a1; }
 /* Command i joins the phase of the commands ph .. i - 1 (no barrier before
  * it: IE_MK_JOIN, default on) when all are GEMVs and no range i writes is
  * read or written by the phase and no range i reads is written by it. */
@@ -370,10 +414,8 @@ static void mk_join(void) {
     int ok = mk.join && mk_gemv_rng(i, &gi);
     for (u32 j = ph; ok && j < i; j++) {
       if (!mk_gemv_rng(j, &gj)) ok = 0;
-      else if (mk_ovl(gi.w0, gi.w1, gj.r0, gj.r1) || mk_ovl(gi.w0, gi.w1, gj.w0, gj.w1) ||
-               mk_ovl(gi.w0, gi.w1, gj.b0, gj.b1) || mk_ovl(gi.w0, gi.w1, gj.s0, gj.s1) ||
-               mk_ovl(gj.w0, gj.w1, gi.r0, gi.r1) || mk_ovl(gj.w0, gj.w1, gi.b0, gi.b1) ||
-               mk_ovl(gj.w0, gj.w1, gi.s0, gi.s1))
+      else if (mk_ovl(&gi.w, &gj.r) || mk_ovl(&gi.w, &gj.w) || mk_ovl(&gi.w, &gj.b) || mk_ovl(&gi.w, &gj.s) ||
+               mk_ovl(&gj.w, &gi.r) || mk_ovl(&gj.w, &gi.b) || mk_ovl(&gj.w, &gi.s))
         ok = 0;
     }
     const u32 f = ok ? 1u : 0u;
@@ -387,16 +429,20 @@ static void mk_flush(void) {
   if (!mk.n) return;
   mk_join();
   mk_prefetch();
-  HIP(H.Memcpy(mk.dcmd, mk.cmd, (size_t)mk.n * MK_CMD, hipMemcpyHostToDevice));
-  void *a[] = {&mk.dcmd, &mk.n, &mk.ws, &mk.base, &mk.dprof};
-  HIP(H.ModuleLaunchCooperativeKernel(mk.f, mk.np, 1, 1, 256, 1, 1, 0, cur_stream, a));
+  const u32 np = mk.np[mk.set];
+  void *dc = mk.dring[mk.slot];
+  HIP(H.MemcpyAsync(dc, mk.cmd, (size_t)mk.n * MK_CMD, hipMemcpyHostToDevice, cur_stream));
+  void *a[] = {&dc, &mk.n, &mk.ws, &mk.base, &mk.dprof};
+  HIP(H.ModuleLaunchCooperativeKernel(mk.f[mk.set], np, 1, 1, 256, 1, 1, 0, cur_stream, a));
+  HIP(H.EventRecord(mk.ev[mk.slot], cur_stream)); /* the copy and the launch are done */
+  HIP(H.MemcpyAsync((void *)mk.hflag, mk.ws + 1, 4, hipMemcpyDeviceToHost, cur_stream));
   u32 nbar = 0;
   for (u32 i = 1; i < mk.n; i++) {
     u32 f;
     memcpy(&f, mk.cmd + (size_t)i * MK_CMD + 12, 4);
     nbar += f == 0u;
   }
-  mk.base += mk.np * nbar;
+  mk.base += np * nbar;
   mk.launches++, mk.cmds += mk.n;
   if (mk.dprof) { /* the first command: from its predecessor's end is not known; skip it */
     HIP(H.Memcpy(mk.hprof, mk.dprof, (size_t)mk.n * 8u, hipMemcpyDeviceToHost));
@@ -404,18 +450,25 @@ static void mk_flush(void) {
     mk.psteps++;
   }
   mk.n = 0;
+  /* the next list goes to the next ring buffers, once their last launch is done */
+  mk.slot = (mk.slot + 1) % MK_RING;
+  HIP(H.EventSynchronize(mk.ev[mk.slot]));
+  mk.cmd = mk.ring[mk.slot];
 }
-/* After a run: stop if a grid barrier of the megakernel timed out. */
+/* After a run (its results read with a blocking copy: every launch is done):
+ * stop if a grid barrier of the megakernel timed out. */
 static void mk_check(u32 pos) {
-  if (!mk.launches) return;
-  u32 ab = 0;
-  HIP(H.Memcpy(&ab, mk.ws + 1, 4, hipMemcpyDeviceToHost));
-  if (ab) ie_die("megakernel: a grid barrier timed out (run at position %u)", pos);
+  if (mk.launches && *mk.hflag) ie_die("megakernel: a grid barrier timed out (run at position %u)", pos);
 }
+/* The MTP build of the megakernel has the multi-token GEMVs with 4 rows per
+ * wave (ie_gemv_q4kq8_tr, ie_gemv_q6kq8_tr; bitwise equal to the others):
+ * the 8-row ones (ts2, tr8) need about 192 VGPRs alone, and with them the
+ * megakernel spills (IE_MK_LIGHT=0: keep them, launched apart). */
+static int mk_light(void) { return mk.rec && mk.set == MKSET_MTP && mk.light; }
 /* 1: the launch went to the list */
 static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **args) {
   if (!mk.rec) return 0;
-  if (lds_bytes || mk.id[k] < 0) {
+  if (lds_bytes || mk.id[k] < 0 || !mk_in_set[mk.set][mk.id[k]]) {
     mk_flush();
     return 0;
   }
@@ -473,38 +526,61 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     hipFunction_t f;
     b->kvb = H.ModuleGetFunction(&f, b->mod, "ie_kv_f16") == 0 ? 2u : 4u;
   }
-  /* IE_MK=1: decode steps through the megakernel, ie_mk.hsaco next to the
-   * kernels (IE_MK_NP: its workgroups, default 64: one per compute unit, the most
-   * that fit with its 225 VGPRs) */
+  /* IE_MK=1: decode steps (ie_mk.hsaco) and verify runs (ie_mk_mtp.hsaco)
+   * through the megakernel; the files next to the kernels. IE_MK_NP,
+   * IE_MK_NP_MTP: the workgroups, default 128: two per CU, the most that are
+   * resident with 192 VGPRs and 14 KB of LDS (the hardware places a
+   * workgroup in one CU: the occupancy query, per WGP, says 4) */
   const char *mke = getenv("IE_MK");
   if (mke && mke[0] == '1') {
     const char *sl = strrchr(hsaco, '/');
     const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
-    char *path = malloc(dl + 16);
-    memcpy(path, hsaco, dl);
-    strcpy(path + dl, "ie_mk.hsaco");
-    FILE *mf = fopen(path, "rb");
-    if (!mf) ie_die("IE_MK: cannot open %s (make %s)", path, path);
-    fseek(mf, 0, SEEK_END);
-    const long ms = ftell(mf);
-    fseek(mf, 0, SEEK_SET);
-    char *mi = malloc((size_t)ms);
-    if (fread(mi, 1, (size_t)ms, mf) != (size_t)ms) ie_die("cannot read %s", path);
-    fclose(mf);
-    HIP(H.ModuleLoadData(&mk.mod, mi));
-    free(mi), free(path);
-    HIP(H.ModuleGetFunction(&mk.f, mk.mod, "ie_mk"));
+    static const char *const mkf[MK_NSETS] = {"ie_mk.hsaco", "ie_mk_mtp.hsaco"};
+    for (int st = 0; st < MK_NSETS; st++) {
+      char *path = malloc(dl + 32);
+      memcpy(path, hsaco, dl);
+      strcpy(path + dl, mkf[st]);
+      FILE *mf = fopen(path, "rb");
+      if (!mf) ie_die("IE_MK: cannot open %s (make %s)", path, path);
+      fseek(mf, 0, SEEK_END);
+      const long ms = ftell(mf);
+      fseek(mf, 0, SEEK_SET);
+      char *mi = malloc((size_t)ms);
+      if (fread(mi, 1, (size_t)ms, mf) != (size_t)ms) ie_die("cannot read %s", path);
+      fclose(mf);
+      HIP(H.ModuleLoadData(&mk.mod[st], mi));
+      free(mi), free(path);
+      HIP(H.ModuleGetFunction(&mk.f[st], mk.mod[st], "ie_mk"));
+    }
+    const char *skip = getenv("IE_MK_SKIP"); /* debug: kernels launched as usual (comma list) */
     for (int i = 0; i < K_N; i++) {
       mk.id[i] = -1;
       for (int j = 0; j < MK_N; j++)
         if (!strcmp(kname[i], mk_names[j])) mk.id[i] = j;
+      if (skip) {
+        const char *q = strstr(skip, kname[i]);
+        const size_t kl = strlen(kname[i]);
+        if (q && (q[kl] == ',' || q[kl] == 0) && (q == skip || q[-1] == ',')) mk.id[i] = -1;
+      }
     }
-    mk.np = getenv("IE_MK_NP") ? (u32)atoi(getenv("IE_MK_NP")) : 64u;
+    mk.np[MKSET_DECODE] = getenv("IE_MK_NP") ? (u32)atoi(getenv("IE_MK_NP")) : 128u;
+    mk.np[MKSET_MTP] = getenv("IE_MK_NP_MTP") ? (u32)atoi(getenv("IE_MK_NP_MTP")) : 128u;
+    /* IE_MK_MTP: 3 (default) verify runs only, 1 verify runs and drafts, 2 drafts only, 0 neither
+     * (measured, MTP code 7 drafts: launches 94.2, 3: 99.2, 1: 98.4 tokens/s; a draft has
+     * few launches, and a cooperative launch costs more than an ordinary one) */
+    mk.mtp = getenv("IE_MK_MTP") ? atoi(getenv("IE_MK_MTP")) : 3;
+    mk.light = !getenv("IE_MK_LIGHT") || atoi(getenv("IE_MK_LIGHT")) != 0;
     mk.pfall = getenv("IE_MK_PFALL") != NULL;
     mk.join = !getenv("IE_MK_JOIN") || atoi(getenv("IE_MK_JOIN")) != 0;
     mk.pf = (getenv("IE_MK_PF") ? (u32)atoi(getenv("IE_MK_PF")) : 16u) << 20;
-    mk.cmd = malloc((size_t)MK_CAP * MK_CMD);
-    HIP(H.Malloc(&mk.dcmd, (size_t)MK_CAP * MK_CMD));
+    for (int r = 0; r < MK_RING; r++) {
+      HIP(H.HostMalloc((void **)&mk.ring[r], (size_t)MK_CAP * MK_CMD, 0));
+      HIP(H.EventCreate(&mk.ev[r]));
+    }
+    mk.cmd = mk.ring[0];
+    HIP(H.HostMalloc((void **)&mk.hflag, 64, 0));
+    *mk.hflag = 0;
+    for (int r = 0; r < MK_RING; r++) HIP(H.Malloc(&mk.dring[r], (size_t)MK_CAP * MK_CMD));
     HIP(H.Malloc((void **)&mk.ws, 64));
     HIP(H.Memset(mk.ws, 0, 64));
     if (getenv("IE_MK_PROF")) {
@@ -512,7 +588,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
       mk.hprof = malloc((size_t)MK_CAP * 8u);
     }
     mk.on = 1;
-    fprintf(stderr, "gpu: megakernel on (%u workgroups, %d kernels)\n", mk.np, MK_N);
+    fprintf(stderr, "gpu: megakernel on (decode: %u workgroups; verify and drafts: %s, %u workgroups)\n",
+            mk.np[MKSET_DECODE], mk.mtp ? "on" : "off", mk.np[MKSET_MTP]);
   }
 
   HIP(H.Malloc((void **)&b->arena, g->arena));
@@ -703,7 +780,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
             launch(b, K_GEMM_Q6KR, ((rows + 127u) / 128u) * ((T + 63u) / 64u), args); /* GK_R x GK_T */
             break;
           }
-          const u32 step = T <= 8u ? 8u : 16u; /* <= 8 tokens (verify): 8 rows per wave */
+          const u32 step = T <= 8u && !mk_light() ? 8u : 16u; /* <= 8 tokens (verify): 8 rows per wave */
           for (u32 t0 = 0; t0 < T; t0 += step) {
             u32 tn = T - t0 < step ? T - t0 : step;
             void *Ab = (char *)A + (size_t)t0 * xs, *Bb = (char *)B + (size_t)t0 * ys * 4u;
@@ -767,7 +844,9 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
             void *Ab = (char *)A + (size_t)t0 * xs, *Bb = (char *)B + (size_t)t0 * ys * 4u;
             const void *Rb = R ? (const char *)R + (size_t)t0 * rs * 4u : NULL;
             void *ta[] = {&w0, &w1, &Ab, &Bb, &rows, &nb, &bias, &Rb, &tn, &xs, &ys, &rs};
-            if (tn >= 6u && tn <= 8u) { /* 8 rows per wave, the tokens split over 2 waves: more waves in flight */
+            if (mk_light()) { /* the megakernel: 4 rows per wave (fewer registers) */
+              launch(b, K_GEMV_Q4K_TR, gr >= 253u && gr <= 256u ? 257u : gr, ta);
+            } else if (tn >= 6u && tn <= 8u) { /* 8 rows per wave, the tokens split over 2 waves: more waves in flight */
               launch(b, K_GEMV_Q4K_TS2, gr >= 253u && gr <= 256u ? 257u : gr, ta);
             } else if (tn <= 8u) { /* 8 rows per wave: half the activation loads per weight byte */
               const u32 g8 = (rows + 63u) / 64u;
@@ -1193,7 +1272,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   struct timespec h0, h1;
   clock_gettime(CLOCK_MONOTONIC, &h0);
   tr_run("decode", pos, 1);
-  mk.rec = mk.on;
+  mk.rec = mk.on, mk.set = MKSET_DECODE;
   run_ops(b, 0, g->n_main, &tok, 1, pos, 0); /* state: slot -> slot */
   mk.rec = 0;
   mk_flush();
@@ -1228,12 +1307,12 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
   const int pc = b->prof == 2 && !sec && T > 1u;
   if (pc) HIP(H.EventRecord(b->e0, NULL));
   tr_run(sec ? "mtp" : last_only && T > 1u ? "prefill" : "verify", pos, T);
-  /* (the megakernel only runs decode steps: measured, MTP drafts through it
-   * 94.0 -> 92.2 tokens/s (the upload of the list and the check cost more
-   * than the gaps of a draft's few launches), verify runs 94.0 -> 80.6 (the
-   * multi-token GEMVs need more waves than 64 resident workgroups have:
-   * ts2 170 us against 126 us)) */
+  /* verify runs and MTP drafts (not prompt chunks): the MTP build of the
+   * megakernel (IE_MK_MTP=0: off) */
+  mk.rec = mk.on && mk.mtp && !(last_only && T > 1u) && (mk.mtp == 1 || (mk.mtp == 2) == (sec != 0)), mk.set = MKSET_MTP;
   run_ops(b, sec ? g->n_main : 0, sec ? g->n_ops : g->n_main, toks, T, pos, last_only ? T - 1 : 0);
+  mk.rec = 0;
+  mk_flush();
   if (pc) {
     HIP(H.DeviceSynchronize()); /* the events are on the NULL stream: run with IE_STREAM=0 for exact times */
     hipEvent_t prev = b->e0;
@@ -1252,6 +1331,7 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
     if (prob) memcpy(&prob[t], &tmp[t * am->stride / 4u + 1u], 4);
   }
   free(tmp);
+  mk_check(pos);
 }
 
 /* The prompt cache snapshot: the current state slot of each linear layer,

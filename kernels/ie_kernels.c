@@ -19,6 +19,11 @@
 #ifndef KERNEL
 #define KERNEL __attribute__((amdgpu_kernel, visibility("protected"))) void
 #endif
+/* the multi-token GEMVs (measured: as functions of their own in the
+ * megakernel (noinline) MTP drops 94 -> 71 tokens/s; they stay inlined) */
+#ifndef KERNEL_HEAVY
+#define KERNEL_HEAVY KERNEL
+#endif
 #define NT 256u
 
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
@@ -419,8 +424,12 @@ static LDS u32 mk_ok;
  * no wait) the next chunks of [pa, pa + cap) into the caches: chunks of
  * MK_PFCHUNK bytes claimed with an atomic add on *cur (cap 0: no prefetch). */
 static inline int mk_grid_sync_pf(G u32 *ws, u32 target, G u32 *cur, const G u8 *pa, u32 cap) {
+  /* every wave makes its stores visible to the device, then the workgroup
+   * meets, then one thread counts it (a release by thread 0 alone does not
+   * cover the stores of the other waves) */
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  barrier();
   if (tid() == 0u) {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     __scoped_atomic_fetch_add(&ws[0], 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     u32 r = 0u, pf = cap != 0u;
     for (u32 i = 0; i < MK_SPIN; i++) {
@@ -598,16 +607,16 @@ _Pragma("unroll") \
  * shapes of Qwen3.8-27B). The two waves of a row group read the same
  * weights (the second from the cache). Per (row, token) the order of
  * ie_gemv_q4kq8 (bitwise equal). */
-KERNEL ie_gemv_q4kq8_ts2(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+KERNEL_HEAVY ie_gemv_q4kq8_ts2(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                          const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
   Q4K_TS_BODY(8u, 4u, 1u, 2u)
 }
-KERNEL ie_gemv_q4kq8_tr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+KERNEL_HEAVY ie_gemv_q4kq8_tr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                         const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
   Q4K_TR_BODY(4u, 16u, 2u)
 }
 /* T <= 8 (speculative verify): 8 rows per wave, half the activation loads per weight byte */
-KERNEL ie_gemv_q4kq8_tr8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+KERNEL_HEAVY ie_gemv_q4kq8_tr8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                          const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
   Q4K_TR_BODY(8u, 8u, 1u)
 }
@@ -712,11 +721,11 @@ KERNEL ie_gemv_q6kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *
       } \
     } \
   }
-KERNEL ie_gemv_q6kq8_tr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+KERNEL_HEAVY ie_gemv_q6kq8_tr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                         const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
   Q6K_TR_BODY(4u, 16u)
 }
-KERNEL ie_gemv_q6kq8_tr8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+KERNEL_HEAVY ie_gemv_q6kq8_tr8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                          const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
   Q6K_TR_BODY(8u, 8u)
 }
@@ -773,7 +782,7 @@ KERNEL ie_gemv_q6kq8_tr8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G flo
     } \
   }
 /* 6 <= T <= 8: the tokens split over 2 waves (as ie_gemv_q4kq8_ts2); bitwise equal to ie_gemv_q6kq8 */
-KERNEL ie_gemv_q6kq8_ts2(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+KERNEL_HEAVY ie_gemv_q6kq8_ts2(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                          const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
   Q6K_TS_BODY(8u, 4u, 2u)
 }
@@ -885,7 +894,7 @@ KERNEL ie_gemv_q8q8_t(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float 
 #ifndef TR_NT
 #define TR_NT 1
 #endif
-KERNEL ie_gemv_q8q8_tr(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+KERNEL_HEAVY ie_gemv_q8q8_tr(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
                        const G float *bias, const G float *res, u32 T, u32 xs, u32 ys, u32 rs) {
 #pragma clang fp contract(off) /* no fused multiply-add: the same rounding as ie_gemv_q8q8 */
   const u32 r0 = (wgid() * 8u + (tid() >> 5)) * GEMV_R, l = lane();
@@ -2263,8 +2272,6 @@ KERNEL ie_attn(const G float *q, const G kvt *kc, const G kvt *vc, G float *sc, 
 static LDS float at_m[8], at_l[8];
 static LDS float at_o[8][256];
 static LDS u32 at_last;
-/* the weights of the splits in the merge (nsplit <= IE_ATT_MAX_SPLIT) */
-static LDS float at_w[4096];
 static inline void attn_split_body(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out,
                                    u32 pos, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq,
                                    const G float *gate, u32 gstride, u32 h, u32 s) {
@@ -2320,21 +2327,22 @@ static inline void attn_split_body(const G float *q, const G kvt *kc, const G kv
   if (!at_last) return;
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
   /* merge: the whole workgroup finds M2 = max m_t and L2 = sum l_t w_t, with
-   * the weight w_t = exp(m_t - M2) of split t computed once, in LDS */
-  const G float *ph = part + (unsigned long)h * nsplit * (hd + 2u);
+   * the weight w_t = exp(m_t - M2) of split t computed once and written over
+   * m_t in part (not in LDS: the megakernel needs little LDS) */
+  G float *ph = part + (unsigned long)h * nsplit * (hd + 2u);
   float mv = -__builtin_inff();
   for (u32 t = tid(); t < nsplit; t += NT) mv = __builtin_fmaxf(mv, ph[t * (hd + 2u)]);
-  const float M2 = wg_max(mv);
+  const float M2 = wg_max(mv); /* its barrier: every m_t is read before a w_t is written */
   float lv = 0.0f;
   for (u32 t = tid(); t < nsplit; t += NT) {
     const float wt = __builtin_expf(ph[t * (hd + 2u)] - M2);
-    at_w[t] = wt;
+    ph[t * (hd + 2u)] = wt;
     lv += ph[t * (hd + 2u) + 1u] * wt;
   }
-  const float L2 = wg_sum(lv); /* its barrier also makes at_w visible */
+  const float L2 = wg_sum(lv); /* its barrier also makes the w_t visible to the workgroup */
   if (tid() < hd) { /* hd % 32 == 0 when oq is set: whole waves */
     float o = 0.0f;
-    for (u32 t = 0; t < nsplit; t++) o += ph[t * (hd + 2u) + 2u + tid()] * at_w[t];
+    for (u32 t = 0; t < nsplit; t++) o += ph[t * (hd + 2u) + 2u + tid()] * ph[t * (hd + 2u)];
     o = o / L2;
     if (gate) o = o * sigmoidf(gate[h * gstride + tid()]); /* qwen35: the output gate */
     out[h * hd + tid()] = o;

@@ -40,7 +40,7 @@ __attribute__((amdgpu_kernel, visibility("protected"))) void ie_mk(G u8 *cmds, u
       barrier(); /* the previous workgroup body is done with mk_vid and its LDS */
       if (tid() == 0u) mk_vid[0] = v % gx, mk_vid[1] = v / gx, mk_vid[2] = gx;
       barrier();
-      MK_DISPATCH(kid, a);
+      mk_dispatch(kid, a);
     }
     /* word 3 of the next command: 1 = it joins this phase (independent
      * GEMVs, src/hip.c mk_join): no barrier */

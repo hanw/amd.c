@@ -21,7 +21,7 @@ SRC = $(ENGINE_SRC) src/main.c
 HDR = src/common.h src/gguf.h src/model.h src/backend.h src/gen.h core/ie_core.h $(B)/ie_mk_gen.h
 CFLAGS += -I$(B)
 
-all: $(B)/ie-run $(B)/ie-serve $(B)/ie_kernels.hsaco $(B)/ie_mk.hsaco
+all: $(B)/ie-run $(B)/ie-serve $(B)/ie_kernels.hsaco $(B)/ie_mk.hsaco $(B)/ie_mk_mtp.hsaco
 
 $(B):
 	mkdir -p $(B)
@@ -66,23 +66,30 @@ $(B)/ie_kernels.o: $(B)/ie_kernels.ll
 $(B)/ie_kernels.hsaco: $(B)/ie_kernels.o
 	$(GPU_LD) -shared -o $@ $<
 
-# The megakernel (kernels/ie_mk.c, IE_MK=1): the kernels of a decode step
-# as functions of one persistent kernel. tools/mk_gen.py writes the table of
-# these kernels (their argument layout) for kernels/ie_mk.c and src/hip.c.
-MK_KERNELS = ie_embed_q8 ie_rmsnorm ie_gemv_q4kq8 ie_gemv_q6kq8 ie_gemv_q8q8 ie_gemv_f32 ie_swiglu ie_gdn1 \
-             ie_qkn_rope_kv ie_attn_split ie_argmax
-$(B)/ie_mk_gen.h: tools/mk_gen.py kernels/ie_kernels.c | $(B)
-	$(PYTHON) tools/mk_gen.py kernels/ie_kernels.c $@ $(MK_KERNELS)
-# (clang 21 at -O3 writes "amdgpu-waves-per-eu"="8,16": at most 192 VGPRs,
-# and the megakernel spills; one workgroup per CU allows 4 waves per SIMD)
+# The megakernel (kernels/ie_mk.c, IE_MK=1): the kernels of a run as
+# functions of one persistent kernel. Two builds: ie_mk.hsaco (decode steps,
+# 192 VGPRs, no spills) and ie_mk_mtp.hsaco (verify runs and MTP drafts; the
+# multi-token GEMVs with 4 rows per wave: the 8-row ones make it spill).
+# At most 192 VGPRs and 16 KB of LDS: two workgroups per CU (128). tools/mk_gen.py writes the table of all these kernels (their
+# argument layout) for kernels/ie_mk.c and src/hip.c.
+MK_DECODE = ie_embed_q8,ie_rmsnorm,ie_gemv_q4kq8,ie_gemv_q6kq8,ie_gemv_q8q8,ie_gemv_f32,ie_swiglu,ie_gdn1,ie_qkn_rope_kv,ie_attn_split,ie_argmax
+MK_MTP = ie_embed_q8,ie_rmsnorm,ie_rmsnorm_t,ie_quant_q8,ie_swiglu,ie_gdn1,ie_qkn_rope_kv,ie_attn_split,ie_attn_split_t,ie_argmax,ie_gemv_q4q8,ie_gemv_q4kq8,ie_gemv_q6kq8,ie_gemv_q8q8,ie_gemv_f32,ie_gemv_f32_t,ie_gemv_q4kq8_tr,ie_gemv_q6kq8_tr,ie_gemv_q8q8_tr
+$(B)/ie_mk_gen.h: tools/mk_gen.py kernels/ie_kernels.c Makefile | $(B)
+	$(PYTHON) tools/mk_gen.py kernels/ie_kernels.c $@ DECODE=$(MK_DECODE) MTP=$(MK_MTP)
+# (clang 21 at -O3 writes "amdgpu-waves-per-eu"="8,16": at most 192 VGPRs;
+# the decode build spills with that, so it gets 1,4: 256 VGPRs)
 $(B)/ie_mk.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h | $(B)
-	$(GPU_CC) $(GPU_CFLAGS) -I$(B) -S -emit-llvm -o $@.tmp $<
+	$(GPU_CC) $(GPU_CFLAGS) -I$(B) -DMKS_DECODE -S -emit-llvm -o $@.tmp $<
 	sed -E -e '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="256,256" "target-cpu"/' \
 	  -e 's/"amdgpu-waves-per-eu"="[0-9]+,[0-9]+"/"amdgpu-waves-per-eu"="1,4"/' $@.tmp > $@
 	rm -f $@.tmp
-$(B)/ie_mk.o: $(B)/ie_mk.ll
+$(B)/ie_mk_mtp.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h | $(B)
+	$(GPU_CC) $(GPU_CFLAGS) -I$(B) -DMKS_MTP -S -emit-llvm -o $@.tmp $<
+	sed -E -e '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="256,256" "target-cpu"/' $@.tmp > $@
+	rm -f $@.tmp
+$(B)/ie_mk.o $(B)/ie_mk_mtp.o: $(B)/%.o: $(B)/%.ll
 	$(GPU_CC) -nogpulib --target=amdgcn-amd-amdhsa -mcpu=$(GPU_ARCH) -O3 -c -o $@ $<
-$(B)/ie_mk.hsaco: $(B)/ie_mk.o
+$(B)/ie_mk.hsaco $(B)/ie_mk_mtp.hsaco: $(B)/%.hsaco: $(B)/%.o
 	$(GPU_LD) -shared -o $@ $<
 
 $(B)/laws_test: tests/laws_test.cpp laws/ie_laws.cpp core/ie_core.h core/lean_mem.h | $(B)

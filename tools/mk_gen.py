@@ -10,18 +10,32 @@ Reads the KERNEL declarations of kernels/ie_kernels.c and writes a header with:
     pointer, 4 for u32 / int / float), so the host packs the void **args of
     a launch into the same bytes.
 
-  tools/mk_gen.py kernels/ie_kernels.c OUT.h kernel ...
+  tools/mk_gen.py kernels/ie_kernels.c OUT.h SET=kernel,kernel,... ...
+
+Each SET is one build of the megakernel (kernels/ie_mk.c with -DMKS_SET):
+the enum and the host tables cover the union of the sets; mk_dispatch has
+the cases of the set the build defines, and mk_in_set[s][id] tells the host
+which kernels set s has.
 """
 import re
 import sys
 
-src, out, names = sys.argv[1], sys.argv[2], sys.argv[3:]
+src, out = sys.argv[1], sys.argv[2]
+sets = []
+for a in sys.argv[3:]:
+    sn, ks_ = a.split("=", 1)
+    sets.append((sn, [k for k in ks_.split(",") if k]))
+names = []
+for _, ks_ in sets:
+    for k in ks_:
+        if k not in names:
+            names.append(k)
 text = open(src).read()
 sizes4 = {"u32", "int", "float", "unsigned"}
 
 
 def params(name):
-    m = re.search(r"^KERNEL\s+" + re.escape(name) + r"\s*\(([^)]*)\)\s*\{", text, re.M)
+    m = re.search(r"^KERNEL(?:_HEAVY)?\s+" + re.escape(name) + r"\s*\(([^)]*)\)\s*\{", text, re.M)
     if not m:
         sys.exit("mk_gen: no KERNEL %s in %s" % (name, src))
     ps = []
@@ -46,16 +60,25 @@ o.append("#define MK_MAXARGS %d" % max(len(p) for _, p in ks))
 o.append("#ifdef IE_MEGA")
 for n, ps in ks:
     o.append("struct mka_%s { %s };" % (n, " ".join("%s %s;" % (t, v) for t, v, _ in ps)))
-o.append("#define MK_DISPATCH(kid, a) switch (kid) { \\")
+o.append("static inline void mk_dispatch(u32 kid, const G u8 *a) {")
+o.append("  switch (kid) {")
 for n, ps in ks:
-    o.append("  case MK_%s: { const G struct mka_%s *p_ = (const G struct mka_%s *)(a); %s(%s); } break; \\"
+    cond = " || ".join("defined(MKS_%s)" % sn for sn, kk in sets if n in kk)
+    o.append("#if %s" % cond)
+    o.append("  case MK_%s: { const G struct mka_%s *p_ = (const G struct mka_%s *)a; %s(%s); } break;"
              % (n, n, n, n, ", ".join("p_->%s" % v for _, v, _ in ps)))
-o.append("  default: break; }")
+    o.append("#endif")
+o.append("  default: break;")
+o.append("  }")
+o.append("}")
 o.append("#else")
 o.append("static const char *const mk_names[MK_N] = {%s};" % ", ".join('"%s"' % n for n, _ in ks))
 o.append("static const unsigned char mk_nargs[MK_N] = {%s};" % ", ".join(str(len(p)) for _, p in ks))
 o.append("static const unsigned char mk_argsz[MK_N][MK_MAXARGS] = {%s};"
          % ", ".join("{%s}" % ", ".join(str(s) for _, _, s in p) for _, p in ks))
+o.append("enum { %s, MK_NSETS };" % ", ".join("MKSET_%s" % sn for sn, _ in sets))
+o.append("static const unsigned char mk_in_set[MK_NSETS][MK_N] = {%s};"
+         % ", ".join("{%s}" % ", ".join("1" if n in kk else "0" for n, _ in ks) for _, kk in sets))
 o.append("#endif")
 o.append("#endif")
 open(out, "w").write("\n".join(o) + "\n")
