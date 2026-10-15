@@ -15,7 +15,8 @@
  * barrier needs them). ws: ws[0] the barrier counter (never reset; base:
  * its value at launch), ws[1] the abort flag (set when a wait times out:
  * then every workgroup leaves, and the host stops). prof (or NULL): per
- * command, the clock after its grid barrier (workgroup 0).
+ * command, the clock after its grid barrier (workgroup 0). trace (or
+ * NULL): the per-workgroup timeline of prof/sm_profiler.h.
  * Bytes 232 .. 255 of a command: the prefetch of its barrier (the first
  * bytes of the weights of the next GEMV; src/hip.c mk_flush) and the claim
  * cursor (word 63, zero in the list the host writes). */
@@ -24,10 +25,13 @@
 #define KERNEL static inline __attribute__((always_inline)) void /* (noinline: 192 VGPRs, but slower, and still 64 workgroups at most) */
 #include "ie_kernels.c"
 #include "ie_mk_gen.h"
+#include "../prof/sm_profiler.h"
+_Static_assert(MK_N < 31, "the profiler has 32 event types: the kernels, 31 the grid barrier");
+#define MK_EV_BARRIER 31u
 
 #define MK_CMD 256u
 
-__attribute__((amdgpu_kernel, visibility("protected"))) void ie_mk(G u8 *cmds, u32 n, G u32 *ws, u32 base, G unsigned long *prof) {
+__attribute__((amdgpu_kernel, visibility("protected"))) void ie_mk(G u8 *cmds, u32 n, G u32 *ws, u32 base, G unsigned long *prof, G uint64_t *trace) {
   const u32 np = __builtin_amdgcn_grid_size_x() / NT, p = __builtin_amdgcn_workgroup_id_x();
   u32 nbar = 0, off = 0; /* off: the workgroups of the phase before command i, mod np */
   for (u32 i = 0; i < n; i++) {
@@ -40,7 +44,11 @@ __attribute__((amdgpu_kernel, visibility("protected"))) void ie_mk(G u8 *cmds, u
       barrier(); /* the previous workgroup body is done with mk_vid and its LDS */
       if (tid() == 0u) mk_vid[0] = v % gx, mk_vid[1] = v / gx, mk_vid[2] = gx;
       barrier();
+      /* IE_MK_TRACE: one range per workgroup body, on the timeline of
+       * workgroup p (prof/sm_profiler.h; thread 0 records) */
+      if (trace) smp_start_at(trace, kid, p, 0u, tid() == 0u);
       mk_dispatch(kid, a);
+      if (trace) smp_end_at(trace, kid, p, 0u, tid() == 0u);
     }
     /* word 3 of the next command: 1 = it joins this phase (independent
      * GEMVs, src/hip.c mk_join): no barrier */
@@ -51,7 +59,9 @@ __attribute__((amdgpu_kernel, visibility("protected"))) void ie_mk(G u8 *cmds, u
        * 61 the command whose word 63 is the claim cursor */
       const unsigned long pa = ((unsigned long)h[59] << 32) | h[58];
       G u32 *cur = (G u32 *)(cmds + (unsigned long)h[61] * MK_CMD) + 63;
+      if (trace) smp_start_at(trace, MK_EV_BARRIER, p, 0u, tid() == 0u);
       if (!mk_grid_sync_pf(ws, base + np * nbar, cur, (const G u8 *)pa, h[60])) return;
+      if (trace) smp_end_at(trace, MK_EV_BARRIER, p, 0u, tid() == 0u);
     }
     if (join) off = (off + tot) % np;
     /* IE_MK_PROF: the time (100 MHz clock) when command i is done everywhere */

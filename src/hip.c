@@ -294,6 +294,7 @@ void gpu_stream_init(void) {
  * another kernel flushes the list first, so the order is always the order
  * of the launches. */
 #include "ie_mk_gen.h"
+#include "../prof/sm_profiler.h"
 enum { MK_CMD = 256, MK_CAP = 4096, MK_ARGEND = 232, MK_RING = 4 };
 static struct {
   int on, rec, set;
@@ -317,6 +318,11 @@ static struct {
   int kof[MK_CAP];
   double pus[K_N];
   uint32_t pcnt[K_N], psteps;
+  /* IE_MK_TRACE=FILE: the timeline of one launch (IE_MK_TRACE_AT: which,
+   * default 10) per workgroup, to FILE (Chrome trace, prof/sm_profiler.h) */
+  smp_buffer_t trace;
+  const char *trace_file;
+  uint64_t trace_at;
 } mk;
 
 /* The prefetch of the barrier after command i: the first bytes (up to
@@ -435,7 +441,8 @@ static void mk_flush(void) {
   const u32 np = mk.np[mk.set];
   void *dc = mk.dring[mk.slot];
   HIP(H.MemcpyAsync(dc, mk.cmd, (size_t)mk.n * MK_CMD, hipMemcpyHostToDevice, cur_stream));
-  void *a[] = {&dc, &mk.n, &mk.ws, &mk.base, &mk.dprof};
+  uint64_t *tp = mk.trace && mk.launches == mk.trace_at ? smp_device_ptr(mk.trace) : NULL;
+  void *a[] = {&dc, &mk.n, &mk.ws, &mk.base, &mk.dprof, &tp};
   HIP(H.ModuleLaunchCooperativeKernel(mk.f[mk.set], np, 1, 1, 256, 1, 1, 0, cur_stream, a));
   HIP(H.EventRecord(mk.ev[mk.slot], cur_stream)); /* the copy and the launch are done */
   HIP(H.MemcpyAsync((void *)mk.hflag, mk.ws + 1, 4, hipMemcpyDeviceToHost, cur_stream));
@@ -447,6 +454,11 @@ static void mk_flush(void) {
   }
   mk.base += np * nbar;
   mk.launches++, mk.cmds += mk.n;
+  if (tp) {
+    smp_print_stats(mk.trace, stderr);
+    smp_export(mk.trace, mk.trace_file);
+    smp_destroy(mk.trace), mk.trace = NULL;
+  }
   if (mk.dprof) { /* the first command: from its predecessor's end is not known; skip it */
     HIP(H.Memcpy(mk.hprof, mk.dprof, (size_t)mk.n * 8u, hipMemcpyDeviceToHost));
     for (u32 i = 1; i + 1u < mk.n; i++) mk.pus[mk.kof[i]] += (mk.hprof[i] - mk.hprof[i - 1]) * 0.01, mk.pcnt[mk.kof[i]]++;
@@ -618,7 +630,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     for (int st = 0; st < MK_NSETS; st++) {
       for (;;) {
         u32 zero = 0;
-        void *a0[] = {&mk.dring[0], &zero, &mk.ws, &mk.base, &mk.dprof};
+        void *nul = NULL;
+        void *a0[] = {&mk.dring[0], &zero, &mk.ws, &mk.base, &mk.dprof, &nul};
         if (H.ModuleLaunchCooperativeKernel(mk.f[st], mk.np[st], 1, 1, 256, 1, 1, 0, cur_stream, a0) == 0) break;
         if (mk.np[st] <= 32u) {
           fprintf(stderr, "gpu: megakernel off for %s runs (no cooperative launch)\n", st == MKSET_DECODE ? "decode" : "verify");
@@ -629,6 +642,14 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
       }
     }
     HIP(H.DeviceSynchronize());
+    if ((mk.trace_file = getenv("IE_MK_TRACE")) && mk.trace_file[0]) {
+      const u32 nmax = mk.np[0] > mk.np[1] ? mk.np[0] : mk.np[1];
+      mk.trace_at = getenv("IE_MK_TRACE_AT") ? (uint64_t)atoll(getenv("IE_MK_TRACE_AT")) : 10u;
+      if ((mk.trace = smp_create(nmax, 1, 16384, 1))) {
+        for (int j = 0; j < MK_N; j++) smp_register_event(mk.trace, (uint32_t)j, mk_names[j] + 3);
+        smp_register_event(mk.trace, 31, "grid barrier");
+      }
+    }
     mk.on = 1;
     static const char *const mkm[4] = {"off", "verify runs and drafts", "drafts", "verify runs"};
     fprintf(stderr, "gpu: megakernel on (decode: %u workgroups; MTP: %s, %u workgroups; IE_MK=0: off)\n",

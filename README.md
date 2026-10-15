@@ -33,6 +33,7 @@
 | `kernels/ie_kernels.c` | GPU 内核，用 C 写（不是 HIP C++），由 clang 编译到 amdgcn。 |
 | `kernels/ie_mk.c` | 大核函数（默认开启，`IE_MK=0` 关闭）：解码一步或验证一步的核函数在一次常驻启动里按顺序执行。 |
 | `tools/mk_gen.py` | 生成大核函数的核函数表（参数布局），设备端和主机端共用。 |
+| `prof/sm_profiler.h`、`prof/sm_profiler.c` | 核函数内的逐 wave 事件时间线（参照 leepoly/sm-profiler 改写给 AMD）：导出 Chrome 追踪 JSON，用 ui.perfetto.dev 打开。 |
 | `tools/mk_bench.c` | 大核函数探针：32 个矩阵向量乘，一次启动对比逐个启动。 |
 | `tools/make_tiny_gguf.py` | 生成小的随机模型（GGUF v3），两种架构都有。 |
 | `tools/ref_forward.py` | 独立的 numpy float64 参考前向计算。 |
@@ -754,7 +755,29 @@ gate/up；多 token 时按 token 的跨步区间判断）在同一段里执行�
 | Qwen3.5-0.8B Q8_0 | 2.176 | 1.958（快 11%） |
 | Qwen3.8-27B Q4_K_M | 30.45 | 29.07（快 5%） |
 
-## 什么被验证、什么被测试、什么没有测试
+### 核函数内的事件时间线（`prof/`，2026-10-15）
+
+`prof/sm_profiler.h` 是 [leepoly/sm-profiler](https://github.com/leepoly/sm-profiler)（CUDA）的 AMD 版，用 C 写，
+接口和缓冲区布局与原版相同：核函数里每个（工作组，wave）记录区间事件和瞬时事件，不用原子操作；主机读回后写成
+Chrome 追踪 JSON。每个 WGP 是一个进程，每个（工作组，wave）是一个线程。
+
+| CUDA 原版 | AMD 版 |
+|---|---|
+| `%globaltimer`（纳秒） | `s_sendmsg_rtn MSG_RTN_GET_REALTIME`（100 MHz 恒定时钟，各计算单元一致；gfx9/10 用 `s_memrealtime`），存成纳秒，精度 10 纳秒 |
+| `%smid` | `s_getreg HW_REG_HW_ID1`：SE、SA、WGP 编号合成一个 WGP 编号；另存 SIMD 编号 |
+| `%laneid`、warp | `mbcnt`；wave 大小 32 或 64 |
+| CUDA 运行时 | dlopen `libamdhip64.so`，不需要 ROCm 头文件 |
+| 设备端 C++ | C（clang amdgcn，本仓库的核函数）；定义 `SMP_HIP` 后也可在 HIP C++ 里用 |
+| B/E 两条记录 | 一条 X 记录（开始和时长）；另有 `smp_print_stats` 按事件统计 |
+
+新增 `*_at` 接口：常驻核函数可以传入逻辑工作组编号。已确认：R9700 上 128 个工作组分布在 32 个不同的 WGP 编号上
+（这块卡有 32 个 WGP）。
+
+示例：`make build/smp_demo build/smp_demo.hsaco`，然后 `build/smp_demo build/smp_demo.hsaco` 写出 `demo_trace.json`。
+
+大核函数：`IE_MK_TRACE=文件` 记录第 `IE_MK_TRACE_AT`（默认 10）次大核函数启动里每个工作组的时间线（每段工作和
+每次全局同步等待），打印统计并写出文件。27B 解码一步约 60 万个事件。记录时这一步约慢 6%。
+
 
 **被验证（Lean 证明，对所有输入成立，`make proofs` 约 1 分钟）**：`core/ie_core.h` 中的函数满足 `laws/ie_laws.cpp` 的 35 条定律（`make proofs` 检查 37 个定理）：
 GEMV 网格和 lane 划分的覆盖与唯一性；Q4_0 和 Q8_0 重排地址在数组内且是双射；半字节和字节解包符合 GGUF；

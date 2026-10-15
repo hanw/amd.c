@@ -16,12 +16,12 @@ GPU_ARCH   ?= gfx1201
 GPU_CFLAGS = -x c -std=c11 -Wall -Wextra --target=amdgcn-amd-amdhsa -mcpu=$(GPU_ARCH) -nogpulib -O3
 
 B = build
-ENGINE_SRC = src/common.c src/gguf.c src/model.c src/plan.c src/cpu.c src/hip.c src/gen.c
+ENGINE_SRC = src/common.c src/gguf.c src/model.c src/plan.c src/cpu.c src/hip.c src/gen.c prof/sm_profiler.c
 SRC = $(ENGINE_SRC) src/main.c
-HDR = src/common.h src/gguf.h src/model.h src/backend.h src/gen.h core/ie_core.h $(B)/ie_mk_gen.h
+HDR = src/common.h src/gguf.h src/model.h src/backend.h src/gen.h core/ie_core.h $(B)/ie_mk_gen.h prof/sm_profiler.h
 CFLAGS += -I$(B)
 
-all: $(B)/ie-run $(B)/ie-serve $(B)/ie_kernels.hsaco $(B)/ie_mk.hsaco $(B)/ie_mk_mtp.hsaco
+all: $(B)/ie-run $(B)/ie-serve $(B)/smp_demo $(B)/smp_demo.hsaco $(B)/ie_kernels.hsaco $(B)/ie_mk.hsaco $(B)/ie_mk_mtp.hsaco
 
 $(B):
 	mkdir -p $(B)
@@ -78,11 +78,11 @@ $(B)/ie_mk_gen.h: tools/mk_gen.py kernels/ie_kernels.c Makefile | $(B)
 	$(PYTHON) tools/mk_gen.py kernels/ie_kernels.c $@ DECODE=$(MK_DECODE) MTP=$(MK_MTP)
 # (clang 21 at -O3 writes "amdgpu-waves-per-eu"="8,16": at most 192 VGPRs,
 # so two workgroups per CU; the host checks the count with a launch at load)
-$(B)/ie_mk.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h | $(B)
+$(B)/ie_mk.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h prof/sm_profiler.h | $(B)
 	$(GPU_CC) $(GPU_CFLAGS) -I$(B) -DMKS_DECODE -S -emit-llvm -o $@.tmp $<
 	sed -E -e '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="256,256" "target-cpu"/' $@.tmp > $@
 	rm -f $@.tmp
-$(B)/ie_mk_mtp.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h | $(B)
+$(B)/ie_mk_mtp.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h prof/sm_profiler.h | $(B)
 	$(GPU_CC) $(GPU_CFLAGS) -I$(B) -DMKS_MTP -S -emit-llvm -o $@.tmp $<
 	sed -E -e '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="256,256" "target-cpu"/' $@.tmp > $@
 	rm -f $@.tmp
@@ -136,3 +136,14 @@ clean:
 	rm -rf $(B) tools/__pycache__
 
 .PHONY: all test proofs clean tokcheck
+
+# prof/: the per-wave event profiler (sm_profiler.h, after leepoly/sm-profiler)
+# and its demo: build/smp_demo build/smp_demo.hsaco -> demo_trace.json
+$(B)/smp_demo: prof/demo.c prof/sm_profiler.c prof/sm_profiler.h | $(B)
+	$(CC) $(CFLAGS) -o $@ prof/demo.c prof/sm_profiler.c -ldl
+$(B)/smp_demo.hsaco: prof/demo_kernel.c prof/sm_profiler.h | $(B)
+	$(GPU_CC) $(GPU_CFLAGS) -S -emit-llvm -o $(B)/smp_demo.ll.tmp $<
+	sed -E '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="1,1024" "target-cpu"/' $(B)/smp_demo.ll.tmp > $(B)/smp_demo.ll
+	$(GPU_CC) -nogpulib --target=amdgcn-amd-amdhsa -mcpu=$(GPU_ARCH) -O3 -c -o $(B)/smp_demo.o $(B)/smp_demo.ll
+	$(GPU_LD) -shared -o $@ $(B)/smp_demo.o
+	rm -f $(B)/smp_demo.ll.tmp
