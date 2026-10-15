@@ -73,9 +73,12 @@ MK_KERNELS = ie_embed_q8 ie_rmsnorm ie_gemv_q4kq8 ie_gemv_q6kq8 ie_gemv_q8q8 ie_
              ie_qkn_rope_kv ie_attn_split ie_argmax
 $(B)/ie_mk_gen.h: tools/mk_gen.py kernels/ie_kernels.c | $(B)
 	$(PYTHON) tools/mk_gen.py kernels/ie_kernels.c $@ $(MK_KERNELS)
+# (clang 21 at -O3 writes "amdgpu-waves-per-eu"="8,16": at most 192 VGPRs,
+# and the megakernel spills; one workgroup per CU allows 4 waves per SIMD)
 $(B)/ie_mk.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h | $(B)
 	$(GPU_CC) $(GPU_CFLAGS) -I$(B) -S -emit-llvm -o $@.tmp $<
-	sed -E '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="256,256" "target-cpu"/' $@.tmp > $@
+	sed -E -e '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="256,256" "target-cpu"/' \
+	  -e 's/"amdgpu-waves-per-eu"="[0-9]+,[0-9]+"/"amdgpu-waves-per-eu"="1,4"/' $@.tmp > $@
 	rm -f $@.tmp
 $(B)/ie_mk.o: $(B)/ie_mk.ll
 	$(GPU_CC) -nogpulib --target=amdgcn-amd-amdhsa -mcpu=$(GPU_ARCH) -O3 -c -o $@ $<

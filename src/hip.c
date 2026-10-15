@@ -405,6 +405,13 @@ static void mk_flush(void) {
   }
   mk.n = 0;
 }
+/* After a run: stop if a grid barrier of the megakernel timed out. */
+static void mk_check(u32 pos) {
+  if (!mk.launches) return;
+  u32 ab = 0;
+  HIP(H.Memcpy(&ab, mk.ws + 1, 4, hipMemcpyDeviceToHost));
+  if (ab) ie_die("megakernel: a grid barrier timed out (run at position %u)", pos);
+}
 /* 1: the launch went to the list */
 static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **args) {
   if (!mk.rec) return 0;
@@ -1208,11 +1215,7 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   if (logits) HIP(H.Memcpy(logits, b->arena + g->bufs[g->logits].off, m->vocab * 4, hipMemcpyDeviceToHost));
   u32 r = 0;
   HIP(H.Memcpy(&r, b->arena + g->bufs[g->argmax].off, 4, hipMemcpyDeviceToHost));
-  if (mk.on) {
-    u32 ab = 0;
-    HIP(H.Memcpy(&ab, mk.ws + 1, 4, hipMemcpyDeviceToHost));
-    if (ab) ie_die("megakernel: a grid barrier timed out (step at position %u)", pos);
-  }
+  mk_check(pos);
   return r;
 }
 
@@ -1225,6 +1228,11 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
   const int pc = b->prof == 2 && !sec && T > 1u;
   if (pc) HIP(H.EventRecord(b->e0, NULL));
   tr_run(sec ? "mtp" : last_only && T > 1u ? "prefill" : "verify", pos, T);
+  /* (the megakernel only runs decode steps: measured, MTP drafts through it
+   * 94.0 -> 92.2 tokens/s (the upload of the list and the check cost more
+   * than the gaps of a draft's few launches), verify runs 94.0 -> 80.6 (the
+   * multi-token GEMVs need more waves than 64 resident workgroups have:
+   * ts2 170 us against 126 us)) */
   run_ops(b, sec ? g->n_main : 0, sec ? g->n_ops : g->n_main, toks, T, pos, last_only ? T - 1 : 0);
   if (pc) {
     HIP(H.DeviceSynchronize()); /* the events are on the NULL stream: run with IE_STREAM=0 for exact times */
