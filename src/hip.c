@@ -305,7 +305,7 @@ static struct {
   unsigned char *cmd; /* host list: mk.ring[mk.slot] */
   unsigned char *ring[MK_RING]; /* pinned */
   hipEvent_t ev[MK_RING];       /* the copy of a ring buffer is done */
-  int slot, mtp, light;
+  int slot, mtp, light, free;
   int off[MK_NSETS]; /* a run of this kind had a kernel the build does not have */
   void *dring[MK_RING]; /* device lists (one per ring buffer: a launch reads its own) */
   u32 *ws;           /* device: barrier counter, abort flag */
@@ -427,7 +427,9 @@ static void mk_join(void) {
                mk_ovl(&gj.w, &gi.r) || mk_ovl(&gj.w, &gi.b) || mk_ovl(&gj.w, &gi.s))
         ok = 0;
     }
-    const u32 f = ok ? 1u : 0u;
+    u32 f;
+    memcpy(&f, c + 12, 4);
+    f = (f & ~1u) | (ok ? 1u : 0u);
     memcpy(c + 12, &f, 4);
     if (!ok) ph = i;
     else mk.joined++;
@@ -450,7 +452,7 @@ static void mk_flush(void) {
   for (u32 i = 1; i < mk.n; i++) {
     u32 f;
     memcpy(&f, mk.cmd + (size_t)i * MK_CMD + 12, 4);
-    nbar += f == 0u;
+    nbar += (f & 1u) == 0u;
   }
   mk.base += np * nbar;
   mk.launches++, mk.cmds += mk.n;
@@ -498,7 +500,13 @@ static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **ar
   mk.kof[mk.n] = k;
   unsigned char *c = mk.cmd + (size_t)mk.n * MK_CMD;
   memset(c, 0, MK_CMD);
-  const u32 h[4] = {(u32)id, gx, gy, 0};
+  /* bit 1: the waves need not meet between workgroup bodies (no LDS, no
+   * workgroup barrier): the GEMVs without the fused norm, the multi-token
+   * GEMVs, the element-wise kernels */
+  const int fk = k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8 || k == K_GEMV_Q4;
+  const int fr = (fk && !*(void **)args[8]) || k == K_GEMV_Q4K_TR || k == K_GEMV_Q6K_TR || k == K_GEMV_Q8_TR ||
+                 k == K_SWIGLU || k == K_EMBED_Q8 || k == K_EMBED_Q4 || k == K_EMBED_F32 || k == K_ROPE_KV || k == K_QUANT;
+  const u32 h[4] = {(u32)id, gx, gy, fr && mk.free ? 2u : 0u};
   memcpy(c, h, sizeof h);
   size_t off = 16;
   for (int i = 0; i < mk_nargs[id]; i++) {
@@ -607,6 +615,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
      * few launches, and a cooperative launch costs more than an ordinary one) */
     mk.mtp = getenv("IE_MK_MTP") ? atoi(getenv("IE_MK_MTP")) : 3;
     mk.light = !getenv("IE_MK_LIGHT") || atoi(getenv("IE_MK_LIGHT")) != 0;
+    mk.free = !getenv("IE_MK_FREE") || atoi(getenv("IE_MK_FREE")) != 0; /* 0: the waves meet before every body */
     mk.pfall = getenv("IE_MK_PFALL") != NULL;
     mk.join = !getenv("IE_MK_JOIN") || atoi(getenv("IE_MK_JOIN")) != 0;
     /* IE_MK_PF (MB): prefetch in the barriers; default 0 (no gain measured) */

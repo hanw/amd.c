@@ -149,48 +149,88 @@ SMP_FN smp_info smp_parse(SMP_G uint64_t *buf) {
   i.cnt = (SMP_G uint32_t *)(buf + 2), i.act = (SMP_G uint32_t *)(buf + ca), i.ev = (SMP_G smp_event *)(buf + ev);
   return i;
 }
-/* One lane per wave calls these (pred: for example smp_lane() == 0). */
-SMP_FN void smp_start_at(SMP_G uint64_t *buf, uint32_t no, uint32_t blk, uint32_t grp, int pred) {
-  if (!pred || no >= SMP_MAX_EVENT_TYPES) return;
-  smp_info i = smp_parse(buf);
-  if (!i.en || blk >= i.nb || grp >= i.ng) return;
-  SMP_G uint32_t *a = i.act + ((uint64_t)blk * i.ng + grp) * SMP_MAX_EVENT_TYPES + no;
+/* The *_ctx forms take the parsed header (smp_parse once per kernel: no
+ * header loads, so less time between the events); the others parse it.
+ * One lane per wave calls these (pred: for example smp_lane() == 0). */
+SMP_FN void smp_start_ctx(const smp_info *i, uint32_t no, uint32_t blk, uint32_t grp, int pred) {
+  if (!pred || no >= SMP_MAX_EVENT_TYPES || !i->en || blk >= i->nb || grp >= i->ng) return;
+  SMP_G uint32_t *a = i->act + ((uint64_t)blk * i->ng + grp) * SMP_MAX_EVENT_TYPES + no;
   if (*a) return; /* already open */
-  SMP_G uint32_t *c = i.cnt + (uint64_t)blk * i.ng + grp;
+  SMP_G uint32_t *c = i->cnt + (uint64_t)blk * i->ng + grp;
   const uint32_t id = *c;
   *c = id + 1u;
-  if (id >= i.ne) return; /* full: counted, not stored */
-  SMP_G smp_event *e = i.ev + ((uint64_t)blk * i.ng + grp) * i.ne + id;
+  if (id >= i->ne) return; /* full: counted, not stored */
+  SMP_G smp_event *e = i->ev + ((uint64_t)blk * i->ng + grp) * i->ne + id;
   e->event_id = id, e->event_no = no, e->block_id = blk, e->group_idx = grp;
   e->sm_id = smp_sm_id(), e->type = SMP_EVENT_RANGE, e->en_ns = 0;
   __asm__ volatile("" ::: "memory");
   e->st_ns = smp_time_ns();
   *a = id + 1u;
 }
-SMP_FN void smp_end_at(SMP_G uint64_t *buf, uint32_t no, uint32_t blk, uint32_t grp, int pred) {
+SMP_FN void smp_end_ctx(const smp_info *i, uint32_t no, uint32_t blk, uint32_t grp, int pred) {
   if (!pred || no >= SMP_MAX_EVENT_TYPES) return;
   const uint64_t t = smp_time_ns();
   __asm__ volatile("" ::: "memory");
-  smp_info i = smp_parse(buf);
-  if (!i.en || blk >= i.nb || grp >= i.ng) return;
-  SMP_G uint32_t *a = i.act + ((uint64_t)blk * i.ng + grp) * SMP_MAX_EVENT_TYPES + no;
+  if (!i->en || blk >= i->nb || grp >= i->ng) return;
+  SMP_G uint32_t *a = i->act + ((uint64_t)blk * i->ng + grp) * SMP_MAX_EVENT_TYPES + no;
   const uint32_t id1 = *a;
   if (!id1) return;
-  i.ev[((uint64_t)blk * i.ng + grp) * i.ne + id1 - 1u].en_ns = t;
+  i->ev[((uint64_t)blk * i->ng + grp) * i->ne + id1 - 1u].en_ns = t;
   *a = 0u;
 }
-SMP_FN void smp_instant_at(SMP_G uint64_t *buf, uint32_t no, uint32_t blk, uint32_t grp, int pred) {
+SMP_FN void smp_instant_ctx(const smp_info *i, uint32_t no, uint32_t blk, uint32_t grp, int pred) {
   if (!pred || no >= SMP_MAX_EVENT_TYPES) return;
   const uint64_t t = smp_time_ns();
-  smp_info i = smp_parse(buf);
-  if (!i.en || blk >= i.nb || grp >= i.ng) return;
-  SMP_G uint32_t *c = i.cnt + (uint64_t)blk * i.ng + grp;
+  if (!i->en || blk >= i->nb || grp >= i->ng) return;
+  SMP_G uint32_t *c = i->cnt + (uint64_t)blk * i->ng + grp;
   const uint32_t id = *c;
   *c = id + 1u;
-  if (id >= i.ne) return;
-  SMP_G smp_event *e = i.ev + ((uint64_t)blk * i.ng + grp) * i.ne + id;
+  if (id >= i->ne) return;
+  SMP_G smp_event *e = i->ev + ((uint64_t)blk * i->ng + grp) * i->ne + id;
   e->event_id = id, e->event_no = no, e->block_id = blk, e->group_idx = grp;
   e->sm_id = smp_sm_id(), e->type = SMP_EVENT_INSTANT, e->st_ns = t, e->en_ns = 0;
+}
+SMP_FN void smp_start_at(SMP_G uint64_t *buf, uint32_t no, uint32_t blk, uint32_t grp, int pred) {
+  if (!pred) return;
+  const smp_info i = smp_parse(buf);
+  smp_start_ctx(&i, no, blk, grp, 1);
+}
+SMP_FN void smp_end_at(SMP_G uint64_t *buf, uint32_t no, uint32_t blk, uint32_t grp, int pred) {
+  if (!pred) return;
+  const smp_info i = smp_parse(buf);
+  smp_end_ctx(&i, no, blk, grp, 1);
+}
+SMP_FN void smp_instant_at(SMP_G uint64_t *buf, uint32_t no, uint32_t blk, uint32_t grp, int pred) {
+  if (!pred) return;
+  const smp_info i = smp_parse(buf);
+  smp_instant_ctx(&i, no, blk, grp, 1);
+}
+/* A recorder for one (workgroup, wave) that owns its counter: the index
+ * stays in a register and a range is one set of stores at its end (no loads:
+ * the least time between events). smp_rec_close stores the count. */
+typedef struct {
+  SMP_G smp_event *ev;
+  SMP_G uint32_t *cnt;
+  uint32_t n, ne, blk, grp, sm;
+} smp_rec;
+SMP_FN smp_rec smp_rec_open(const smp_info *i, uint32_t blk, uint32_t grp) {
+  smp_rec r = {0, 0, 0, 0, blk, grp, 0};
+  if (!i->en || blk >= i->nb || grp >= i->ng) return r;
+  r.ev = i->ev + ((uint64_t)blk * i->ng + grp) * i->ne, r.cnt = i->cnt + (uint64_t)blk * i->ng + grp;
+  r.ne = i->ne, r.sm = smp_sm_id();
+  return r;
+}
+SMP_FN void smp_rec_range(smp_rec *r, uint32_t no, uint64_t st_ns, uint64_t en_ns) {
+  if (!r->ev) return;
+  if (r->n < r->ne) {
+    SMP_G smp_event *e = r->ev + r->n;
+    e->event_id = r->n, e->event_no = no, e->block_id = r->blk, e->group_idx = r->grp;
+    e->sm_id = r->sm, e->type = SMP_EVENT_RANGE, e->st_ns = st_ns, e->en_ns = en_ns;
+  }
+  r->n++;
+}
+SMP_FN void smp_rec_close(smp_rec *r) {
+  if (r->ev) *r->cnt = r->n;
 }
 /* The hardware workgroup and wave */
 SMP_FN void smp_start(SMP_G uint64_t *buf, uint32_t no, int pred) { smp_start_at(buf, no, smp_block(), smp_wave(), pred); }

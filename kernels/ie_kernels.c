@@ -50,10 +50,12 @@ static inline u32 tid(void) { return __builtin_amdgcn_workitem_id_x(); }
 /* The megakernel (kernels/ie_mk.c): a workgroup runs the workgroups of the
  * kernels one after another; the interpreter writes the current one here
  * (x, y, the number of workgroups in x) before it calls the kernel body. */
-static LDS u32 mk_vid[3];
-static inline u32 wgid(void) { return __builtin_amdgcn_readfirstlane(mk_vid[0]); }
-static inline u32 tokid(void) { return __builtin_amdgcn_readfirstlane(mk_vid[1]); }
-static inline u32 ngroups_x(void) { return __builtin_amdgcn_readfirstlane(mk_vid[2]); }
+/* one copy per wave (lane 0 writes it, the wave reads it): the waves need
+ * not meet to pass it, so the waves of a GEMV run their rows apart */
+static LDS u32 mk_vid[8][4];
+static inline u32 wgid(void) { return __builtin_amdgcn_readfirstlane(mk_vid[__builtin_amdgcn_workitem_id_x() >> 5][0]); }
+static inline u32 tokid(void) { return __builtin_amdgcn_readfirstlane(mk_vid[__builtin_amdgcn_workitem_id_x() >> 5][1]); }
+static inline u32 ngroups_x(void) { return __builtin_amdgcn_readfirstlane(mk_vid[__builtin_amdgcn_workitem_id_x() >> 5][2]); }
 #else
 static inline u32 wgid(void) { return __builtin_amdgcn_workgroup_id_x(); }
 /* Token index of a multi-token launch (grid dimension y; 0 for one token).
