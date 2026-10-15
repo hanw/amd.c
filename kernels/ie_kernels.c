@@ -16,7 +16,9 @@
 #define G __attribute__((address_space(1))) /* global memory */
 #define LDS __attribute__((address_space(3), loader_uninitialized))
 #define LDSP __attribute__((address_space(3))) /* LDS pointer targets */
+#ifndef KERNEL
 #define KERNEL __attribute__((amdgpu_kernel, visibility("protected"))) void
+#endif
 #define NT 256u
 
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
@@ -39,11 +41,26 @@ typedef _Float16 kv4 __attribute__((ext_vector_type(4)));
 #define KV4(p, i) __builtin_convertvector(((const G kv4 *)(p))[i], f32x4) /* 4 elements as f32 */
 
 static inline u32 tid(void) { return __builtin_amdgcn_workitem_id_x(); }
+#ifdef IE_MEGA
+/* The megakernel (kernels/ie_mk.c): a workgroup runs the workgroups of the
+ * kernels one after another; the interpreter writes the current one here
+ * (x, y, the number of workgroups in x) before it calls the kernel body. */
+static LDS u32 mk_vid[3];
+static inline u32 wgid(void) { return __builtin_amdgcn_readfirstlane(mk_vid[0]); }
+static inline u32 tokid(void) { return __builtin_amdgcn_readfirstlane(mk_vid[1]); }
+static inline u32 ngroups_x(void) { return __builtin_amdgcn_readfirstlane(mk_vid[2]); }
+#else
 static inline u32 wgid(void) { return __builtin_amdgcn_workgroup_id_x(); }
-static inline u32 lane(void) { return tid() & 31u; }
 /* Token index of a multi-token launch (grid dimension y; 0 for one token).
  * The kernels that take byte strides move their pointers by y strides. */
 static inline u32 tokid(void) { return __builtin_amdgcn_workgroup_id_y(); }
+/* the number of launched workgroups in x (the host may add idle ones): the
+ * dispatch packet's grid_size_x (byte 12) over the workgroup size */
+static inline u32 ngroups_x(void) {
+  return ((const __attribute__((address_space(4))) u32 *)__builtin_amdgcn_dispatch_ptr())[3] / 256u;
+}
+#endif
+static inline u32 lane(void) { return tid() & 31u; }
 #define TOK(p, s) ((p) ? (__typeof__(p))((G u8 *)(p) + (unsigned long)tokid() * (s)) : (p))
 #define TOKC(p, s) ((__typeof__(p))((const G u8 *)(p) + (unsigned long)tokid() * (s)))
 
@@ -247,9 +264,7 @@ static inline void gemv_norm_tail(const G float *y, u32 rows, const G float *nw,
                                   G u32 *count) {
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   barrier();
-  /* the number of launched workgroups (the host may add idle ones): the
-   * dispatch packet's grid_size_x (byte 12) over the workgroup size */
-  const u32 ngroups = ((const __attribute__((address_space(4))) u32 *)__builtin_amdgcn_dispatch_ptr())[3] / NT;
+  const u32 ngroups = ngroups_x(); /* the launched workgroups (the host may add idle ones) */
   if (tid() == 0u) gm_last = __atomic_fetch_add(count, 1u, __ATOMIC_ACQ_REL) == ngroups - 1u;
   barrier();
   if (!gm_last) return;
@@ -327,11 +342,11 @@ KERNEL ie_gemv_q4q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y
  *   dq = sum q a = ie_q4k_dot (law q4k_dot),
  *   acc += da * ((d sc) dq - (dmin mn) asum)   (no fused multiply-add).
  * ie_gemv_q4kq8_tr does the same arithmetic in the same order per token. */
-KERNEL ie_gemv_q4kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
-                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
-                     G u32 *count) {
+/* The rows of workgroup g (a task of the megakernel: g need not be wgid()). */
+static inline void gemv_q4kq8_rows(u32 g, const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows,
+                                   u32 nb, const G float *bias, const G float *res) {
 #pragma clang fp contract(off)
-  const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
+  const u32 r = ie_gemv_row(g, tid() >> 5), l = lane();
   if (r < rows) {
     const G u32 *aw = (const G u32 *)xq;
     const G float *da = (const G float *)(xq + 32u * nb);
@@ -370,7 +385,64 @@ KERNEL ie_gemv_q4kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *
     acc = wave_tree_f(acc);
     if (l == 0u) y[r] = epilogue(acc, r, bias, res);
   }
+}
+
+KERNEL ie_gemv_q4kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                     G u32 *count) {
+  gemv_q4kq8_rows(wgid(), qw, qs, xq, y, rows, nb, bias, res);
   if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
+}
+
+/* Probe for the megakernel: a persistent grid (any size) loops over the
+ * workgroups of ie_gemv_q4kq8 (no fused norm). The same rows, the same
+ * arithmetic: the output is bitwise equal. */
+KERNEL ie_gemv_q4kq8_p(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                       const G float *bias, const G float *res) {
+  const u32 ng = ie_gemv_ngroups(rows), np = __builtin_amdgcn_grid_size_x() / 256u;
+  for (u32 g = wgid(); g < ng; g += np) gemv_q4kq8_rows(g, qw, qs, xq, y, rows, nb, bias, res);
+}
+
+/* Grid barrier of the persistent kernels (the megakernel, kernels/ie_mk.c).
+ * ws[0]: arrival counter, never reset: each workgroup adds 1 and waits until
+ * it reaches target (wrapping u32 compare). ws[1]: abort flag. Every wait is
+ * bounded: after MK_SPIN polls the workgroup sets the abort flag; a set flag
+ * makes every workgroup leave. Returns 0 on abort. Every thread calls it. */
+#ifndef MK_SPIN
+#define MK_SPIN 400000u
+#endif
+static LDS u32 mk_ok;
+static inline int mk_grid_sync(G u32 *ws, u32 target) {
+  if (tid() == 0u) {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    __scoped_atomic_fetch_add(&ws[0], 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    u32 r = 0u;
+    for (u32 i = 0; i < MK_SPIN; i++) {
+      if ((int)(__scoped_atomic_load_n(&ws[0], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) - target) >= 0) { r = 1u; break; }
+      if ((i & 31u) == 31u && __scoped_atomic_load_n(&ws[1], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE)) break;
+    }
+    if (!r) __scoped_atomic_store_n(&ws[1], 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    mk_ok = r;
+  }
+  barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  return (int)mk_ok;
+}
+
+/* Probe: n GEMVs (MAT_Q4K) one after another in one launch, a grid barrier
+ * between two. d: n descriptors of 8 words {qw lo, qw hi, qs lo, qs hi,
+ * y lo, y hi, rows, nb}; all read the activations xq. */
+KERNEL ie_mk_gemv_chain(const G u32 *d, u32 n, const G u8 *xq, G u32 *ws) {
+  const u32 np = __builtin_amdgcn_grid_size_x() / 256u;
+  for (u32 i = 0; i < n; i++) {
+    const G u32 *e = d + 8u * i;
+    const G u32 *qw = (const G u32 *)(((unsigned long)e[1] << 32) | e[0]);
+    const G u16 *qs = (const G u16 *)(((unsigned long)e[3] << 32) | e[2]);
+    G float *y = (G float *)(((unsigned long)e[5] << 32) | e[4]);
+    const u32 rows = e[6], nb = e[7], ng = ie_gemv_ngroups(rows);
+    for (u32 g = wgid(); g < ng; g += np) gemv_q4kq8_rows(g, qw, qs, xq, y, rows, nb, 0, 0);
+    if (i + 1u < n && !mk_grid_sync(ws, np * (i + 1u))) return;
+  }
 }
 
 /* MAT_Q4K for T <= 16 tokens: 4 rows per wave (as ie_gemv_q8q8_tr); per
@@ -2268,7 +2340,7 @@ KERNEL ie_attn_split(const G float *q, const G kvt *kc, const G kvt *vc, G float
 KERNEL ie_attn_split_t(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 pos,
                        u32 hd, u32 n_head, u32 n_kv, u32 smax, u32 ch, G u32 *count, G u8 *oq, const G float *gate,
                        u32 gstride, u32 qst, u32 ost, u32 oqst, u32 gst, u32 pstride) {
-  const u32 j = __builtin_amdgcn_workgroup_id_y(), pj = pos + j;
+  const u32 j = tokid(), pj = pos + j;
   const u32 nsplit = (pj + ch) / ch; /* ie_att_nsplit (src/model.h): ch does not depend on the position */
   const u32 h = wgid() / smax, s = wgid() % smax;
   if (s >= nsplit) return;
@@ -3575,7 +3647,7 @@ static inline void tk_select(u32 n, u32 K, G float *ov, G u32 *oi) {
   }
 }
 KERNEL ie_topk_part(const G float *x, u32 n, u32 xs, u32 K, u32 cs, u32 ng, G float *cv, G u32 *ci) {
-  const u32 r = __builtin_amdgcn_workgroup_id_y(), g = wgid();
+  const u32 r = tokid(), g = wgid();
   const G float *row = x + (unsigned long)r * xs;
   const u32 i0 = g * cs;
   for (u32 p = tid(); p < cs; p += NT) {

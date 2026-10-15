@@ -129,6 +129,8 @@ int main(int argc, char **argv) {
     unsigned groups = (rows + 8 * rpw - 1) / (8 * rpw);
     const char *pe = getenv("PAD_GROUPS"); /* launch at least this many workgroups (extra ones do nothing) */
     if (pe && (unsigned)atoi(pe) > groups) groups = (unsigned)atoi(pe);
+    const char *pg = getenv("PGRID"); /* persistent kernel (KERNEL=ie_gemv_q4kq8_p): exactly this many workgroups */
+    if (pg) groups = (unsigned)atoi(pg);
     const int iters = 200;
     for (int it = -20; it < iters; it++) {
       if (it == 0) CK(H.EventRecord(e0, NULL));

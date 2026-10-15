@@ -41,6 +41,8 @@ static struct {
   hipError_t (*GraphInstantiate)(void **, void *, void *, void *, size_t);
   hipError_t (*GraphLaunch)(void *, hipStream_t);
   hipError_t (*StreamSynchronize)(hipStream_t);
+  hipError_t (*ModuleLaunchCooperativeKernel)(hipFunction_t, unsigned, unsigned, unsigned, unsigned, unsigned,
+                                              unsigned, unsigned, hipStream_t, void **);
 } H;
 static hipStream_t cur_stream; /* the stream of all launches (NULL: the default stream) */
 
@@ -85,6 +87,7 @@ static void hip_load(void) {
   SYM(GraphInstantiate, "hipGraphInstantiate");
   SYM(GraphLaunch, "hipGraphLaunch");
   SYM(StreamSynchronize, "hipStreamSynchronize");
+  SYM(ModuleLaunchCooperativeKernel, "hipModuleLaunchCooperativeKernel");
 #undef SYM
 }
 
@@ -278,6 +281,60 @@ void gpu_stream_init(void) {
   ie_mat_sink = gpu_sink;
 }
 
+/* The megakernel (IE_MK=1, kernels/ie_mk.c): while mk.rec is set, the
+ * launches of the kernels it has go to a command list (256 bytes each:
+ * {id, groups x, groups y, 0}, then the arguments packed as a launch packs
+ * them); mk_flush runs the list as one cooperative launch of mk.np
+ * workgroups. A launch of another kernel flushes the list first, so the
+ * order is always the order of the launches. */
+#include "ie_mk_gen.h"
+enum { MK_CMD = 256, MK_CAP = 4096 };
+static struct {
+  int on, rec;
+  hipModule_t mod;
+  hipFunction_t f;
+  int id[K_N];       /* kernel -> MK_ id, or -1 */
+  unsigned char *cmd; /* host list */
+  void *dcmd;        /* device list */
+  u32 *ws;           /* device: barrier counter, abort flag */
+  u32 n, np, base;
+  uint64_t launches, cmds;
+} mk;
+
+static void mk_flush(void) {
+  if (!mk.n) return;
+  HIP(H.Memcpy(mk.dcmd, mk.cmd, (size_t)mk.n * MK_CMD, hipMemcpyHostToDevice));
+  void *a[] = {&mk.dcmd, &mk.n, &mk.ws, &mk.base};
+  HIP(H.ModuleLaunchCooperativeKernel(mk.f, mk.np, 1, 1, 256, 1, 1, 0, cur_stream, a));
+  mk.base += mk.np * (mk.n - 1u);
+  mk.launches++, mk.cmds += mk.n;
+  mk.n = 0;
+}
+/* 1: the launch went to the list */
+static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **args) {
+  if (!mk.rec) return 0;
+  if (lds_bytes || mk.id[k] < 0) {
+    mk_flush();
+    return 0;
+  }
+  if (mk.n == MK_CAP) mk_flush();
+  const int id = mk.id[k];
+  unsigned char *c = mk.cmd + (size_t)mk.n * MK_CMD;
+  memset(c, 0, MK_CMD);
+  const u32 h[4] = {(u32)id, gx, gy, 0};
+  memcpy(c, h, sizeof h);
+  size_t off = 16;
+  for (int i = 0; i < mk_nargs[id]; i++) {
+    const size_t sz = mk_argsz[id][i];
+    off = (off + sz - 1) / sz * sz;
+    if (off + sz > MK_CMD) ie_die("megakernel: the arguments of %s do not fit", kname[k]);
+    memcpy(c + off, args[i], sz);
+    off += sz;
+  }
+  mk.n++;
+  return 1;
+}
+
 backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   hip_load();
   HIP(H.Init(0));
@@ -312,6 +369,39 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   {
     hipFunction_t f;
     b->kvb = H.ModuleGetFunction(&f, b->mod, "ie_kv_f16") == 0 ? 2u : 4u;
+  }
+  /* IE_MK=1: decode steps through the megakernel, ie_mk.hsaco next to the
+   * kernels (IE_MK_NP: its workgroups, default 128) */
+  const char *mke = getenv("IE_MK");
+  if (mke && mke[0] == '1') {
+    const char *sl = strrchr(hsaco, '/');
+    const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
+    char *path = malloc(dl + 16);
+    memcpy(path, hsaco, dl);
+    strcpy(path + dl, "ie_mk.hsaco");
+    FILE *mf = fopen(path, "rb");
+    if (!mf) ie_die("IE_MK: cannot open %s (make %s)", path, path);
+    fseek(mf, 0, SEEK_END);
+    const long ms = ftell(mf);
+    fseek(mf, 0, SEEK_SET);
+    char *mi = malloc((size_t)ms);
+    if (fread(mi, 1, (size_t)ms, mf) != (size_t)ms) ie_die("cannot read %s", path);
+    fclose(mf);
+    HIP(H.ModuleLoadData(&mk.mod, mi));
+    free(mi), free(path);
+    HIP(H.ModuleGetFunction(&mk.f, mk.mod, "ie_mk"));
+    for (int i = 0; i < K_N; i++) {
+      mk.id[i] = -1;
+      for (int j = 0; j < MK_N; j++)
+        if (!strcmp(kname[i], mk_names[j])) mk.id[i] = j;
+    }
+    mk.np = getenv("IE_MK_NP") ? (u32)atoi(getenv("IE_MK_NP")) : 128u;
+    mk.cmd = malloc((size_t)MK_CAP * MK_CMD);
+    HIP(H.Malloc(&mk.dcmd, (size_t)MK_CAP * MK_CMD));
+    HIP(H.Malloc((void **)&mk.ws, 64));
+    HIP(H.Memset(mk.ws, 0, 64));
+    mk.on = 1;
+    fprintf(stderr, "gpu: megakernel on (%u workgroups, %d kernels)\n", mk.np, MK_N);
   }
 
   HIP(H.Malloc((void **)&b->arena, g->arena));
@@ -414,11 +504,13 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
 
 static void launch_lds(gpu_backend *b, int k, unsigned groups, unsigned lds_bytes, void **args) {
   tr_launch(k, groups, 1);
+  if (mk_put(k, groups, 1, lds_bytes, args)) return;
   HIP(H.ModuleLaunchKernel(b->k[k], groups, 1, 1, 256, 1, 1, lds_bytes, cur_stream, args, NULL));
 }
 /* groups x T workgroups: grid dimension y is the token (kernels with byte strides) */
 static void launch_t(gpu_backend *b, int k, unsigned groups, unsigned T, void **args) {
   tr_launch(k, groups, T);
+  if (mk_put(k, groups, T, 0, args)) return;
   HIP(H.ModuleLaunchKernel(b->k[k], groups, T, 1, 256, 1, 1, 0, cur_stream, args, NULL));
 }
 static void launch(gpu_backend *b, int k, unsigned groups, void **args) { launch_lds(b, k, groups, 0, args); }
@@ -990,7 +1082,10 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   struct timespec h0, h1;
   clock_gettime(CLOCK_MONOTONIC, &h0);
   tr_run("decode", pos, 1);
+  mk.rec = mk.on;
   run_ops(b, 0, g->n_main, &tok, 1, pos, 0); /* state: slot -> slot */
+  mk.rec = 0;
+  mk_flush();
   clock_gettime(CLOCK_MONOTONIC, &h1);
   if (pos > 0) b->host_ms += (h1.tv_sec - h0.tv_sec) * 1e3 + (h1.tv_nsec - h0.tv_nsec) / 1e6, b->host_n++;
   HIP(H.EventRecord(b->e1, NULL));
@@ -1009,6 +1104,11 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   if (logits) HIP(H.Memcpy(logits, b->arena + g->bufs[g->logits].off, m->vocab * 4, hipMemcpyDeviceToHost));
   u32 r = 0;
   HIP(H.Memcpy(&r, b->arena + g->bufs[g->argmax].off, 4, hipMemcpyDeviceToHost));
+  if (mk.on) {
+    u32 ab = 0;
+    HIP(H.Memcpy(&ab, mk.ws + 1, 4, hipMemcpyDeviceToHost));
+    if (ab) ie_die("megakernel: a grid barrier timed out (step at position %u)", pos);
+  }
   return r;
 }
 

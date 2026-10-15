@@ -18,9 +18,10 @@ GPU_CFLAGS = -x c -std=c11 -Wall -Wextra --target=amdgcn-amd-amdhsa -mcpu=$(GPU_
 B = build
 ENGINE_SRC = src/common.c src/gguf.c src/model.c src/plan.c src/cpu.c src/hip.c src/gen.c
 SRC = $(ENGINE_SRC) src/main.c
-HDR = src/common.h src/gguf.h src/model.h src/backend.h src/gen.h core/ie_core.h
+HDR = src/common.h src/gguf.h src/model.h src/backend.h src/gen.h core/ie_core.h $(B)/ie_mk_gen.h
+CFLAGS += -I$(B)
 
-all: $(B)/ie-run $(B)/ie-serve $(B)/ie_kernels.hsaco
+all: $(B)/ie-run $(B)/ie-serve $(B)/ie_kernels.hsaco $(B)/ie_mk.hsaco
 
 $(B):
 	mkdir -p $(B)
@@ -63,6 +64,22 @@ $(B)/ie_kernels.o: $(B)/ie_kernels.ll
 	$(GPU_CC) -nogpulib --target=amdgcn-amd-amdhsa -mcpu=$(GPU_ARCH) -O3 -c -o $@ $<
 
 $(B)/ie_kernels.hsaco: $(B)/ie_kernels.o
+	$(GPU_LD) -shared -o $@ $<
+
+# The megakernel (kernels/ie_mk.c, IE_MK=1): the kernels of a decode step
+# as functions of one persistent kernel. tools/mk_gen.py writes the table of
+# these kernels (their argument layout) for kernels/ie_mk.c and src/hip.c.
+MK_KERNELS = ie_embed_q8 ie_rmsnorm ie_gemv_q4kq8 ie_gemv_q6kq8 ie_gemv_q8q8 ie_gemv_f32 ie_swiglu ie_gdn1 \
+             ie_qkn_rope_kv ie_attn_split ie_argmax
+$(B)/ie_mk_gen.h: tools/mk_gen.py kernels/ie_kernels.c | $(B)
+	$(PYTHON) tools/mk_gen.py kernels/ie_kernels.c $@ $(MK_KERNELS)
+$(B)/ie_mk.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h | $(B)
+	$(GPU_CC) $(GPU_CFLAGS) -I$(B) -S -emit-llvm -o $@.tmp $<
+	sed -E '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="256,256" "target-cpu"/' $@.tmp > $@
+	rm -f $@.tmp
+$(B)/ie_mk.o: $(B)/ie_mk.ll
+	$(GPU_CC) -nogpulib --target=amdgcn-amd-amdhsa -mcpu=$(GPU_ARCH) -O3 -c -o $@ $<
+$(B)/ie_mk.hsaco: $(B)/ie_mk.o
 	$(GPU_LD) -shared -o $@ $<
 
 $(B)/laws_test: tests/laws_test.cpp laws/ie_laws.cpp core/ie_core.h core/lean_mem.h | $(B)
