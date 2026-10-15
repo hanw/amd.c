@@ -299,15 +299,25 @@ static struct {
   u32 *ws;           /* device: barrier counter, abort flag */
   u32 n, np, base;
   uint64_t launches, cmds;
+  /* IE_MK_PROF=1: per command the clock at its end; per kernel the sum */
+  unsigned long *dprof, *hprof;
+  int kof[MK_CAP];
+  double pus[K_N];
+  uint32_t pcnt[K_N], psteps;
 } mk;
 
 static void mk_flush(void) {
   if (!mk.n) return;
   HIP(H.Memcpy(mk.dcmd, mk.cmd, (size_t)mk.n * MK_CMD, hipMemcpyHostToDevice));
-  void *a[] = {&mk.dcmd, &mk.n, &mk.ws, &mk.base};
+  void *a[] = {&mk.dcmd, &mk.n, &mk.ws, &mk.base, &mk.dprof};
   HIP(H.ModuleLaunchCooperativeKernel(mk.f, mk.np, 1, 1, 256, 1, 1, 0, cur_stream, a));
   mk.base += mk.np * (mk.n - 1u);
   mk.launches++, mk.cmds += mk.n;
+  if (mk.dprof) { /* the first command: from its predecessor's end is not known; skip it */
+    HIP(H.Memcpy(mk.hprof, mk.dprof, (size_t)mk.n * 8u, hipMemcpyDeviceToHost));
+    for (u32 i = 1; i + 1u < mk.n; i++) mk.pus[mk.kof[i]] += (mk.hprof[i] - mk.hprof[i - 1]) * 0.01, mk.pcnt[mk.kof[i]]++;
+    mk.psteps++;
+  }
   mk.n = 0;
 }
 /* 1: the launch went to the list */
@@ -319,6 +329,7 @@ static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **ar
   }
   if (mk.n == MK_CAP) mk_flush();
   const int id = mk.id[k];
+  mk.kof[mk.n] = k;
   unsigned char *c = mk.cmd + (size_t)mk.n * MK_CMD;
   memset(c, 0, MK_CMD);
   const u32 h[4] = {(u32)id, gx, gy, 0};
@@ -400,6 +411,10 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     HIP(H.Malloc(&mk.dcmd, (size_t)MK_CAP * MK_CMD));
     HIP(H.Malloc((void **)&mk.ws, 64));
     HIP(H.Memset(mk.ws, 0, 64));
+    if (getenv("IE_MK_PROF")) {
+      HIP(H.Malloc((void **)&mk.dprof, (size_t)MK_CAP * 8u));
+      mk.hprof = malloc((size_t)MK_CAP * 8u);
+    }
     mk.on = 1;
     fprintf(stderr, "gpu: megakernel on (%u workgroups, %d kernels)\n", mk.np, MK_N);
   }
@@ -1368,6 +1383,16 @@ static void gpu_close(backend *bk) {
     H.Free(b->chk), free(b->chk_a), free(b->chk_b);
   }
   if (b->prof && b->psteps) prof_report(b), prof_layers(b);
+  if (mk.on && mk.psteps) {
+    double tot = 0;
+    for (int k = 0; k < K_N; k++) tot += mk.pus[k];
+    fprintf(stderr, "megakernel profile: %u launches, %.3f ms per launch (commands 2 .. n-1, barrier included)\n",
+            mk.psteps, tot / 1e3 / mk.psteps);
+    for (int k = 0; k < K_N; k++)
+      if (mk.pcnt[k])
+        fprintf(stderr, "  %-18s %5.1f per launch %9.2f us each %8.3f ms per launch\n", kname[k],
+                (double)mk.pcnt[k] / mk.psteps, mk.pus[k] / mk.pcnt[k], mk.pus[k] / 1e3 / mk.psteps);
+  }
   if (tr_f) fprintf(stderr, "trace: wrote %u launches in %u runs\n", tr_n, tr_call), fclose(tr_f), tr_f = NULL;
   HIP(H.DeviceSynchronize());
   for (uint32_t i = 0; i < b->nh; i++) H.Free(b->hv[i]);

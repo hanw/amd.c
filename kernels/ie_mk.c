@@ -14,7 +14,8 @@
  * The launch must be cooperative (all np workgroups resident: the grid
  * barrier needs them). ws: ws[0] the barrier counter (never reset; base:
  * its value at launch), ws[1] the abort flag (set when a wait times out:
- * then every workgroup leaves, and the host stops). */
+ * then every workgroup leaves, and the host stops). prof (or NULL): per
+ * command, the clock after its grid barrier (workgroup 0). */
 #define IE_MEGA 1
 #define KERNEL static inline __attribute__((always_inline)) void
 #include "ie_kernels.c"
@@ -22,7 +23,7 @@
 
 #define MK_CMD 256u
 
-__attribute__((amdgpu_kernel, visibility("protected"))) void ie_mk(const G u8 *cmds, u32 n, G u32 *ws, u32 base) {
+__attribute__((amdgpu_kernel, visibility("protected"))) void ie_mk(const G u8 *cmds, u32 n, G u32 *ws, u32 base, G unsigned long *prof) {
   const u32 np = __builtin_amdgcn_grid_size_x() / NT, p = __builtin_amdgcn_workgroup_id_x();
   for (u32 i = 0; i < n; i++) {
     const G u32 *h = (const G u32 *)(cmds + (unsigned long)i * MK_CMD);
@@ -35,5 +36,7 @@ __attribute__((amdgpu_kernel, visibility("protected"))) void ie_mk(const G u8 *c
       MK_DISPATCH(kid, a);
     }
     if (i + 1u < n && !mk_grid_sync(ws, base + np * (i + 1u))) return;
+    /* IE_MK_PROF: the time (100 MHz clock) when command i is done everywhere */
+    if (prof && p == 0u && tid() == 0u) prof[i] = __builtin_amdgcn_s_sendmsg_rtnl(0x83);
   }
 }
