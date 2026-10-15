@@ -288,7 +288,7 @@ void gpu_stream_init(void) {
  * workgroups. A launch of another kernel flushes the list first, so the
  * order is always the order of the launches. */
 #include "ie_mk_gen.h"
-enum { MK_CMD = 256, MK_CAP = 4096 };
+enum { MK_CMD = 256, MK_CAP = 4096, MK_ARGEND = 232 };
 static struct {
   int on, rec;
   hipModule_t mod;
@@ -297,7 +297,8 @@ static struct {
   unsigned char *cmd; /* host list */
   void *dcmd;        /* device list */
   u32 *ws;           /* device: barrier counter, abort flag */
-  u32 n, np, base;
+  u32 n, np, base, pf, pfall, join;
+  uint64_t joined;
   uint64_t launches, cmds;
   /* IE_MK_PROF=1: per command the clock at its end; per kernel the sum */
   unsigned long *dprof, *hprof;
@@ -306,12 +307,96 @@ static struct {
   uint32_t pcnt[K_N], psteps;
 } mk;
 
+/* The prefetch of the barrier after command i: the first bytes (up to
+ * mk.pf, IE_MK_PF MB, default 16) of the weights of the next GEMV command j;
+ * all the barriers before j share the claim cursor of j. */
+static void mk_prefetch(void) {
+  for (u32 i = 0; i + 1u < mk.n; i++) {
+    const int ki = mk.kof[i];
+    if (mk.pfall == 0 && (ki == K_GEMV_Q4K || ki == K_GEMV_Q6K || ki == K_GEMV_Q8)) continue; /* the tail of a GEMV: memory is busy */
+    u32 j = i + 1u;
+    for (; j < mk.n; j++) {
+      const int k = mk.kof[j];
+      if (k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8) break;
+    }
+    if (j == mk.n || !mk.pf) continue;
+    unsigned char *c = mk.cmd + (size_t)j * MK_CMD;
+    uint64_t qw;
+    u32 rows, nb;
+    memcpy(&qw, c + 16, 8), memcpy(&rows, c + 48, 4), memcpy(&nb, c + 52, 4);
+    uint64_t bytes = (uint64_t)rows * nb * (mk.kof[j] == K_GEMV_Q8 ? 32u : 16u);
+    if (bytes > mk.pf) bytes = mk.pf;
+    unsigned char *d = mk.cmd + (size_t)i * MK_CMD;
+    const u32 w[4] = {(u32)qw, (u32)(qw >> 32), (u32)bytes, j};
+    memcpy(d + 232, w, sizeof w);
+  }
+}
+
+/* The data ranges of a GEMV command (MAT_Q4K / Q6K / Q8 or F32): the
+ * activations it reads, the result it writes, bias and residual. 0: not a
+ * GEMV of these, or with the fused RMSNorm (its counter). */
+typedef struct { uint64_t r0, r1, w0, w1, b0, b1, s0, s1; } mk_rng;
+static int mk_gemv_rng(u32 i, mk_rng *g) {
+  const int k = mk.kof[i];
+  const unsigned char *c = mk.cmd + (size_t)i * MK_CMD + 16;
+  uint64_t p[8];
+  u32 rows, n2;
+  memset(g, 0, sizeof *g);
+  if (k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8) {
+    /* qw qs xq y rows nb bias res nw ... */
+    memcpy(p, c, 32), memcpy(&rows, c + 32, 4), memcpy(&n2, c + 36, 4), memcpy(p + 4, c + 40, 24);
+    if (p[6]) return 0;
+    g->r0 = p[2], g->r1 = p[2] + (uint64_t)n2 * 40u, g->w0 = p[3], g->w1 = p[3] + (uint64_t)rows * 4u;
+  } else if (k == K_GEMV_F32) {
+    /* w x y rows cols bias res nw ... */
+    memcpy(p, c, 24), memcpy(&rows, c + 24, 4), memcpy(&n2, c + 28, 4), memcpy(p + 4, c + 32, 24);
+    if (p[6]) return 0;
+    g->r0 = p[1], g->r1 = p[1] + (uint64_t)n2 * 4u, g->w0 = p[2], g->w1 = p[2] + (uint64_t)rows * 4u;
+  } else
+    return 0;
+  if (p[4]) g->b0 = p[4], g->b1 = p[4] + (uint64_t)rows * 4u;
+  if (p[5]) g->s0 = p[5], g->s1 = p[5] + (uint64_t)rows * 4u;
+  return 1;
+}
+static int mk_ovl(uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) { return a0 < b1 && b0 < a1; }
+/* Command i joins the phase of the commands ph .. i - 1 (no barrier before
+ * it: IE_MK_JOIN, default on) when all are GEMVs and no range i writes is
+ * read or written by the phase and no range i reads is written by it. */
+static void mk_join(void) {
+  u32 ph = 0;
+  for (u32 i = 1; i < mk.n; i++) {
+    unsigned char *c = mk.cmd + (size_t)i * MK_CMD;
+    mk_rng gi, gj;
+    int ok = mk.join && mk_gemv_rng(i, &gi);
+    for (u32 j = ph; ok && j < i; j++) {
+      if (!mk_gemv_rng(j, &gj)) ok = 0;
+      else if (mk_ovl(gi.w0, gi.w1, gj.r0, gj.r1) || mk_ovl(gi.w0, gi.w1, gj.w0, gj.w1) ||
+               mk_ovl(gi.w0, gi.w1, gj.b0, gj.b1) || mk_ovl(gi.w0, gi.w1, gj.s0, gj.s1) ||
+               mk_ovl(gj.w0, gj.w1, gi.r0, gi.r1) || mk_ovl(gj.w0, gj.w1, gi.b0, gi.b1) ||
+               mk_ovl(gj.w0, gj.w1, gi.s0, gi.s1))
+        ok = 0;
+    }
+    const u32 f = ok ? 1u : 0u;
+    memcpy(c + 12, &f, 4);
+    if (!ok) ph = i;
+    else mk.joined++;
+  }
+}
+
 static void mk_flush(void) {
   if (!mk.n) return;
+  mk_join();
+  mk_prefetch();
   HIP(H.Memcpy(mk.dcmd, mk.cmd, (size_t)mk.n * MK_CMD, hipMemcpyHostToDevice));
   void *a[] = {&mk.dcmd, &mk.n, &mk.ws, &mk.base, &mk.dprof};
   HIP(H.ModuleLaunchCooperativeKernel(mk.f, mk.np, 1, 1, 256, 1, 1, 0, cur_stream, a));
-  mk.base += mk.np * (mk.n - 1u);
+  u32 nbar = 0;
+  for (u32 i = 1; i < mk.n; i++) {
+    u32 f;
+    memcpy(&f, mk.cmd + (size_t)i * MK_CMD + 12, 4);
+    nbar += f == 0u;
+  }
+  mk.base += mk.np * nbar;
   mk.launches++, mk.cmds += mk.n;
   if (mk.dprof) { /* the first command: from its predecessor's end is not known; skip it */
     HIP(H.Memcpy(mk.hprof, mk.dprof, (size_t)mk.n * 8u, hipMemcpyDeviceToHost));
@@ -338,7 +423,7 @@ static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **ar
   for (int i = 0; i < mk_nargs[id]; i++) {
     const size_t sz = mk_argsz[id][i];
     off = (off + sz - 1) / sz * sz;
-    if (off + sz > MK_CMD) ie_die("megakernel: the arguments of %s do not fit", kname[k]);
+    if (off + sz > MK_ARGEND) ie_die("megakernel: the arguments of %s do not fit", kname[k]);
     memcpy(c + off, args[i], sz);
     off += sz;
   }
@@ -382,7 +467,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     b->kvb = H.ModuleGetFunction(&f, b->mod, "ie_kv_f16") == 0 ? 2u : 4u;
   }
   /* IE_MK=1: decode steps through the megakernel, ie_mk.hsaco next to the
-   * kernels (IE_MK_NP: its workgroups, default 128) */
+   * kernels (IE_MK_NP: its workgroups, default 64: one per compute unit, the most
+   * that fit with its 225 VGPRs) */
   const char *mke = getenv("IE_MK");
   if (mke && mke[0] == '1') {
     const char *sl = strrchr(hsaco, '/');
@@ -406,7 +492,10 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
       for (int j = 0; j < MK_N; j++)
         if (!strcmp(kname[i], mk_names[j])) mk.id[i] = j;
     }
-    mk.np = getenv("IE_MK_NP") ? (u32)atoi(getenv("IE_MK_NP")) : 128u;
+    mk.np = getenv("IE_MK_NP") ? (u32)atoi(getenv("IE_MK_NP")) : 64u;
+    mk.pfall = getenv("IE_MK_PFALL") != NULL;
+    mk.join = !getenv("IE_MK_JOIN") || atoi(getenv("IE_MK_JOIN")) != 0;
+    mk.pf = (getenv("IE_MK_PF") ? (u32)atoi(getenv("IE_MK_PF")) : 16u) << 20;
     mk.cmd = malloc((size_t)MK_CAP * MK_CMD);
     HIP(H.Malloc(&mk.dcmd, (size_t)MK_CAP * MK_CMD));
     HIP(H.Malloc((void **)&mk.ws, 64));
@@ -1386,6 +1475,7 @@ static void gpu_close(backend *bk) {
   if (mk.on && mk.psteps) {
     double tot = 0;
     for (int k = 0; k < K_N; k++) tot += mk.pus[k];
+    fprintf(stderr, "megakernel: %.1f commands joined per launch\n", (double)mk.joined / mk.launches);
     fprintf(stderr, "megakernel profile: %u launches, %.3f ms per launch (commands 2 .. n-1, barrier included)\n",
             mk.psteps, tot / 1e3 / mk.psteps);
     for (int k = 0; k < K_N; k++)

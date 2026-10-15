@@ -412,14 +412,31 @@ KERNEL ie_gemv_q4kq8_p(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float
 #define MK_SPIN 400000u
 #endif
 static LDS u32 mk_ok;
-static inline int mk_grid_sync(G u32 *ws, u32 target) {
+#ifndef MK_PFCHUNK
+#define MK_PFCHUNK 16384u
+#endif
+/* While it waits, the workgroup prefetches (s_prefetch_data: no registers,
+ * no wait) the next chunks of [pa, pa + cap) into the caches: chunks of
+ * MK_PFCHUNK bytes claimed with an atomic add on *cur (cap 0: no prefetch). */
+static inline int mk_grid_sync_pf(G u32 *ws, u32 target, G u32 *cur, const G u8 *pa, u32 cap) {
   if (tid() == 0u) {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     __scoped_atomic_fetch_add(&ws[0], 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
-    u32 r = 0u;
+    u32 r = 0u, pf = cap != 0u;
     for (u32 i = 0; i < MK_SPIN; i++) {
       if ((int)(__scoped_atomic_load_n(&ws[0], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) - target) >= 0) { r = 1u; break; }
       if ((i & 31u) == 31u && __scoped_atomic_load_n(&ws[1], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE)) break;
+      if (pf) {
+        const u32 c = __builtin_amdgcn_readfirstlane(
+            __scoped_atomic_fetch_add(cur, MK_PFCHUNK, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
+        if (c >= cap) pf = 0u;
+        else
+#if __has_builtin(__builtin_amdgcn_s_prefetch_data) /* clang 19+ */
+          for (u32 o = c; o < c + MK_PFCHUNK && o < cap; o += 256u) __builtin_amdgcn_s_prefetch_data(pa + o, 31);
+#else
+          (void)pa;
+#endif
+      }
     }
     if (!r) __scoped_atomic_store_n(&ws[1], 1u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     mk_ok = r;
@@ -428,6 +445,7 @@ static inline int mk_grid_sync(G u32 *ws, u32 target) {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
   return (int)mk_ok;
 }
+static inline int mk_grid_sync(G u32 *ws, u32 target) { return mk_grid_sync_pf(ws, target, ws, 0, 0u); }
 
 /* Probe: n GEMVs (MAT_Q4K) one after another in one launch, a grid barrier
  * between two. d: n descriptors of 8 words {qw lo, qw hi, qs lo, qs hi,
