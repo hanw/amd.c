@@ -24,6 +24,9 @@
 #ifndef KERNEL_HEAVY
 #define KERNEL_HEAVY KERNEL
 #endif
+#ifndef KERNEL_CALL
+#define KERNEL_CALL KERNEL /* the megakernel: a call, not inlined (its registers apart) */
+#endif
 #define NT 256u
 
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
@@ -2399,9 +2402,28 @@ KERNEL ie_attn_split_t(const G float *q, const G kvt *kc, const G kvt *vc, G flo
  * holds the merge weights (16 KB in all). hd <= 256, hd % 4 == 0,
  * ch % 8 == 0, kc and vc 8-byte aligned. */
 #define AKV_P 8u
+#if defined(IE_MEGA) && !defined(IE_KV_F32)
+/* The megakernel (16 KB of LDS for all its kernels): K and V stay fp16 in
+ * LDS (8 KB, the same bytes as at_o: one kernel at a time per workgroup) and
+ * become f32 when read (exact, so the arithmetic is the same); the weights
+ * of the merge go over the m_t in part, as attn_split_body. */
+#define akv_kv (*(LDSP kvt(*)[2][AKV_P][256]) & at_o[0][0])
+typedef kv4 akv_r;
+#define AKV_RAW(p, i) (((const G kv4 *)(p))[i])
+#define AKV_ZERO ((kv4){0, 0, 0, 0})
+#define AKV_AT(k, r, e) ((float)akv_kv[k][r][e])
+#define AKV_WG 1
+_Static_assert(sizeof(kvt[2][AKV_P][256]) <= sizeof(at_o), "akv_kv over at_o");
+#else
 static LDS float akv_kv[2][AKV_P][256]; /* K, V; in the merge: the weights of the splits (<= 4096) */
+typedef f32x4 akv_r;
+#define AKV_RAW(p, i) KV4(p, i)
+#define AKV_ZERO ((f32x4){0.0f, 0.0f, 0.0f, 0.0f})
+#define AKV_AT(k, r, e) (akv_kv[k][r][e])
+#define AKV_WG 0
+#endif
 static LDS u32 akv_last[8];
-KERNEL ie_attn_kv(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 pos, u32 hd,
+KERNEL_CALL ie_attn_kv(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 pos, u32 hd,
                   u32 n_head, u32 n_kv, u32 smax, u32 ch, G u32 *count, G u8 *oq, const G float *gate, u32 gstride, u32 qst,
                   u32 ost, u32 oqst, u32 gst, u32 pstride, u32 T, u32 nb, u32 spw) {
   const u32 grp = n_head / n_kv, kvd = n_kv * hd, ngs = (smax + spw - 1u) / spw;
@@ -2425,15 +2447,15 @@ KERNEL ie_attn_kv(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
   }
   float sm[8], ss[8], sa[8][8]; /* the 8 streams (the waves of ie_attn_split) of the current split */
   const u32 h4 = hd >> 2, n4 = AKV_P * h4; /* float4 per row, per pass (<= 512) */
-  f32x4 kr[2], vr[2];
+  akv_r kr[2], vr[2];
 #define AKV_LOAD(c)                                                                          \
   for (u32 u = 0; u < 2u; u++) {                                                             \
     const u32 i4 = tid() + NT * u, r = i4 / h4, e4 = i4 - r * h4;                           \
-    kr[u] = vr[u] = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};                                          \
+    kr[u] = vr[u] = AKV_ZERO;                                                                \
     if (i4 < n4 && (c) + r < PE) {                                                           \
       const unsigned long o = ((unsigned long)((c) + r) * kvd + kh * hd) / 4u + e4;          \
-      kr[u] = KV4(kc, o);                                                                    \
-      vr[u] = KV4(vc, o);                                                                    \
+      kr[u] = AKV_RAW(kc, o);                                                                \
+      vr[u] = AKV_RAW(vc, o);                                                                \
     }                                                                                        \
   }
   AKV_LOAD(P0)
@@ -2447,8 +2469,8 @@ KERNEL ie_attn_kv(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
     for (u32 u = 0; u < 2u; u++) {
       const u32 i4 = tid() + NT * u, r = i4 / h4, e4 = i4 - r * h4;
       if (i4 < n4) {
-        *(LDSP f32x4 *)&akv_kv[0][r][4u * e4] = kr[u];
-        *(LDSP f32x4 *)&akv_kv[1][r][4u * e4] = vr[u];
+        *(LDSP akv_r *)&akv_kv[0][r][4u * e4] = kr[u];
+        *(LDSP akv_r *)&akv_kv[1][r][4u * e4] = vr[u];
       }
     }
     barrier();
@@ -2464,7 +2486,7 @@ KERNEL ie_attn_kv(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
         const int ok = p < p1;
         float d = 0.0f;
         for (u32 jj = 0; jj < 8u; jj++)
-          if (l + 32u * jj < hd) d += qv[jj] * akv_kv[0][r][l + 32u * jj];
+          if (l + 32u * jj < hd) d += qv[jj] * AKV_AT(0, r, l + 32u * jj);
         d = wave_sum_all(d);
         d *= scale;
         const float mn = __builtin_fmaxf(sm[x], d), cc = __builtin_expf(sm[x] - mn), e = __builtin_expf(d - mn);
@@ -2472,7 +2494,7 @@ KERNEL ie_attn_kv(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
         ss[x] = ok ? s2 : ss[x];
         for (u32 jj = 0; jj < 8u; jj++)
           if (l + 32u * jj < hd) {
-            const float a2 = sa[x][jj] * cc + e * akv_kv[1][r][l + 32u * jj];
+            const float a2 = sa[x][jj] * cc + e * AKV_AT(1, r, l + 32u * jj);
             sa[x][jj] = ok ? a2 : sa[x][jj];
           }
         sm[x] = ok ? mn : sm[x];
@@ -2507,19 +2529,24 @@ KERNEL ie_attn_kv(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
     akv_last[w] = ndone ? __atomic_fetch_add(&count[j * n_head + h], ndone, __ATOMIC_ACQ_REL) + ndone == nsplit : 0u;
   barrier();
   /* the merges this workgroup completed (all 256 threads, as attn_split_body) */
+#if AKV_WG
+#define WV(t) ph[(t) * (hd + 2u)] /* the weights over the m_t (the megakernel) */
+#else
   LDSP float *wv = &akv_kv[0][0][0]; /* the weights of the splits (the K/V buffer is free now) */
+#define WV(t) wv[t]
+#endif
   for (u32 x = 0; x < 8u; x++) {
     if (!akv_last[x]) continue;
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     const u32 px = 8u * b + x, jx = px / grp, hx = kh * grp + px % grp, ns = (pos + jx + ch) / ch;
-    const G float *ph = part + (unsigned long)jx * pstride + (unsigned long)hx * ns * (hd + 2u);
+    G float *ph = part + (unsigned long)jx * pstride + (unsigned long)hx * ns * (hd + 2u);
     float mv = -__builtin_inff();
     for (u32 t = tid(); t < ns; t += NT) mv = __builtin_fmaxf(mv, ph[t * (hd + 2u)]);
     const float M2 = wg_max(mv);
     float lv = 0.0f;
     for (u32 t = tid(); t < ns; t += NT) {
       const float wt = __builtin_expf(ph[t * (hd + 2u)] - M2);
-      wv[t] = wt;
+      WV(t) = wt;
       lv += ph[t * (hd + 2u) + 1u] * wt;
     }
     const float L2 = wg_sum(lv); /* its barrier also makes wv visible */
@@ -2532,9 +2559,9 @@ KERNEL ie_attn_kv(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
       for (; t + 8u <= ns; t += 8u) { /* 8 loads in flight; the sum in the order t = 0, 1, ... */
         float pv[8];
         for (u32 u = 0; u < 8u; u++) pv[u] = ph[(t + u) * (hd + 2u) + 2u + tid()];
-        for (u32 u = 0; u < 8u; u++) o += pv[u] * wv[t + u];
+        for (u32 u = 0; u < 8u; u++) o += pv[u] * WV(t + u);
       }
-      for (; t < ns; t++) o += ph[t * (hd + 2u) + 2u + tid()] * wv[t];
+      for (; t < ns; t++) o += ph[t * (hd + 2u) + 2u + tid()] * WV(t);
       o = o / L2;
       if (gx) o = o * sigmoidf(gx[hx * gstride + tid()]);
       ox[hx * hd + tid()] = o;
@@ -2544,6 +2571,7 @@ KERNEL ie_attn_kv(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
     barrier(); /* wv is used again by the next merge */
   }
 }
+#undef WV
 
 /* ----------------------------------------------------------------- qwen35 */
 

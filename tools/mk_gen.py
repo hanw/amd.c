@@ -35,7 +35,7 @@ sizes4 = {"u32", "int", "float", "unsigned"}
 
 
 def params(name):
-    m = re.search(r"^KERNEL(?:_HEAVY)?\s+" + re.escape(name) + r"\s*\(([^)]*)\)\s*\{", text, re.M)
+    m = re.search(r"^KERNEL(?:_HEAVY|_CALL)?\s+" + re.escape(name) + r"\s*\(([^)]*)\)\s*\{", text, re.M)
     if not m:
         sys.exit("mk_gen: no KERNEL %s in %s" % (name, src))
     ps = []

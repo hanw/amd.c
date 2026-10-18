@@ -72,8 +72,8 @@ $(B)/ie_kernels.hsaco: $(B)/ie_kernels.o
 # multi-token GEMVs with 4 rows per wave: the 8-row ones make it spill).
 # At most 192 VGPRs and 16 KB of LDS: two workgroups per CU (128). tools/mk_gen.py writes the table of all these kernels (their
 # argument layout) for kernels/ie_mk.c and src/hip.c.
-MK_DECODE = ie_embed_q8,ie_embed_q4,ie_embed_f32,ie_rope_kv,ie_gemv_q4q8,ie_rmsnorm,ie_gemv_q4kq8,ie_gemv_q6kq8,ie_gemv_q8q8,ie_gemv_f32,ie_swiglu,ie_gdn1,ie_qkn_rope_kv,ie_attn_split,ie_argmax
-MK_MTP = ie_embed_q8,ie_rmsnorm,ie_rmsnorm_t,ie_quant_q8,ie_swiglu,ie_gdn1,ie_qkn_rope_kv,ie_attn_split,ie_attn_split_t,ie_argmax,ie_gemv_q4q8,ie_gemv_q4kq8,ie_gemv_q6kq8,ie_gemv_q8q8,ie_gemv_f32,ie_gemv_f32_t,ie_gemv_q4kq8_tr,ie_gemv_q6kq8_tr,ie_gemv_q8q8_tr
+MK_DECODE = ie_embed_q8,ie_embed_q4,ie_embed_f32,ie_rope_kv,ie_gemv_q4q8,ie_rmsnorm,ie_gemv_q4kq8,ie_gemv_q6kq8,ie_gemv_q8q8,ie_gemv_f32,ie_swiglu,ie_gdn1,ie_qkn_rope_kv,ie_attn_split,ie_attn_kv,ie_argmax
+MK_MTP = ie_embed_q8,ie_rmsnorm,ie_rmsnorm_t,ie_quant_q8,ie_swiglu,ie_gdn1,ie_qkn_rope_kv,ie_attn_split,ie_attn_split_t,ie_attn_kv,ie_argmax,ie_gemv_q4q8,ie_gemv_q4kq8,ie_gemv_q6kq8,ie_gemv_q8q8,ie_gemv_f32,ie_gemv_f32_t,ie_gemv_q4kq8_tr,ie_gemv_q6kq8_tr,ie_gemv_q8q8_tr
 $(B)/ie_mk_gen.h: tools/mk_gen.py kernels/ie_kernels.c Makefile | $(B)
 	$(PYTHON) tools/mk_gen.py kernels/ie_kernels.c $@ DECODE=$(MK_DECODE) MTP=$(MK_MTP)
 # (clang 21 at -O3 writes "amdgpu-waves-per-eu"="8,16": at most 192 VGPRs,

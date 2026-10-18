@@ -22,6 +22,7 @@
  * cursor (word 63, zero in the list the host writes). */
 #define IE_MEGA 1
 #pragma clang diagnostic ignored "-Wunused-function" /* the kernels a decode step does not use */
+#define KERNEL_CALL static __attribute__((noinline)) void /* ie_attn_kv: inlined, it made the megakernel spill */
 #define KERNEL static inline __attribute__((always_inline)) void /* (noinline: 192 VGPRs, but slower, and still 64 workgroups at most) */
 #include "ie_kernels.c"
 #include "ie_mk_gen.h"
