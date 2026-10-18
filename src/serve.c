@@ -603,14 +603,14 @@ static void handle_chat(int fd, const request *r) {
   }
   prompt_tokens(&cp, &j->prompt);
   chat_prompt_free(&cp);
-  /* the room in the context: n_prompt + max_new + draft <= ctx */
+  /* the room in the context: n_prompt + max_new + spec_room(draft) <= ctx */
   if (getenv("IE_SERVE_DEBUG")) { /* the prompt ids, to compare with llama-tokenize */
     sbuf b = {0};
     for (uint32_t i = 0; i < j->prompt.n; i++) sb_printf(&b, "%s%u", i ? " " : "", j->prompt.v[i]);
     fprintf(stderr, "prompt ids: %s\n", b.p ? b.p : "");
     sb_free(&b);
   }
-  const uint32_t used = j->prompt.n + O.draft;
+  const uint32_t used = j->prompt.n + spec_room(O.draft);
   if (used >= O.ctx) {
     http_error(fd, 400, "invalid_request_error", "the prompt has %u tokens; the context is %u (--ctx)", j->prompt.n, O.ctx);
     goto bad;

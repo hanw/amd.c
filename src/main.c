@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     const char *dh = getenv("IE_DRAFT_HEAD"); /* q8: the drafts use the Q8_0 output matrix */
     if (!(dh && !strcmp(dh, "q8"))) model_make_draft_head(&m, &g);
   }
-  uint32_t need = n_prompt + (uint32_t)n_gen + draft;
+  uint32_t need = n_prompt + (uint32_t)n_gen + spec_room(draft);
   if (n_ctx == 0) n_ctx = need;
   if (n_ctx < need) ie_die("--ctx %u is smaller than prompt + n = %u", n_ctx, need);
   fprintf(stderr, "model: %s, %u layers, dim %u, ffn %u, heads %u/%u (hd %u), vocab %u, rope %s, weights %.2f MB\n",

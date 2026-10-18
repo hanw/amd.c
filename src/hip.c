@@ -10,6 +10,7 @@
 #include "../core/ie_core.h"
 #include "backend.h"
 #include "common.h"
+uint32_t spec_verify_max(void); /* src/gen.c */
 
 typedef int hipError_t; /* 0 = hipSuccess */
 typedef void *hipModule_t, *hipFunction_t, *hipStream_t, *hipEvent_t;
@@ -670,7 +671,9 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   HIP(H.Malloc((void **)&b->arena, g->arena));
   HIP(H.Memset(b->arena, 0, g->arena));
   HIP(H.Malloc((void **)&b->am_part, ARGMAX_GROUPS * 12u));
-  b->ns = g->T > 4u && g->mtp_h >= 0 ? 8u : 4u; /* a verify run of up to 8 tokens needs 8 states */
+  /* a verify run of up to 8 tokens (7 MTP drafts) needs 8 states; with the
+   * prompt lookup (src/gen.c, up to 15 drafts) 16 */
+  b->ns = g->T > 4u && g->mtp_h >= 0 ? (g->T >= 16u && spec_verify_max() > 8u ? 16u : 8u) : 4u;
   HIP(H.Malloc((void **)&b->am_count, 4u));
   HIP(H.Memset(b->am_count, 0, 4u)); /* the kernel sets it back to 0 */
   HIP(H.Malloc((void **)&b->gm_count, 4u));
@@ -1077,7 +1080,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         /* a prompt chunk (wfrom > 0) may have more tokens than the ring has
          * slots: ie_gdn does not write the ring, ie_ring_store does after it */
         u32 rw = wfrom == 0;
-        if (T <= 8u) { /* decode and verify: one kernel, the norm fused */
+        if (T <= 8u || (wfrom == 0u && T <= ns)) { /* decode and verify: one kernel, the norm fused */
           void *a1[] = {&A, &B, &Q, &ring, &st, &cw, &dtb, &sa, &nw, &pos, &cd, &nk, &nv, &eps, &T, &is, &os, &qs, &slot, &wfrom, &rw, &ns};
           launch(b, K_GDN1, nv, a1);
           if (!rw) {

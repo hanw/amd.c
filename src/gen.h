@@ -51,6 +51,8 @@ uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32_t *tok
 /* Speculative decoding with the MTP head (GPU). emit (or NULL) gets each
  * output token after the prompt; when it returns nonzero, the generation
  * ends. Returns the number of tokens in out. */
+uint32_t spec_verify_max(void);
+uint32_t spec_room(uint32_t draft);
 uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out, uint32_t n_prompt, uint32_t total, uint32_t D,
                        int64_t eos, int stop, uint32_t first, uint32_t hrow, sampler *sp, uint32_t V, double *gen_ms,
                        uint32_t *n_steps, uint32_t *n_acc, float pmin, uint32_t *n_drafted, gen_emit emit, void *ectx,
@@ -104,7 +106,7 @@ void gen_free(gen_ctx *c);
  * tokens continues from the snapshot (the result is close to, but not
  * bitwise the same as, the full prompt: the chunks differ), and the snapshot
  * is then taken for this prompt. The caller checks that n_prompt + max_new
- * + draft <= the graph's n_ctx. */
+ * + spec_room(draft) <= the graph's n_ctx. */
 void gen_run(gen_ctx *c, const uint32_t *prompt, uint32_t n_prompt, const gen_params *p, gen_stats *st);
 
 #endif

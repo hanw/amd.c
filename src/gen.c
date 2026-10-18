@@ -164,6 +164,52 @@ uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32_t *tok
   return last;
 }
 
+/* Prompt lookup: the drafts from the text so far. t[0 .. n) are the tokens
+ * (t[n-1]: the token at the step's position). Finds the earlier place whose
+ * tokens before it match the longest suffix of t (up to LOOKUP_NMAX tokens,
+ * the latest place on a tie) and copies up to D tokens after that place to
+ * d[1 ..]. Returns the number of drafts; *mlen: the match length (0: none). */
+enum { LOOKUP_NMAX = 16 };
+
+/* The most tokens of a verify run: 8 (7 MTP drafts), or 1 + IE_LOOKUP_MAX
+ * (default 15, up to 15) with the prompt lookup on; the GPU backend keeps
+ * this many linear attention states. */
+uint32_t spec_verify_max(void) {
+  const char *e = getenv("IE_LOOKUP");
+  if (e && e[0] == '0') return 8u;
+  e = getenv("IE_LOOKUP_MAX");
+  uint32_t n = e ? (uint32_t)atoi(e) : 15u;
+  if (n > 15u) n = 15u;
+  return n + 1u > 8u ? n + 1u : 8u;
+}
+
+/* The positions past the generated tokens that a verify run may use. */
+uint32_t spec_room(uint32_t draft) {
+  const uint32_t r = spec_verify_max() - 1u;
+  return draft ? (r > draft ? r : draft) : 0u;
+}
+static uint32_t lookup_draft(const uint32_t *t, uint32_t n, uint32_t D, uint32_t *d, uint32_t *mlen) {
+  uint32_t best = 0, bi = 0;
+  *mlen = 0;
+  if (n < 2) return 0;
+  const uint32_t last = t[n - 1];
+  for (uint32_t i = n - 1; i-- > 0;) {
+    if (t[i] != last) continue;
+    uint32_t L = 1;
+    while (L < LOOKUP_NMAX && L <= i && t[i - L] == t[n - 1 - L]) L++;
+    if (L > best) {
+      best = L, bi = i;
+      if (best == LOOKUP_NMAX) break;
+    }
+  }
+  if (!best) return 0;
+  uint32_t c = n - 1 - bi; /* tokens after the place */
+  if (c > D) c = D;
+  for (uint32_t j = 0; j < c; j++) d[j + 1] = t[bi + 1 + j];
+  *mlen = best;
+  return c;
+}
+
 /* Greedy decoding with the MTP head drafting D tokens per step (GPU).
  * Positions < P are done in the model and in the MTP KV cache (MTP position
  * q holds the pair (h(q-1), token q), h = the model's normed final hidden
@@ -193,6 +239,22 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
   /* IE_SPEC_TIME=1: the host time of the drafts and of the verify runs (each run ends with a read of its argmax, so it waits for the GPU) */
   const int stime = getenv("IE_SPEC_TIME") != NULL;
   double t_draft = 0, t_verify = 0, tq;
+  /* prompt lookup: IE_LOOKUP=0 off; IE_LOOKUP_MIN: the shortest match used
+   * (default 2); IE_LOOKUP_LONG: the match that skips the rest of the MTP
+   * chain (default 16); IE_LOOKUP_AGREE: the MTP drafts that must agree
+   * (default 2); IE_LOOKUP_MAX: lookup drafts per step (default 15) */
+  const char *ev = getenv("IE_LOOKUP");
+  const int lk_on = !(ev && ev[0] == '0');
+  ev = getenv("IE_LOOKUP_MIN");
+  const uint32_t lk_min = ev ? (uint32_t)atoi(ev) : 2u;
+  ev = getenv("IE_LOOKUP_LONG");
+  const uint32_t lk_long = ev ? (uint32_t)atoi(ev) : 16u;
+  ev = getenv("IE_LOOKUP_AGREE");
+  const uint32_t lk_agree = ev ? (uint32_t)atoi(ev) : 2u;
+  uint32_t lk_n = 0;
+  uint32_t lk_max = spec_verify_max() - 1u; /* lookup drafts per step: the graph's room */
+  if (lk_max > g->T - 1u) lk_max = g->T - 1u;
+  if (lk_max < D) lk_max = D;
   out[n++] = tP;
   /* out[n_prompt .. sent) went to emit; a nonzero return ends the loop */
   uint32_t sent = n_prompt;
@@ -212,12 +274,37 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
     hrow = 0;
     b->run(b, 1, &out[P - k], k + 1, P - k, 0, tk, pr);
     if (pr[k] >= pmin) d[1] = model_draft_tok(m, tk[k]), nd = 1;
+    /* Prompt lookup (IE_LOOKUP, default on): an earlier place in the text
+     * that ends like the text now (a match of ml >= lk_min tokens) gives up
+     * to lk_max drafts: its next tokens. A verify of 16 tokens costs about
+     * 1.6 times one of 8, so they are used only where the MTP chain agrees:
+     * (a) ml >= lk_long: when the chain's first lk_agree drafts are the
+     *     lookup's, the lookup's drafts are used and the rest of the chain is
+     *     not run; (b) else, after the chain: when its nd >= lk_agree drafts
+     *     are all the lookup's, the lookup's next tokens are added. The verify
+     *     step is the same, so the output is the same; only the drafts change. */
+    uint32_t ml = 0, ld[16], nl = lk_on ? lookup_draft(out, n, lk_max, ld, &ml) : 0;
+    if (nl && (ml < lk_min || nl <= lk_agree)) nl = 0;
+    /* the chain so far differs from the lookup: no lookup this step */
+#define LK_DIFF() (nd && d[nd] != ld[nd])
+    if (nl && LK_DIFF()) nl = 0;
     for (uint32_t j = 2; j <= D && nd == j - 1; j++) { /* (2) */
+      if (nl && ml >= lk_long && nd >= lk_agree) { /* (a) */
+        for (uint32_t i = nd + 1; i <= nl; i++) d[i] = ld[i];
+        nd = nl, lk_n++;
+        goto verify;
+      }
       b->copy_rows(b, g->mtp_h, 0, g->mtp_g, j == 2 ? k : 0, 1);
       b->run(b, 1, &d[j - 1], 1, P + j - 1, 0, tk, pr);
       if (pr[0] >= pmin) d[j] = model_draft_tok(m, tk[0]), nd = j;
+      if (nl && LK_DIFF()) nl = 0;
     }
-    /* (3) verify */
+#undef LK_DIFF
+    if (nl > nd && nd >= lk_agree) { /* (b) */
+      for (uint32_t i = nd + 1; i <= nl; i++) d[i] = ld[i];
+      nd = nl, lk_n++;
+    }
+  verify: /* (3) verify */
     if (stime) t_draft += now_ms() - tq, tq = now_ms();
     tk[0] = tP;
     for (uint32_t j = 1; j <= nd; j++) tk[j] = d[j];
@@ -270,6 +357,7 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
   SPEC_EMIT(); /* the last step's tokens (the result does not matter now) */
 #undef SPEC_EMIT
   if (p_done) *p_done = P, *h_row = hrow ? hrow : k; /* the last verify's row k holds h(P - 1) */
+  if (lk_on && !emit && *n_steps) fprintf(stderr, "lookup: %u of %u steps drafted from the text\n", lk_n, *n_steps);
   if (stime && *n_steps)
     fprintf(stderr, "spec time: drafts %.2f ms/step, verify %.2f ms/step (%u steps)\n", t_draft / *n_steps, t_verify / *n_steps, *n_steps);
   *gen_ms = now_ms() - t0;
