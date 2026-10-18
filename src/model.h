@@ -67,6 +67,29 @@ typedef struct {
   vec conv, dt_bias, ssm_a, ssm_norm;
 } layer;
 
+/* DFlash 2 drafter (z-lab/dflash, a separate GGUF, architecture "dflash"):
+ * a block of B tokens [t(P), mask x (B-1)] at positions P .. P+B-1 runs
+ * through n_layer Qwen3 layers whose attention also sees the context: the
+ * keys and values of fc(the hidden states of n_tl target layers) of the
+ * earlier positions (non-causal, sliding window). Two-tap dynamic
+ * convolutions along the block wrap the attention and the FFN. The token
+ * embedding and the output matrix are the target's. A selector (host)
+ * picks one path through the top-k candidates of each position. */
+typedef struct {
+  vec attn_norm, ffn_norm, q_norm, k_norm;
+  vec aconv_base, fconv_base; /* [2][kernel][dim]: [0] before, [1] after the sublayer */
+  mat wq, wk, wv, wo, wgate, wup, wdown, wgu, aconv, fconv; /* aconv, fconv: dim -> 2*kernel*groups */
+} df_layer;
+typedef struct {
+  uint32_t n_layer, dim, ffn, n_head, n_kv, hd, block, window, mask, top_k, rank, kernel, group;
+  uint32_t n_tl, tl[8]; /* target layers (0-based): their outputs, concatenated, are fc's input */
+  float eps, rope_base;
+  vec enc_norm, out_norm;
+  mat fc, sel_h;
+  df_layer *l;
+  const void *sel_prev, *sel_next; /* gguf_tensor of the selector codebooks (host, the file mapped) */
+} dflash;
+
 typedef struct {
   int arch, rope;
   uint32_t n_layer, dim, ffn, n_head, n_kv, hd, vocab, ctx_train;
@@ -95,6 +118,7 @@ typedef struct {
   /* the draft head's rows: tokens 0 .. dv_n - 1, then dv_s .. (IE_DRAFT_VOCAB; 0: all rows, row = token) */
   uint32_t dv_n, dv_s;
   vec enorm, hnorm, head_norm;
+  dflash *df; /* the DFlash 2 drafter (NULL: none) */
   /* tokenizer */
   int tok_gpt2; /* 1: GPT2 byte-level, 0: SentencePiece */
   uint32_t n_tokens;
@@ -105,6 +129,11 @@ typedef struct {
 /* Load the MTP head (blk.N.nextn.*) from g (the model file or a separate
  * file); returns 0 if g has none. */
 int model_load_mtp(model *m, gguf_file *g);
+/* Load a DFlash 2 drafter from g (kept open: the selector reads its
+ * codebooks); returns 0 if g is not one. */
+int model_load_dflash(model *m, gguf_file *g);
+/* Row tok of a selector codebook (which 0: predecessor, 1: successor). */
+void model_df_code(const model *m, int which, uint32_t tok, float *out);
 /* Make m->out_draft from the output matrix of g (the model file). */
 void model_make_draft_head(model *m, gguf_file *g);
 /* The token of row i of the draft head. */
@@ -148,6 +177,20 @@ enum {
    * (conv_dim) | z (inner) | beta (n_vh) | alpha (n_vh)], b = the output
    * (inner, after the gated RMSNorm), Q8 copy in qo. State of layer. */
   OP_GDN,
+  /* b (at boff) = a: n floats per token */
+  OP_COPY,
+  /* DFlash: b = conv(a) along the tokens of the run: b[t] = sum_{o<2}
+   * (base[o] + dyn[t][o]) * a[t-o] per channel (a[-1] = 0); v = base
+   * [2][2][dim], c = dyn ([2][2][groups] per token), nh = which half (0 or
+   * 1); res >= 0: b = res + conv(a) */
+  OP_DF_CONV,
+  /* DFlash: a = [q (n_head hd) | k | v] per token (q absent: nh == 0):
+   * per head RMSNorm (v: q_norm, nv: k_norm), RoPE (NEOX, all hd dims),
+   * k and v into the drafter KV cache of layer at pos + t */
+  OP_DF_QKV,
+  /* DFlash: b = attention(q = a) over the drafter KV cache of layer: query
+   * at pos + t sees the positions within the window up to pos + T - 1 */
+  OP_DF_ATTN,
 };
 
 typedef struct {
@@ -227,11 +270,19 @@ typedef struct {
    * only, and the MTP head not at all */
   uint32_t i_head, i_mtp_head;
   int h_out, mtp_h, mtp_g, mtp_logits, mtp_argmax;
+  /* the MTP ops end at n_mtp; DFlash (m->df set): the context ops [i_dfc,
+   * i_dfb) (fc of df_feat rows, their keys and values into the drafter KV
+   * cache), the block ops [i_dfb, n_ops) (df_logits: the draft head's
+   * logits, df_sel: the selector's hidden projection). df_feat: the outputs
+   * of the target layers df->tl, written by the model ops. */
+  uint32_t n_mtp, i_dfc, i_dfb;
+  int df_feat, df_logits, df_sel;
   float *rope_cos, *rope_sin; /* [n_ctx][n_rot/2] */
   uint64_t weight_bytes_per_token;
 } graph;
 
-/* T: tokens per run (1, or 1 + drafts); mtp: also build the MTP ops. */
+/* T: tokens per run (1, or 1 + drafts); mtp: also build the MTP ops (and
+ * the DFlash ops when m->df is set). */
 void graph_build(graph *gr, const model *m, uint32_t n_ctx, uint32_t T, int mtp);
 void graph_free(graph *gr);
 

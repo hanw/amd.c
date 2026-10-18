@@ -11,8 +11,9 @@ struct backend {
   uint32_t (*step)(backend *b, uint32_t tok, uint32_t pos, float *logits, double *ms);
   void (*close)(backend *b);
   /* GPU only (NULL on the CPU). Run section sec of the op list (0: the
-   * model, 1: the MTP head) for T tokens toks at positions pos .. pos + T -
-   * 1. The linear attention state after each token t is kept (or, if
+   * model, 1: the MTP head, 4: the MTP layer without its output head;
+   * DFlash: 2 the drafter context, 3 the drafter block; out unused for
+   * 2 to 4) for T tokens toks at positions pos .. pos + T - 1. The linear attention state after each token t is kept (or, if
    * last_only, after the last token only) until accept. out: the T argmax
    * tokens. */
   void (*run)(backend *b, int sec, const uint32_t *toks, uint32_t T, uint32_t pos, int last_only, uint32_t *out,

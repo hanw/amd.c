@@ -22,13 +22,14 @@ static void usage(void) {
           "  --draft D: speculative decoding with the model's MTP head, up to D = 1 to 7 drafts per step (GPU);\n"
           "             --draft-pmin P: stop drafting when the MTP probability of a draft is below P (default 0.6);\n"
           "             --mtp FILE: the MTP head from FILE (default: the model file)\n"
+          "  --dflash FILE: with --draft, the drafts from a DFlash 2 drafter (GGUF) instead of the MTP head\n"
           "  --chunk N: GPU, the prompt in chunks of up to N tokens (1 to 512, default 256)\n"
           "  --temp T [--top-k K] [--top-p P] [--seed S]: sampling (default: greedy)\n");
   exit(2);
 }
 
 int main(int argc, char **argv) {
-  const char *mtp_path = NULL;
+  const char *mtp_path = NULL, *df_path = NULL;
   uint32_t draft = 0, chunk = 256, top_k = 0;
   float temp = 0.0f, top_p = 1.0f, pmin = 0.6f;
   uint64_t seed = 1;
@@ -49,6 +50,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--stop")) stop = 1;
     else if (!strcmp(argv[i], "--draft") && i + 1 < argc) draft = (uint32_t)atoi(argv[++i]);
     else if (!strcmp(argv[i], "--mtp") && i + 1 < argc) mtp_path = argv[++i];
+    else if (!strcmp(argv[i], "--dflash") && i + 1 < argc) df_path = argv[++i];
     else if (!strcmp(argv[i], "--chunk") && i + 1 < argc) chunk = (uint32_t)atoi(argv[++i]);
     else if (!strcmp(argv[i], "--draft-pmin") && i + 1 < argc) pmin = (float)atof(argv[++i]);
     else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = (float)atof(argv[++i]);
@@ -109,6 +111,12 @@ int main(int argc, char **argv) {
     if (!model_load_mtp(&m, mtp_path ? &g2 : &g)) ie_die("no MTP head (blk.N.nextn.*) in %s", mtp_path ? mtp_path : path);
     const char *dh = getenv("IE_DRAFT_HEAD"); /* q8: the drafts use the Q8_0 output matrix */
     if (!(dh && !strcmp(dh, "q8"))) model_make_draft_head(&m, &g);
+  }
+  gguf_file g3; /* the DFlash drafter: open to the end (the selector reads its codebooks) */
+  if (df_path) {
+    if (!draft) ie_die("--dflash needs --draft (the verify room and the MTP graph)");
+    gguf_open(&g3, df_path);
+    if (!model_load_dflash(&m, &g3)) ie_die("%s is not a DFlash drafter", df_path);
   }
   uint32_t need = n_prompt + (uint32_t)n_gen + spec_room(draft);
   if (n_ctx == 0) n_ctx = need;

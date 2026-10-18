@@ -98,11 +98,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_ATTN_FA, K_ATTN_FA_Q8, K_ATTN_FA2, K_GEMM_F32_S, K_GEMM_Q4KR_SB, K_REQUANT_SB, K_Q8_F16, K_GEMM_Q4K_H, K_GEMM_Q4K_H256, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_ATTN_FA, K_ATTN_FA_Q8, K_ATTN_FA2, K_GEMM_F32_S, K_GEMM_Q4KR_SB, K_REQUANT_SB, K_Q8_F16, K_GEMM_Q4K_H, K_GEMM_Q4K_H256, K_COPY_ROWS, K_DF_CONV, K_DF_QKV, K_DF_ATTN, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv", "ie_attn_fa", "ie_attn_fa_q8", "ie_attn_fa2", "ie_gemm_f32_s", "ie_gemm_q4kr_sb", "ie_requant_sb", "ie_q8_f16", "ie_gemm_q4k_h", "ie_gemm_q4k_h256"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv", "ie_attn_fa", "ie_attn_fa_q8", "ie_attn_fa2", "ie_gemm_f32_s", "ie_gemm_q4kr_sb", "ie_requant_sb", "ie_q8_f16", "ie_gemm_q4k_h", "ie_gemm_q4k_h256", "ie_copy_rows", "ie_df_conv", "ie_df_qkv", "ie_df_attn"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 /* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
  * linear layer are gpu_backend.ns: at least the tokens of a verify run */
@@ -132,6 +132,7 @@ typedef struct {
   u32 at_pstride, at_tmax;
   u32 *gm_count;           /* GEMV with a fused RMSNorm: finished workgroups (device) */
   u32 slot;                /* ie_gdn: the state slot that holds the current state */
+  float *dfk, *dfv;        /* DFlash: the drafter KV cache [layer][position][n_kv * hd] (f32) */
   u32 ns;                  /* ie_gdn: state slots per linear layer (4, or 8 for more than 3 drafts) */
   int attn_split;          /* use ie_attn_split (hd <= IE_ATT_MAX_HD, and not IE_ATTN=old) */
   int attn_kv;             /* use ie_attn_kv for decode and verify (the K/V of a split read once; not IE_ATTN=split) */
@@ -716,6 +717,12 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   const size_t rbytes = (size_t)m->n_rec * GDN_RING * m->conv_dim * 4 + 4,
                sbytes = (size_t)m->n_rec * b->ns * m->n_vh * m->sd * m->sd * 4 + 4;
   HIP(H.Malloc((void **)&b->ring, rbytes));
+  if (g->df_feat >= 0) {
+    const size_t dkv = (size_t)m->df->n_layer * (g->n_ctx + 16u) * m->df->n_kv * m->df->hd * 4u;
+    HIP(H.Malloc((void **)&b->dfk, dkv));
+    HIP(H.Malloc((void **)&b->dfv, dkv));
+    fprintf(stderr, "gpu: dflash KV cache %.1f MB\n", 2.0 * dkv / 1e6);
+  }
   HIP(H.Malloc((void **)&b->st, sbytes));
   if (m->n_rec && g->T > 16u && !(getenv("IE_GDN_CHUNK") && getenv("IE_GDN_CHUNK")[0] == '0')) {
     const size_t T = g->T, nb = (T + 31u) / 32u, nv = m->n_vh;
@@ -1037,6 +1044,40 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         launch(b, K_ADD, elem_groups, args);
         break;
       }
+      case OP_COPY: {
+        u32 as = g->bufs[o->a].stride / 4u, bs = g->bufs[o->b].stride / 4u;
+        void *args[] = {&A, &B, &n, &as, &bs};
+        launch_t(b, K_COPY_ROWS, elem_groups, T, args);
+        break;
+      }
+      case OP_DF_CONV: {
+        const dflash *d = m->df;
+        u32 which = o->nh, gs = d->group, as = g->bufs[o->a].stride / 4u, bs = g->bufs[o->b].stride / 4u,
+            ds = g->bufs[o->c].stride / 4u, rs = o->res >= 0 ? g->bufs[o->res].stride / 4u : 0u;
+        void *args[] = {&A, &B, &C, &w0, &R, &n, &which, &gs, &as, &bs, &ds, &rs};
+        launch_t(b, K_DF_CONV, elem_groups, T, args);
+        break;
+      }
+      case OP_DF_QKV: {
+        const dflash *d = m->df;
+        const size_t lofs = (size_t)o->layer * (g->n_ctx + 16u) * d->n_kv * d->hd;
+        float *kc = b->dfk + lofs, *vc = b->dfv + lofs;
+        u32 xs = g->bufs[o->a].stride / 4u, nh = o->nh, nk = d->n_kv, dh = d->hd;
+        float de = d->eps, rb = d->rope_base;
+        void *qw = w0;
+        void *args[] = {&A, &xs, &qw, &NW, &kc, &vc, &nh, &nk, &dh, &pos, &de, &rb};
+        launch_t(b, K_DF_QKV, nh + 2u * nk, T, args);
+        break;
+      }
+      case OP_DF_ATTN: {
+        const dflash *d = m->df;
+        const size_t lofs = (size_t)o->layer * (g->n_ctx + 16u) * d->n_kv * d->hd;
+        float *kc = b->dfk + lofs, *vc = b->dfv + lofs;
+        u32 qs = g->bufs[o->a].stride / 4u, os = g->bufs[o->b].stride / 4u, nh = o->nh, nk = d->n_kv, dh = d->hd, win = d->window;
+        void *args[] = {&A, &qs, &B, &os, &kc, &vc, &pos, &T, &nh, &nk, &dh, &win};
+        launch_t(b, K_DF_ATTN, nh, T, args);
+        break;
+      }
       case OP_SWIGLU: {
         u32 as = g->bufs[o->a].stride, qs = o->qo >= 0 ? g->bufs[o->qo].stride : 0u;
         void *args[] = {&A, &B, &n, &Q, &as, &qs};
@@ -1293,8 +1334,8 @@ static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u
       launch_op(b, i, T - 1, toks[T - 1], pos + T - 1, 1, slot, wfrom);
       continue;
     }
-    if (chunk && g->mtp_logits >= 0 && i >= g->i_mtp_head) continue;
-    if (T > 1 && g->mtp_logits >= 0 && i >= g->i_mtp_head) { /* MTP catch-up: only the last token's draft is used */
+    if (chunk && g->mtp_logits >= 0 && i >= g->i_mtp_head && i < g->n_mtp) continue;
+    if (T > 1 && g->mtp_logits >= 0 && i >= g->i_mtp_head && i < g->n_mtp) { /* MTP catch-up: only the last token's draft is used */
       launch_op(b, i, T - 1, toks[T - 1], pos + T - 1, 1, slot, wfrom);
       continue;
     }
@@ -1305,7 +1346,7 @@ static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u
     static int gmin = -1;
     if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
     const int all = k == OP_GDN || ((k == OP_GEMV_Q8 || k == OP_GEMV_Q4K || k == OP_GEMV_Q6K || k == OP_GEMV_F32) && !nobatch) || k == OP_RMSNORM || k == OP_QUANT || k == OP_SWIGLU ||
-                    k == OP_QKN_ROPE_KV || (k == OP_ATTN && (int)T >= gmin) /* the fast (not bitwise) prefill path */
+                    k == OP_QKN_ROPE_KV || k == OP_COPY || k == OP_DF_CONV || k == OP_DF_QKV || k == OP_DF_ATTN || (k == OP_ATTN && (int)T >= gmin) /* the fast (not bitwise) prefill path */
                     || (k == OP_ATTN && b->attn_split && T <= b->at_tmax && b->at_part); /* verify: ie_attn_split_t (bitwise) */
     if (all) launch_op(b, i, 0, toks[0], pos, T, slot, wfrom);
     else
@@ -1381,6 +1422,19 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
   gpu_backend *b = (gpu_backend *)bk;
   const graph *g = b->g;
   if (sec == 1 && g->mtp_argmax < 0) ie_die("the graph has no MTP ops");
+  if (sec == 4) { /* the MTP layer only (its KV cache), not its output head */
+    tr_run("mtp_kv", pos, T);
+    run_ops(b, g->n_main, g->i_mtp_head, toks, T, pos, 0);
+    (void)last_only, (void)out, (void)prob;
+    return;
+  }
+  if (sec >= 2) { /* DFlash: 2 the context ops, 3 the block ops (launches; the host reads df_logits / df_sel) */
+    if (g->df_feat < 0) ie_die("the graph has no DFlash ops");
+    tr_run(sec == 2 ? "df_ctx" : "df_block", pos, T);
+    run_ops(b, sec == 2 ? g->i_dfc : g->i_dfb, sec == 2 ? g->i_dfb : g->n_ops, toks, T, pos, 0);
+    (void)last_only, (void)out, (void)prob;
+    return;
+  }
   /* IE_PROFILE=2: the ops of the prompt chunks (ms per chunk in the report) */
   const int pc = b->prof == 2 && !sec && T > 1u;
   if (pc) HIP(H.EventRecord(b->e0, NULL));
@@ -1389,7 +1443,7 @@ static void gpu_run(backend *bk, int sec, const uint32_t *toks, uint32_t T, uint
    * megakernel (IE_MK_MTP=0: off) */
   mk.rec = mk.on && !mk.off[MKSET_MTP] && mk.mtp && !(last_only && T > 1u) && (mk.mtp == 1 || (mk.mtp == 2) == (sec != 0)),
   mk.set = MKSET_MTP;
-  run_ops(b, sec ? g->n_main : 0, sec ? g->n_ops : g->n_main, toks, T, pos, last_only ? T - 1 : 0);
+  run_ops(b, sec ? g->n_main : 0, sec ? g->n_mtp : g->n_main, toks, T, pos, last_only ? T - 1 : 0);
   mk.rec = 0;
   mk_flush();
   if (pc) {

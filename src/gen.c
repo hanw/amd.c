@@ -147,6 +147,7 @@ uint32_t prefill(backend *b, const graph *g, uint32_t vocab, const uint32_t *tok
     b->run(b, 0, toks + p0, T, p0, 1, a, NULL);
     b->accept(b, T - 1);
     last = a[T - 1];
+    if (g->df_feat >= 0) b->run(b, 2, toks + p0, T, p0, 0, NULL, NULL); /* DFlash: the context of the drafter */
     if (lg) {
       b->read_rows(b, g->logits, 0, T, lg);
       const uint32_t stride = g->bufs[g->logits].stride / 4u;
@@ -210,6 +211,66 @@ static uint32_t lookup_draft(const uint32_t *t, uint32_t n, uint32_t D, uint32_t
   return c;
 }
 
+/* DFlash: drafts for the block [t(P), mask...] at P (the drafter context
+ * is up to date): the block run, the top-k candidates of rows 1 .. n, and
+ * the selector's path from the anchor t(P) (greedy). Returns n. */
+static uint32_t df_draft(backend *b, const model *m, const graph *g, sampler *sp, uint32_t tP, uint32_t P, uint32_t n, uint32_t *d,
+                         float pmin) {
+  const dflash *df = m->df;
+  const uint32_t K = df->top_k, R = df->rank, B = n + 1;
+  uint32_t bt[17];
+  bt[0] = tP;
+  for (uint32_t j = 1; j < B; j++) bt[j] = df->mask;
+  b->run(b, 3, bt, B, P, 0, NULL, NULL);
+  float *uv = sp->cv;
+  uint32_t *ci = sp->ci;
+  if (!b->topk(b, g->df_logits, 1, n, m->vocab, K, uv, ci)) ie_die("dflash: top k on the GPU failed");
+  const uint32_t ss = g->bufs[g->df_sel].stride / 4u;
+  float *hp = malloc((size_t)n * ss * 4), *pc = malloc((size_t)R * 4), *sc = malloc((size_t)R * 4);
+  b->read_rows(b, g->df_sel, 1, n, hp);
+  static int nosel = -1; /* IE_DFLASH_SEL=0: the top candidate of each position (no selector) */
+  if (nosel < 0) nosel = getenv("IE_DFLASH_SEL") && getenv("IE_DFLASH_SEL")[0] == '0';
+  uint32_t prev = tP;
+  for (uint32_t j = 0; j < n && nosel; j++) {
+    uint32_t bi = 0;
+    for (uint32_t c = 1; c < K; c++) if (uv[j * K + c] > uv[j * K + bi]) bi = c;
+    d[j + 1] = ci[j * K + bi];
+  }
+  for (uint32_t j = 0; j < n && !nosel; j++) {
+    model_df_code(m, 0, prev, pc);
+    const float *h = hp + (size_t)j * ss;
+    for (uint32_t r = 0; r < R; r++) pc[r] *= h[r];
+    float best = -INFINITY;
+    uint32_t bi = 0;
+    for (uint32_t c = 0; c < K; c++) {
+      const uint32_t tok = ci[j * K + c];
+      model_df_code(m, 1, tok, sc);
+      float s = 0.0f;
+      for (uint32_t r = 0; r < R; r++) s += pc[r] * sc[r];
+      s += uv[j * K + c];
+      if (s > best) best = s, bi = tok;
+    }
+    d[j + 1] = prev = bi;
+  }
+  free(hp), free(pc), free(sc);
+  /* Keep the drafts while the drafter's probability of each (softmax over
+   * its top K logits) is at least pmin, as the MTP drafts. */
+  uint32_t nd = 0;
+  for (uint32_t j = 0; j < n; j++) {
+    const float *u = uv + j * K;
+    float mx = u[0], z = 0.0f, pd = 0.0f;
+    for (uint32_t c = 1; c < K; c++) mx = u[c] > mx ? u[c] : mx;
+    for (uint32_t c = 0; c < K; c++) {
+      const float e = expf(u[c] - mx);
+      z += e;
+      if (ci[j * K + c] == d[j + 1]) pd = e;
+    }
+    if (pd < pmin * z) break;
+    nd = j + 1;
+  }
+  return nd;
+}
+
 /* Greedy decoding with the MTP head drafting D tokens per step (GPU).
  * Positions < P are done in the model and in the MTP KV cache (MTP position
  * q holds the pair (h(q-1), token q), h = the model's normed final hidden
@@ -252,6 +313,21 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
   ev = getenv("IE_LOOKUP_AGREE");
   const uint32_t lk_agree = ev ? (uint32_t)atoi(ev) : 2u;
   uint32_t lk_n = 0;
+  /* DFlash (m->df, the graph's DFlash ops): IE_DFLASH=0 uses the MTP head */
+  const char *dfe = getenv("IE_DFLASH");
+  const int dfm = g->df_feat >= 0 && !(dfe && dfe[0] == '0');
+  /* drafts per DFlash block: 15 (twice the trained block, as lucebox; measured faster than 7 on code and prose) */
+  uint32_t ing = 0, df_n = dfm ? 15u : 0u;
+  if (dfm && df_n > spec_verify_max() - 1u) df_n = spec_verify_max() - 1u;
+  if (dfm && df_n + 1u > g->T) df_n = g->T - 1u;
+  if (dfm && getenv("IE_DFLASH_N")) df_n = (uint32_t)atoi(getenv("IE_DFLASH_N"));
+  const float df_pmin = getenv("IE_DFLASH_PMIN") ? (float)atof(getenv("IE_DFLASH_PMIN")) : 0.3f;
+  /* IE_DFLASH_AUTO=0: DFlash at every step (the MTP head not run) */
+  const int df_auto = dfm && !(getenv("IE_DFLASH_AUTO") && getenv("IE_DFLASH_AUTO")[0] == '0');
+  int df_mode = 1, use_df = 0, df_seen[2] = {0, 0};
+  double df_rate[2] = {0, 0}, df_tok[2] = {0, 0}, df_ms[2] = {0, 0};
+  uint32_t df_used[2] = {0, 0};
+  if (dfm && (df_n < 1 || df_n > 15 || df_n + 1 > g->T || df_n > spec_verify_max() - 1u)) ie_die("IE_DFLASH_N: 1 to 15 (the verify room)");
   uint32_t lk_max = spec_verify_max() - 1u; /* lookup drafts per step: the graph's room */
   if (lk_max > g->T - 1u) lk_max = g->T - 1u;
   if (lk_max < D) lk_max = D;
@@ -270,9 +346,39 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
     float pr[16];
     uint32_t nd = 0;
     tq = stime ? now_ms() : 0;
-    b->copy_rows(b, g->mtp_h, 0, g->h_out, hrow, k + 1);
-    hrow = 0;
-    b->run(b, 1, &out[P - k], k + 1, P - k, 0, tk, pr);
+    const double t_step = now_ms();
+    /* DFlash: the context of the last accepted tokens (every step, so the
+     * drafter can be used at any step). With the MTP head kept current too
+     * (df_auto), each step uses the drafter with the better measured rate
+     * (tokens per ms) and tries the other one every 16th step. */
+    if (dfm && ing) b->run(b, 2, &out[P - ing], ing, P - ing, 0, NULL, NULL);
+    /* the other drafter at steps 1 and 16, 32, ... (a probe) */
+    const int probe = *n_steps == 1u || (*n_steps && *n_steps % 16u == 0u);
+    /* a long match in the text: the MTP path, whose chain stops after the
+     * first lk_agree drafts agree with the lookup (cheaper than a DFlash
+     * block); such steps do not count in the rates */
+    uint32_t ml0 = 0, ld0[16];
+    const int lkl = df_auto && lk_on && lookup_draft(out, n, lk_max, ld0, &ml0) > lk_agree && ml0 >= lk_long;
+    use_df = dfm && !lkl && (!df_auto || (probe ? !df_mode : df_mode));
+    if (!use_df || df_auto) { /* (1) the MTP catch-up and its first draft (DFlash: the KV cache only) */
+      b->copy_rows(b, g->mtp_h, 0, g->h_out, hrow, k + 1);
+      hrow = 0;
+      b->run(b, use_df ? 4 : 1, &out[P - k], k + 1, P - k, 0, tk, pr);
+    }
+    if (use_df) {
+      nd = df_draft(b, m, g, sp, tP, P, df_n, d, df_pmin);
+      if (lk_on && nd >= lk_agree) { /* the prompt lookup, as with the MTP chain: (a) replaces, (b) extends the drafts */
+        uint32_t ml = 0, ld[16];
+        const uint32_t nl = lookup_draft(out, n, lk_max, ld, &ml);
+        if (nl > lk_agree && ml >= lk_min && !memcmp(d + 1, ld + 1, lk_agree * sizeof *d)) {
+          if ((ml >= lk_long && nl >= nd) || (nl > nd && !memcmp(d + 1, ld + 1, nd * sizeof *d))) {
+            for (uint32_t j = 1; j <= nl; j++) d[j] = ld[j];
+            nd = nl, lk_n++;
+          }
+        }
+      }
+      goto verify;
+    }
     if (pr[k] >= pmin) d[1] = model_draft_tok(m, tk[k]), nd = 1;
     /* Prompt lookup (IE_LOOKUP, default on): an earlier place in the text
      * that ends like the text now (a match of ml >= lk_min tokens) gives up
@@ -347,6 +453,16 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
     for (uint32_t j = 1; j <= k && n < total; j++) out[n++] = d[j];
     if (n < total) out[n++] = a[k];
     b->accept(b, k); /* the linear attention state after token k */
+    ing = k + 1; /* DFlash: positions P .. P + k into the drafter context (their features: verify rows 0 .. k) */
+    if (df_auto && !lkl) { /* the rate of the drafter of this step */
+      /* the rate: decayed sums of tokens and of time (about the last 10 steps of that drafter) */
+      const int u = use_df;
+      df_tok[u] = 0.9 * df_tok[u] + (k + 1), df_ms[u] = 0.9 * df_ms[u] + (now_ms() - t_step);
+      df_rate[u] = df_tok[u] / df_ms[u];
+      df_seen[u] = 1, df_used[u]++;
+      /* switch only when the other drafter's rate is 10 % higher */
+      if (df_seen[0] && df_seen[1] && df_rate[!df_mode] > 1.1 * df_rate[df_mode]) df_mode = !df_mode;
+    }
     P += k + 1;
     tP = a[k];
     (*n_steps)++, *n_acc += k;
@@ -358,6 +474,7 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
 #undef SPEC_EMIT
   if (p_done) *p_done = P, *h_row = hrow ? hrow : k; /* the last verify's row k holds h(P - 1) */
   if (lk_on && !emit && *n_steps) fprintf(stderr, "lookup: %u of %u steps drafted from the text\n", lk_n, *n_steps);
+  if (df_auto && !emit) fprintf(stderr, "dflash: %u steps DFlash, %u steps MTP (rates %.3f / %.3f tokens per ms)\n", df_used[1], df_used[0], df_rate[1], df_rate[0]);
   if (stime && *n_steps)
     fprintf(stderr, "spec time: drafts %.2f ms/step, verify %.2f ms/step (%u steps)\n", t_draft / *n_steps, t_verify / *n_steps, *n_steps);
   *gen_ms = now_ms() - t0;
@@ -400,6 +517,7 @@ static uint32_t prefill_range(backend *b, const graph *g, const uint32_t *toks, 
     b->run(b, 0, toks + p0, T, p0, 1, a, NULL);
     b->accept(b, T - 1);
     last = a[T - 1];
+    if (g->df_feat >= 0) b->run(b, 2, toks + p0, T, p0, 0, NULL, NULL); /* DFlash: the context of the drafter */
     if (mtp) {
       if (T > 1) b->copy_rows(b, g->mtp_h, 1, g->h_out, 0, T - 1);
       b->run(b, 1, toks + p0, T, p0, 1, d, NULL);

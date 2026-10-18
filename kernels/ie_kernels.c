@@ -2157,6 +2157,108 @@ KERNEL ie_add(const G float *a, const G float *b, G float *c, u32 n) {
   if (i < n) c[i] = a[i] + b[i];
 }
 
+/* b[t] = a[t]: n floats per token (grid y: token; strides in floats) */
+KERNEL ie_copy_rows(const G float *a, G float *b, u32 n, u32 as, u32 bs) {
+  const u32 i = wgid() * NT + tid(), t = tokid();
+  if (i < n) b[t * bs + i] = a[t * as + i];
+}
+
+/* ------------------------------------------------------------- DFlash 2 */
+
+/* The two-tap dynamic convolution along the tokens of the run (grid y:
+ * token t): b[t][c] = res[t][c] + sum_{o < 2, o <= t} (base[w][o][c] +
+ * dyn[t][w][o][c / gs]) * a[t - o][c], w = which (base [2][2][n], dyn per
+ * token [2][2][n / gs]; strides in floats). */
+KERNEL ie_df_conv(const G float *a, G float *b, const G float *dyn, const G float *base, const G float *res, u32 n,
+                  u32 which, u32 gs, u32 as, u32 bs, u32 ds, u32 rs) {
+  const u32 c = wgid() * NT + tid(), t = tokid();
+  if (c >= n) return;
+  const u32 ng = n / gs;
+  float acc = 0.0f;
+  for (u32 o = 0; o < 2u && o <= t; o++) {
+    const float x = a[(t - o) * as + c];
+    acc += base[(which * 2u + o) * n + c] * x;
+    acc += dyn[t * ds + (which * 2u + o) * ng + c / gs] * x;
+  }
+  b[t * bs + c] = res ? res[t * rs + c] + acc : acc;
+}
+
+/* DFlash per head RMSNorm, RoPE (NEOX: pairs (i, i + hd/2), all hd dims)
+ * and the KV store, for token t (grid y) at position pos + t. x: [q (nh
+ * heads) | k (nkv heads) | v (nkv heads)] of hd each (stride xs floats).
+ * Workgroup h < nh: q head h (in place); nh <= h < nh + nkv: k head (to kc);
+ * then nkv workgroups copy the v heads (to vc). kc, vc: [position][nkv*hd]. */
+static LDS float dfq_x[256];
+KERNEL ie_df_qkv(G float *x, u32 xs, const G float *qw, const G float *kw, G float *kc, G float *vc, u32 nh, u32 nkv,
+                 u32 hd, u32 pos, float eps, float base) {
+  const u32 h = wgid(), t = tokid(), i = tid(), kvd = nkv * hd, p = pos + t;
+  G float *xt = x + (unsigned long)t * xs;
+  if (h >= nh + nkv) { /* v */
+    const u32 kh = h - nh - nkv;
+    if (i < hd) vc[(unsigned long)p * kvd + kh * hd + i] = xt[nh * hd + kvd + kh * hd + i];
+    return;
+  }
+  G float *v = xt + h * hd; /* q heads, then k heads: contiguous */
+  const float xv = i < hd ? v[i] : 0.0f;
+  const float ss = wg_sum(xv * xv);
+  const float r = 1.0f / __builtin_sqrtf(ss / (float)hd + eps);
+  const G float *w = h < nh ? qw : kw;
+  const float y = i < hd ? xv * r * w[i] : 0.0f;
+  if (i < hd) dfq_x[i] = y;
+  barrier();
+  if (i < hd) {
+    const u32 half = hd / 2u, j = i < half ? i : i - half;
+    const float th = (float)p * __builtin_powf(base, -2.0f * (float)j / (float)hd);
+    const float cs = __builtin_cosf(th), sn = __builtin_sinf(th);
+    const float o = i < half ? y * cs - dfq_x[i + half] * sn : y * cs + dfq_x[i - half] * sn;
+    if (h < nh) v[i] = o;
+    else kc[(unsigned long)p * kvd + (h - nh) * hd + i] = o;
+  }
+}
+
+/* DFlash attention of the query heads of token t (grid y) at position
+ * pos + t over the drafter KV cache: the positions lo .. pos + T - 1, lo =
+ * max(0, pos + t - (win - 1)) (non-causal inside the block, a sliding
+ * window). Workgroup: query head h (GQA: KV head h / (nh / nkv)). q: [q |
+ * k | v] rows of stride qs floats; out rows of stride os floats. */
+#define DFA_MAX 2304u
+static LDS float dfa_s[DFA_MAX];
+static LDS float dfa_q[256];
+KERNEL ie_df_attn(const G float *q, u32 qs, G float *out, u32 os, const G float *kc, const G float *vc, u32 pos, u32 T, u32 nh,
+                  u32 nkv, u32 hd, u32 win) {
+  const u32 h = wgid(), t = tokid(), i = tid(), kh = h / (nh / nkv), kvd = nkv * hd;
+  const u32 p = pos + t, lo = p + 1u > win ? p + 1u - win : 0u, hi = pos + T; /* keys lo .. hi - 1 */
+  const u32 nk = hi - lo < DFA_MAX ? hi - lo : DFA_MAX;
+  const G float *qh = q + (unsigned long)t * qs + h * hd;
+  if (i < hd) dfa_q[i] = qh[i];
+  barrier();
+  const float scale = 1.0f / __builtin_sqrtf((float)hd);
+  const u32 w = i >> 5, l = lane();
+  for (u32 j = w; j < nk; j += 8u) { /* a wave per key */
+    const G float *kr = kc + (unsigned long)(lo + j) * kvd + kh * hd;
+    float d = 0.0f;
+    for (u32 e = l; e < hd; e += 32u) d += dfa_q[e] * kr[e];
+    d = wave_sum_all(d);
+    if (l == 0u) dfa_s[j] = d * scale;
+  }
+  barrier();
+  float mv = -__builtin_inff();
+  for (u32 j = i; j < nk; j += NT) mv = __builtin_fmaxf(mv, dfa_s[j]);
+  const float M = wg_max(mv);
+  float sv = 0.0f;
+  for (u32 j = i; j < nk; j += NT) {
+    const float e = __builtin_expf(dfa_s[j] - M);
+    dfa_s[j] = e;
+    sv += e;
+  }
+  const float L = wg_sum(sv); /* its barrier: dfa_s complete */
+  if (i < hd) {
+    float o = 0.0f;
+    for (u32 j = 0; j < nk; j++) o += dfa_s[j] * vc[(unsigned long)(lo + j) * kvd + kh * hd + i];
+    out[(unsigned long)t * os + h * hd + i] = o / L;
+  }
+}
+
 /* a = silu(a) * b */
 /* a = silu(a) * b. n is a multiple of 32, so a wave is one whole block (or
  * none). If q is not NULL, also write the Q8 copy of the result. */
