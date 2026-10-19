@@ -22,6 +22,7 @@ static struct {
   hipError_t (*SetDevice)(int);
   hipError_t (*GetDeviceCount)(int *);
   hipError_t (*Malloc)(void **, size_t);
+  hipError_t (*MemGetInfo)(size_t *, size_t *);
   hipError_t (*Free)(void *);
   hipError_t (*Memcpy)(void *, const void *, size_t, int);
   hipError_t (*MemcpyAsync)(void *, const void *, size_t, int, hipStream_t);
@@ -71,6 +72,7 @@ static void hip_load(void) {
   SYM(SetDevice, "hipSetDevice");
   SYM(GetDeviceCount, "hipGetDeviceCount");
   SYM(Malloc, "hipMalloc");
+  SYM(MemGetInfo, "hipMemGetInfo");
   SYM(Free, "hipFree");
   SYM(Memcpy, "hipMemcpy");
   SYM(Memset, "hipMemset");
@@ -132,7 +134,8 @@ typedef struct {
   u32 at_pstride, at_tmax;
   u32 *gm_count;           /* GEMV with a fused RMSNorm: finished workgroups (device) */
   u32 slot;                /* ie_gdn: the state slot that holds the current state */
-  float *dfk, *dfv;        /* DFlash: the drafter KV cache [layer][position][n_kv * hd] (f32) */
+  float *dfk, *dfv;        /* DFlash: the drafter KV cache [layer][df_ring][n_kv * hd] (f32), row = position % df_ring */
+  u32 df_ring;
   u32 ns;                  /* ie_gdn: state slots per linear layer (4, or 8 for more than 3 drafts) */
   int attn_split;          /* use ie_attn_split (hd <= IE_ATT_MAX_HD, and not IE_ATTN=old) */
   int attn_kv;             /* use ie_attn_kv for decode and verify (the K/V of a split read once; not IE_ATTN=split) */
@@ -714,11 +717,24 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   const size_t kv = (size_t)m->n_kvl * g->n_ctx * m->n_kv * m->hd * b->kvb + 4;
   HIP(H.Malloc((void **)&b->kc, kv));
   HIP(H.Malloc((void **)&b->vc, kv));
+  /* 16 linear attention states (verify runs of up to 16 tokens) only if they
+   * fit with 512 MB to spare (a long context, for example 131072 with
+   * Qwen3.8-27B, leaves room for 8 only); else 8 (7 drafts) */
+  if (b->ns == 16u) {
+    size_t fr = 0, tot = 0;
+    const size_t s16 = (size_t)m->n_rec * 16u * m->n_vh * m->sd * m->sd * 4;
+    if (H.MemGetInfo(&fr, &tot) == 0 && fr < s16 + ((size_t)512 << 20)) {
+      b->ns = 8u;
+      fprintf(stderr, "gpu: %.0f MB free: 8 linear attention states (verify runs of up to 8 tokens)\n", fr / 1e6);
+    }
+  }
+  b->base.verify_max = b->ns > 4u ? b->ns : 1u;
   const size_t rbytes = (size_t)m->n_rec * GDN_RING * m->conv_dim * 4 + 4,
                sbytes = (size_t)m->n_rec * b->ns * m->n_vh * m->sd * m->sd * 4 + 4;
   HIP(H.Malloc((void **)&b->ring, rbytes));
-  if (g->df_feat >= 0) {
-    const size_t dkv = (size_t)m->df->n_layer * (g->n_ctx + 16u) * m->df->n_kv * m->df->hd * 4u;
+  if (g->df_feat >= 0) { /* a ring of window + 32 positions per layer (the block: up to 16) */
+    b->df_ring = m->df->window + 32u < g->n_ctx + 16u ? m->df->window + 32u : g->n_ctx + 16u;
+    const size_t dkv = (size_t)m->df->n_layer * b->df_ring * m->df->n_kv * m->df->hd * 4u;
     HIP(H.Malloc((void **)&b->dfk, dkv));
     HIP(H.Malloc((void **)&b->dfv, dkv));
     fprintf(stderr, "gpu: dflash KV cache %.1f MB\n", 2.0 * dkv / 1e6);
@@ -1060,21 +1076,22 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
       }
       case OP_DF_QKV: {
         const dflash *d = m->df;
-        const size_t lofs = (size_t)o->layer * (g->n_ctx + 16u) * d->n_kv * d->hd;
+        const size_t lofs = (size_t)o->layer * b->df_ring * d->n_kv * d->hd;
         float *kc = b->dfk + lofs, *vc = b->dfv + lofs;
-        u32 xs = g->bufs[o->a].stride / 4u, nh = o->nh, nk = d->n_kv, dh = d->hd;
+        u32 xs = g->bufs[o->a].stride / 4u, nh = o->nh, nk = d->n_kv, dh = d->hd, ring = b->df_ring;
         float de = d->eps, rb = d->rope_base;
         void *qw = w0;
-        void *args[] = {&A, &xs, &qw, &NW, &kc, &vc, &nh, &nk, &dh, &pos, &de, &rb};
+        void *args[] = {&A, &xs, &qw, &NW, &kc, &vc, &nh, &nk, &dh, &pos, &de, &rb, &ring};
         launch_t(b, K_DF_QKV, nh + 2u * nk, T, args);
         break;
       }
       case OP_DF_ATTN: {
         const dflash *d = m->df;
-        const size_t lofs = (size_t)o->layer * (g->n_ctx + 16u) * d->n_kv * d->hd;
+        const size_t lofs = (size_t)o->layer * b->df_ring * d->n_kv * d->hd;
         float *kc = b->dfk + lofs, *vc = b->dfv + lofs;
-        u32 qs = g->bufs[o->a].stride / 4u, os = g->bufs[o->b].stride / 4u, nh = o->nh, nk = d->n_kv, dh = d->hd, win = d->window;
-        void *args[] = {&A, &qs, &B, &os, &kc, &vc, &pos, &T, &nh, &nk, &dh, &win};
+        u32 qs = g->bufs[o->a].stride / 4u, os = g->bufs[o->b].stride / 4u, nh = o->nh, nk = d->n_kv, dh = d->hd, win = d->window,
+            ring = b->df_ring;
+        void *args[] = {&A, &qs, &B, &os, &kc, &vc, &pos, &T, &nh, &nk, &dh, &win, &ring};
         launch_t(b, K_DF_ATTN, nh, T, args);
         break;
       }

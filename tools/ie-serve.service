@@ -11,8 +11,12 @@ Wants=network-online.target
 User=hanwang
 WorkingDirectory=/home/hanwang/amd.c
 # Only Open WebUI on this host talks to ie-serve, so it listens on 127.0.0.1.
+# --draft 7 --dflash: MTP and the DFlash 2 drafter; each step uses the faster one (README, DFlash 2).
+# With DFlash, 65536 is the largest context that fits in 32 GB; for 131072, drop the --dflash line
+# (and the backslash before it).
 ExecStart=/home/hanwang/amd.c/build/ie-serve /home/hanwang/models/q4/Qwen3.8-27B-Q4_K_M.gguf \
-    --host 127.0.0.1 --port 8000 --ctx 131072 --draft 3 --chunk 512
+    --host 127.0.0.1 --port 8000 --ctx 65536 --draft 7 --chunk 512 \
+    --dflash /home/hanwang/models/dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 Restart=on-failure
 RestartSec=5
 

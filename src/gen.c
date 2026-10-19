@@ -319,6 +319,7 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
   /* drafts per DFlash block: 15 (twice the trained block, as lucebox; measured faster than 7 on code and prose) */
   uint32_t ing = 0, df_n = dfm ? 15u : 0u;
   if (dfm && df_n > spec_verify_max() - 1u) df_n = spec_verify_max() - 1u;
+  if (dfm && b->verify_max && df_n > b->verify_max - 1u) df_n = b->verify_max - 1u;
   if (dfm && df_n + 1u > g->T) df_n = g->T - 1u;
   if (dfm && getenv("IE_DFLASH_N")) df_n = (uint32_t)atoi(getenv("IE_DFLASH_N"));
   const float df_pmin = getenv("IE_DFLASH_PMIN") ? (float)atof(getenv("IE_DFLASH_PMIN")) : 0.3f;
@@ -327,8 +328,10 @@ uint32_t spec_generate(backend *b, const model *m, const graph *g, uint32_t *out
   int df_mode = 1, use_df = 0, df_seen[2] = {0, 0};
   double df_rate[2] = {0, 0}, df_tok[2] = {0, 0}, df_ms[2] = {0, 0};
   uint32_t df_used[2] = {0, 0};
+  if (dfm && getenv("IE_DFLASH_N") && b->verify_max && df_n > b->verify_max - 1u) df_n = b->verify_max - 1u;
   if (dfm && (df_n < 1 || df_n > 15 || df_n + 1 > g->T || df_n > spec_verify_max() - 1u)) ie_die("IE_DFLASH_N: 1 to 15 (the verify room)");
-  uint32_t lk_max = spec_verify_max() - 1u; /* lookup drafts per step: the graph's room */
+  uint32_t lk_max = spec_verify_max() - 1u; /* lookup drafts per step: the graph's room and the backend's states */
+  if (b->verify_max && lk_max > b->verify_max - 1u) lk_max = b->verify_max - 1u;
   if (lk_max > g->T - 1u) lk_max = g->T - 1u;
   if (lk_max < D) lk_max = D;
   out[n++] = tP;

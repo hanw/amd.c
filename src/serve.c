@@ -37,7 +37,7 @@
 
 /* ---- options ---- */
 typedef struct {
-  const char *path, *backend, *hsaco, *host, *api_key, *mtp, *name, *effort;
+  const char *path, *backend, *hsaco, *host, *api_key, *mtp, *name, *effort, *dflash;
   int port, think, queue_max, cache, raw_think;
   uint32_t ctx, draft, chunk, top_k, max_body;
   float pmin, temp, top_p;
@@ -60,6 +60,7 @@ static void usage(void) {
           "  --ctx N             context: prompt + output tokens (default 8192)\n"
           "  --draft D           MTP drafts per step, 1 to 7 (GPU; default 0: off)\n"
           "  --draft-pmin P      (default 0.6)   --mtp FILE   the MTP head from FILE\n"
+          "  --dflash FILE       with --draft: also a DFlash 2 drafter (GGUF); each step uses the faster drafter\n"
           "  --chunk N           prompt chunk, 1 to 512 (GPU; default 256)\n"
           "  --temp T --top-k K --top-p P   defaults when a request does not set them (0.7, 20, 0.8)\n"
           "  --no-think          end the prompt with an empty <think></think> block (no reasoning text)\n"
@@ -72,7 +73,7 @@ static void usage(void) {
 }
 
 /* ---- the engine (only the engine thread uses these after the start) ---- */
-static gguf_file G, G2;
+static gguf_file G, G2, G3; /* G3: the DFlash drafter (open while serving: the selector reads its codebooks) */
 static model M;
 static graph GR;
 static backend *B;
@@ -414,6 +415,10 @@ static void *engine_main(void *arg) {
     const char *dh = getenv("IE_DRAFT_HEAD");
     if (!(dh && !strcmp(dh, "q8"))) model_make_draft_head(&M, &G);
   }
+  if (O.dflash) {
+    gguf_open(&G3, O.dflash);
+    if (!model_load_dflash(&M, &G3)) ie_die("%s is not a DFlash drafter", O.dflash);
+  }
   char err[256];
   if (!(TK = tok_open(&M, &G, err, sizeof err))) ie_die("tokenizer: %s", err);
   IM_START = tok_find(TK, "<|im_start|>"), IM_END = tok_find(TK, "<|im_end|>");
@@ -437,8 +442,8 @@ static void *engine_main(void *arg) {
   plan_arena(&GR, 1);
   B = gpu ? gpu_open(&M, &GR, O.hsaco) : cpu_open(&M, &GR);
   gen_init(&GC, B, &M, &GR);
-  fprintf(stderr, "model \"%s\": vocab %u, pre-tokenizer %s, context %u, drafts %u, stop tokens %lld %lld %lld\n", MODEL_ID, M.vocab,
-          tok_pre(TK), O.ctx, O.draft, (long long)STOP_IDS[0], (long long)STOP_IDS[1], (long long)STOP_IDS[2]);
+  fprintf(stderr, "model \"%s\": vocab %u, pre-tokenizer %s, context %u, drafts %u%s, stop tokens %lld %lld %lld\n", MODEL_ID, M.vocab,
+          tok_pre(TK), O.ctx, O.draft, M.df ? " (+ DFlash)" : "", (long long)STOP_IDS[0], (long long)STOP_IDS[1], (long long)STOP_IDS[2]);
 
   pthread_mutex_lock(&QM);
   IS_READY = 1;
@@ -704,6 +709,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--draft")) O.draft = (uint32_t)atoi(ARG);
     else if (!strcmp(a, "--draft-pmin")) O.pmin = (float)atof(ARG);
     else if (!strcmp(a, "--mtp")) O.mtp = ARG;
+    else if (!strcmp(a, "--dflash")) O.dflash = ARG;
     else if (!strcmp(a, "--chunk")) O.chunk = (uint32_t)atoi(ARG);
     else if (!strcmp(a, "--temp")) O.temp = (float)atof(ARG);
     else if (!strcmp(a, "--top-k")) O.top_k = (uint32_t)atoi(ARG);
@@ -730,6 +736,7 @@ int main(int argc, char **argv) {
   const int gpu = !strcmp(O.backend, "gpu");
   if (!gpu && strcmp(O.backend, "cpu")) usage();
   if (O.draft > 7 || (O.draft && !gpu)) ie_die("--draft: 1 to 7, GPU only");
+  if (O.dflash && !O.draft) ie_die("--dflash needs --draft");
   if (O.chunk < 1 || O.chunk > 512) ie_die("--chunk: 1 to 512");
   if (O.ctx < 16) ie_die("--ctx: at least 16");
   if (O.queue_max < 1) O.queue_max = 1;

@@ -18,8 +18,12 @@ make build/ie-serve build/ie_kernels.hsaco
 ## 2. 启动
 
 ```
-./build/ie-serve ~/models/q4/Qwen3.8-27B-Q4_K_M.gguf --host 127.0.0.1 --port 8000 --ctx 131072 --draft 3
+./build/ie-serve ~/models/q4/Qwen3.8-27B-Q4_K_M.gguf --host 127.0.0.1 --port 8000 --ctx 65536 --draft 7 \
+    --dflash ~/models/dflash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 ```
+
+起草器文件：`incoai/Qwen3.8-27B-DFlash2-GGUF` 的 `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`（1.1 GB）。
+注意：加了 `--dflash` 后，32 GB 显存里上下文最多 65536。要 131072 的上下文，请去掉 `--dflash`。
 
 服务先绑定端口，再加载模型。加载完成后，日志里有一行 `ie-serve: http://127.0.0.1:8000/v1`。
 
@@ -32,7 +36,8 @@ make build/ie-serve build/ie_kernels.hsaco
 | `--api-key KEY` | 无 | 请求必须带 `Authorization: Bearer KEY`。也可以用环境变量 `IE_API_KEY` |
 | `--name ID` | 模型文件的 `general.name` | `/v1/models` 返回的模型名。空白字符换成 `-`（Open WebUI 不接受带空格的模型名），例如 `Qwen3.8-27B` |
 | `--ctx N` | 8192 | 提示加输出的最多 token 数。KV 缓存按这个大小分配（见下面"上下文长度"） |
-| `--draft D` | 0 | MTP 草稿数（1 到 7，只在 GPU 上）。聊天时 3 最快（见 `claude/progress.md`） |
+| `--draft D` | 0 | MTP 草稿数（1 到 7，只在 GPU 上）。推荐 7（上下文起草和 DFlash 也用这个验证空间） |
+| `--dflash FILE` | 无 | 与 `--draft` 一起用：再加载 DFlash 2 起草器，每一步按实测速度选 DFlash 或 MTP（见 README“DFlash 2 起草器”） |
 | `--draft-pmin P`、`--mtp FILE` | 0.6、无 | 与 `ie-run` 相同 |
 | `--chunk N` | 256 | 预填充每块的 token 数（1 到 512） |
 | `--temp T`、`--top-k K`、`--top-p P` | 0.7、20、0.8 | 请求没有给出这些参数时使用 |

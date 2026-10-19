@@ -33,6 +33,9 @@ struct backend {
    * idx get n * K entries, per row value descending, equal values smaller
    * index first. Returns 0 (and does nothing) if K is too large. */
   int (*topk)(backend *b, int id, uint32_t r0, uint32_t n, uint32_t nv, uint32_t K, float *val, uint32_t *idx);
+  /* GPU: the most tokens of one verify run (the linear attention states
+   * kept: 8 or 16); 0 on the CPU */
+  uint32_t verify_max;
   /* The prompt cache (ie-serve). save = 1: copy the state that is not kept
    * per position (the linear attention state of the current slot and the
    * conv ring) and row 0 of buffer hbuf (-1: none; the MTP h input) to
