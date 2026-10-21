@@ -429,6 +429,12 @@ static void mk_join(void) {
                mk_ovl(&gj.w, &gi.r) || mk_ovl(&gj.w, &gi.b) || mk_ovl(&gj.w, &gi.s))
         ok = 0;
     }
+    static int jd = -1;
+    if (jd < 0) jd = getenv("IE_MK_JDEBUG") != NULL;
+    if (jd && mk.launches == 2) {
+      mk_rng gx;
+      fprintf(stderr, "join %u %s: %s (gemv %d, phase from %u)\n", i, kname[mk.kof[i]], ok ? "joined" : "barrier", mk_gemv_rng(i, &gx), ph);
+    }
     u32 f;
     memcpy(&f, c + 12, 4);
     f = (f & ~1u) | (ok ? 1u : 0u);
