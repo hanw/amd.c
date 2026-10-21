@@ -3952,9 +3952,9 @@ static inline float half_tree_f(float v) {
   v += I2F(shl_i(F2I(v), 1));
   return v;
 }
-/* One block (b) of row r of an expert matrix of the given kind against the
- * Q8 activations x: the term the row functions add for it (from acc = 0). */
-static inline float gexp_block(u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, u32 rows, u32 nb, u32 r, u32 b) {
+/* acc after block b of row r of an expert matrix of the given kind against
+ * the Q8 activations x, in the arithmetic and order of the row functions. */
+static inline float gexp_block(float acc, u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, u32 rows, u32 nb, u32 r, u32 b) {
 #pragma clang fp contract(off)
   const G u32 *aw = (const G u32 *)x;
   const float da = ((const G float *)(x + 32u * nb))[b];
@@ -3967,7 +3967,7 @@ static inline float gexp_block(u32 kind, const G u32 *qw, const G u16 *qs, const
     const u32 wq[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
     const Mem qm = {wq};
     const float sc = (float)((const G f16 *)qs)[ie_q8_dst_scale(r, b, nb)] * da;
-    return 0.0f + sc * (float)(int)ie_q8q8_block(qm, 0u, am, 0u);
+    return acc + sc * (float)(int)ie_q8q8_block(qm, 0u, am, 0u);
   }
   const u32x4 w4 = *(const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb));
   const u32 wq[4] = {w4.x, w4.y, w4.z, w4.w};
@@ -3979,21 +3979,21 @@ static inline float gexp_block(u32 kind, const G u32 *qw, const G u16 *qs, const
     const u32 sc = qs[ie_q6k_sc(r, b, nb)];
     const float dv = (float)((const G f16 *)qs)[ie_q6k_d(rows, r, b, nb)];
     const float s0 = dv * (float)(int)(signed char)(sc & 255u), s1 = dv * (float)(int)(signed char)(sc >> 8);
-    return __builtin_fmaf(__builtin_fmaf(s1, (float)d1, s0 * (float)d0), da, 0.0f);
+    return __builtin_fmaf(__builtin_fmaf(s1, (float)d1, s0 * (float)d0), da, acc);
   }
   const u32 sm = qs[ie_q4k_sm(r, b, nb)];
   const float dv = (float)((const G f16 *)qs)[ie_q4k_dd(rows, r, b, nb)];
   if (kind == 6u) { /* IQ4_XS */
     const int dq = (int)ie_iq4_dot(qm, 0u, am, 0u);
     const float sc = dv * (float)((int)(sm & 63u) - 32);
-    return __builtin_fmaf(sc * (float)dq, da, 0.0f);
+    return __builtin_fmaf(sc * (float)dq, da, acc);
   }
   /* Q4_K (3), Q5_K (5) */
   const int dq = kind == 5u ? (int)ie_q5k_dot(qm, 0u, qw[ie_q5k_hw(rows, r, b, nb)], am, 0u) : (int)ie_q4k_dot(qm, 0u, am, 0u);
   const float mv = (float)((const G f16 *)qs)[ie_q4k_dd(rows, r, b, nb) + 1u];
   const float sc = dv * (float)(sm & 63u), mm = mv * (float)(sm >> 8);
   const float xa = da * (float)(int)((const G u32 *)(x + 36u * nb))[b];
-  return __builtin_fmaf(-mm, xa, __builtin_fmaf(sc * (float)dq, da, 0.0f));
+  return __builtin_fmaf(-mm, xa, __builtin_fmaf(sc * (float)dq, da, acc));
 }
 
 /* nb <= 16 (the expert down matrices: 512 columns): two rows per wave, one
@@ -4002,19 +4002,42 @@ static inline float gexp_block(u32 kind, const G u32 *qw, const G u16 *qs, const
 static inline void gexp_half_rows(u32 g, u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, G float *y, u32 rows, u32 nb) {
   const u32 l = lane(), r = (g * 8u + (tid() >> 5)) * 2u + (l >> 4), b = l & 15u;
   float v = 0.0f;
-  if (r < rows && b < nb) v = gexp_block(kind, qw, qs, x, rows, nb, r, b);
+  if (r < rows && b < nb) v = gexp_block(0.0f, kind, qw, qs, x, rows, nb, r, b);
   v = half_tree_f(v);
   if ((l & 15u) == 0u && r < rows) y[r] = v;
 }
 
+/* 16 < nb <= 64 (the expert gate/up matrices: 2048 columns): two rows per
+ * wave (16 per workgroup), lane l the blocks l, l + 32 of both; each row's
+ * value as the row functions (the same terms, order and tree). */
+static inline void gexp_two_rows(u32 g, u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, G float *y, u32 rows, u32 nb) {
+  const u32 l = lane(), r0 = (g * 8u + (tid() >> 5)) * 2u;
+  if (r0 >= rows) return;
+  const u32 r1 = r0 + 1u < rows ? r0 + 1u : r0;
+  float a0 = 0.0f, a1 = 0.0f;
+  for (u32 t = 0; t < 2u; t++) {
+    const u32 b = ie_lane_blk(l, t);
+    if (b < nb) {
+      a0 = gexp_block(a0, kind, qw, qs, x, rows, nb, r0, b);
+      a1 = gexp_block(a1, kind, qw, qs, x, rows, nb, r1, b);
+    }
+  }
+  a0 = wave_tree_f(a0), a1 = wave_tree_f(a1);
+  if (l == 0u) {
+    y[r0] = a0;
+    if (r0 + 1u < rows) y[r0 + 1u] = a1;
+  }
+}
+
 KERNEL ie_gexp(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G u32 *route, u32 qwn,
-               u32 qsn, u32 astr, u32 bstr, u32 kind) {
+               u32 qsn, u32 astr, u32 bstr, u32 kind, u32 two_off) {
   const u32 s = tokid(), e = route[s];
   const G u32 *w = qw + (unsigned long)e * qwn;
   const G u16 *q = qs + (unsigned long)e * qsn;
   const G u8 *x = xq + (unsigned long)s * astr;
   G float *o = (G float *)((G u8 *)y + (unsigned long)s * bstr);
   if (nb <= 16u) gexp_half_rows(wgid(), kind, w, q, x, o, rows, nb);
+  else if (nb <= 64u && !two_off) gexp_two_rows(wgid(), kind, w, q, x, o, rows, nb);
   else if (kind == 2u) gemv_q8q8_rows(wgid(), w, (const G f16 *)q, x, o, rows, nb, 0, 0);
   else if (kind == 3u) gemv_q4kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
   else if (kind == 4u) gemv_q6kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);

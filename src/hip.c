@@ -1080,9 +1080,12 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           ie_die("expert GEMV: kind %d has no GPU kernel", w->kind);
         u32 rows = w->rows, nb = w->nb, as = o->astr, bs = o->bstr, kind = (u32)w->kind;
         u32 qwn = (u32)mat_qw_words(w->kind, w->rows, w->cols), qsn = (u32)mat_qs_n(w->kind, w->rows, w->cols);
-        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &C, &qwn, &qsn, &as, &bs, &kind};
-        /* nb <= 16: two rows per wave, 16 per workgroup (ie_gexp) */
-        const unsigned gx = nb <= 16u ? (rows + 15u) / 16u : gemv_groups(rows);
+        static int two_env = -1; /* IE_GEXP_TWO=0: the gate/up experts one row per wave (as the other GEMVs) */
+        if (two_env < 0) two_env = !(getenv("IE_GEXP_TWO") && getenv("IE_GEXP_TWO")[0] == '0');
+        u32 two_off = !two_env;
+        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &C, &qwn, &qsn, &as, &bs, &kind, &two_off};
+        /* nb <= 64: two rows per wave, 16 per workgroup (ie_gexp) */
+        const unsigned gx = nb <= 16u || (nb <= 64u && !two_off) ? (rows + 15u) / 16u : gemv_groups(rows);
         launch_t(b, K_GEXP, gx, o->nh, args);
         break;
       }
