@@ -15,6 +15,7 @@ import sys
 import numpy as np
 
 GGML_F32, GGML_F16, GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_BF16 = 0, 1, 2, 8, 12, 13, 14, 30
+GGML_IQ3_S, GGML_IQ4_XS = 21, 23
 T_U32, T_I32, T_F32, T_BOOL, T_STR, T_ARR, T_U64, T_F64 = 4, 5, 6, 7, 8, 9, 10, 12
 ALIGN = 32
 
@@ -109,6 +110,29 @@ def kq(rng, rows, cols, scale, typ):
     b[:, 0:2] = np.full(nsb, scale / q / 63.0 * 4, np.float16).view(np.uint8).reshape(nsb, 2)
     b[:, 2:4] = np.full(nsb, scale / 63.0 * 2, np.float16).view(np.uint8).reshape(nsb, 2)
     return b.tobytes()
+
+
+def iq(rng, rows, cols, scale, typ):
+    """Random IQ4_XS / IQ3_S matrix (cols % 256 == 0): random bytes, small f16 d."""
+    nsb = rows * cols // 256
+    if typ == GGML_IQ4_XS:  # d, scales_h, scales_l[4], qs[128]; weight = d (ls - 32) kv[q], |.| <= 32 * 127 d
+        b = rng.integers(0, 256, size=(nsb, 136), dtype=np.uint8)
+        b[:, 0:2] = np.full(nsb, scale / 4064.0 * 4, np.float16).view(np.uint8).reshape(nsb, 2)
+        return b.tobytes()
+    # IQ3_S: d, qs[64], qh[8], signs[32], scales[4]; weight = d (1 + 2 s) grid sign, |.| <= 31 * 15 d
+    b = rng.integers(0, 256, size=(nsb, 110), dtype=np.uint8)
+    b[:, 0:2] = np.full(nsb, scale / 465.0 * 3, np.float16).view(np.uint8).reshape(nsb, 2)
+    return b.tobytes()
+
+
+def anyq(rng, rows, cols, scale, typ):
+    if typ == GGML_Q8_0:
+        return q8_0(rng, rows, cols, scale)
+    if typ in (GGML_Q4_K, GGML_Q5_K, GGML_Q6_K):
+        return kq(rng, rows, cols, scale, typ)
+    if typ in (GGML_IQ4_XS, GGML_IQ3_S):
+        return iq(rng, rows, cols, scale, typ)
+    raise ValueError(typ)
 
 
 def f32(a):
@@ -249,6 +273,74 @@ def make_k(path, seed, n_layer=2, dim=512, ffn=1536, n_head=8, n_kv=4, vocab=301
     print("wrote", path)
 
 
+def make_flint(path, seed, dim=256, n_head=4, n_kv=2, hd=96, ffn=512, n_exp=8, n_used=3, eff=256, sff=512, vocab=300, ctx=64, win=4,
+               swp=None, types=None, n_dense=2):
+    """flint (Recursive): QK norm, learned sinks, sliding window (win) layers
+    with RoPE and full layers without, 2 dense layers, then sigmoid top-k MoE
+    with a shared expert. Every tensor type of the UD-Q4_K_XL file: Q8_0,
+    Q5_K, IQ4_XS, IQ3_S, Q4_K, Q6_K, BF16 (router); layer 4: gate and up
+    experts of different types and a router bias."""
+    rng = np.random.default_rng(seed)
+    a = "flint"
+    swp = swp or [False, False, True, True, False]
+    n_layer = len(swp)
+    kvs = [("general.architecture", T_STR, a), ("general.name", T_STR, "tiny-flint"), ("general.alignment", T_U32, ALIGN),
+           (a + ".block_count", T_U32, n_layer), (a + ".context_length", T_U32, ctx), (a + ".embedding_length", T_U32, dim),
+           (a + ".feed_forward_length", T_U32, ffn), (a + ".attention.head_count", T_U32, n_head),
+           (a + ".attention.head_count_kv", T_U32, n_kv), (a + ".rope.freq_base", T_F32, 10000.0),
+           (a + ".attention.layer_norm_rms_epsilon", T_F32, 1e-6), (a + ".expert_count", T_U32, n_exp),
+           (a + ".expert_used_count", T_U32, n_used), (a + ".expert_gating_func", T_U32, 2),
+           (a + ".attention.key_length", T_U32, hd), (a + ".attention.value_length", T_U32, hd),
+           (a + ".expert_feed_forward_length", T_U32, eff), (a + ".expert_shared_feed_forward_length", T_U32, sff),
+           (a + ".leading_dense_block_count", T_U32, n_dense), (a + ".expert_shared_count", T_U32, 2),
+           (a + ".expert_weights_norm", T_BOOL, True), (a + ".expert_weights_scale", T_F32, 1.0),
+           (a + ".attention.sliding_window", T_U32, win),
+           (a + ".attention.sliding_window_pattern", T_ARR, (T_BOOL, swp)),
+           (a + ".attention.rope_pattern", T_ARR, (T_BOOL, swp)),
+           ("tokenizer.ggml.model", T_STR, "gpt2"), ("tokenizer.ggml.tokens", T_ARR, (T_STR, gpt2_vocab(vocab))),
+           ("tokenizer.ggml.token_type", T_ARR, (T_I32, [1] * vocab)), ("tokenizer.ggml.merges", T_ARR, (T_STR, ["Ġ t", "h e"]))]
+    qd, kvd = n_head * hd, n_kv * hd
+    sc = lambda k: 0.5 / np.sqrt(k)
+    Q8, Q5, I4, I3, Q4K, Q6 = GGML_Q8_0, GGML_Q5_K, GGML_IQ4_XS, GGML_IQ3_S, GGML_Q4_K, GGML_Q6_K
+    # per layer: q, k, v, o, then dense (gate, up, down) or moe (gate_exps, up_exps, down_exps, gate_sh, up_sh, down_sh)
+    types = types or [(Q8, Q5, Q8, Q8, I4, I4, Q5),
+             (Q8, Q8, Q8, Q8, Q8, Q8, Q8),
+             (Q5, Q8, Q5, Q8, I4, I4, Q5, Q8, Q8, Q5),
+             (Q8, Q8, Q8, Q8, I3, I3, Q6, I4, I4, I4),
+             (Q8, Q8, Q8, Q8, Q4K, Q8, Q8, Q5, Q5, Q8)]
+    T = [("token_embd.weight", [dim, vocab], Q8, q8_0(rng, vocab, dim, 16.0))]
+    for l in range(n_layer):
+        p = "blk.%d." % l
+        t = types[l]
+        T.append((p + "attn_norm.weight", [dim], GGML_F32, f32(1 + 0.1 * rng.standard_normal(dim))))
+        T.append((p + "attn_q_norm.weight", [hd], GGML_F32, f32(1 + 0.1 * rng.standard_normal(hd))))
+        T.append((p + "attn_k_norm.weight", [hd], GGML_F32, f32(1 + 0.1 * rng.standard_normal(hd))))
+        T.append((p + "attn_sinks.weight", [n_head], GGML_F32, f32(rng.uniform(-1, 3, n_head))))
+        T.append((p + "attn_q.weight", [dim, qd], t[0], anyq(rng, qd, dim, sc(dim), t[0])))
+        T.append((p + "attn_k.weight", [dim, kvd], t[1], anyq(rng, kvd, dim, sc(dim), t[1])))
+        T.append((p + "attn_v.weight", [dim, kvd], t[2], anyq(rng, kvd, dim, sc(dim), t[2])))
+        T.append((p + "attn_output.weight", [qd, dim], t[3], anyq(rng, dim, qd, sc(qd), t[3])))
+        T.append((p + "ffn_norm.weight", [dim], GGML_F32, f32(1 + 0.1 * rng.standard_normal(dim))))
+        if l < n_dense:
+            T.append((p + "ffn_gate.weight", [dim, ffn], t[4], anyq(rng, ffn, dim, sc(dim), t[4])))
+            T.append((p + "ffn_up.weight", [dim, ffn], t[5], anyq(rng, ffn, dim, sc(dim), t[5])))
+            T.append((p + "ffn_down.weight", [ffn, dim], t[6], anyq(rng, dim, ffn, sc(ffn), t[6])))
+            continue
+        T.append((p + "ffn_gate_inp.weight", [dim, n_exp], GGML_BF16, bf16(3.0 / np.sqrt(dim) * rng.standard_normal((n_exp, dim)))))
+        if l == 4:
+            T.append((p + "exp_probs_b.bias", [n_exp], GGML_F32, f32(0.2 * rng.standard_normal(n_exp))))
+        T.append((p + "ffn_gate_exps.weight", [dim, eff, n_exp], t[4], anyq(rng, n_exp * eff, dim, sc(dim), t[4])))
+        T.append((p + "ffn_up_exps.weight", [dim, eff, n_exp], t[5], anyq(rng, n_exp * eff, dim, sc(dim), t[5])))
+        T.append((p + "ffn_down_exps.weight", [eff, dim, n_exp], t[6], anyq(rng, n_exp * dim, eff, sc(eff), t[6])))
+        T.append((p + "ffn_gate_shexp.weight", [dim, sff], t[7], anyq(rng, sff, dim, sc(dim), t[7])))
+        T.append((p + "ffn_up_shexp.weight", [dim, sff], t[8], anyq(rng, sff, dim, sc(dim), t[8])))
+        T.append((p + "ffn_down_shexp.weight", [sff, dim], t[9], anyq(rng, dim, sff, sc(sff), t[9])))
+    T.append(("output_norm.weight", [dim], GGML_F32, f32(1 + 0.1 * rng.standard_normal(dim))))
+    T.append(("output.weight", [dim, vocab], Q8, q8_0(rng, vocab, dim, 4 * sc(dim))))
+    write_gguf(path, kvs, T)
+    print("wrote", path)
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "build"
     make(out + "/tiny-qwen2.gguf", "qwen2", 1, n_layer=2, dim=96, ffn=352, n_head=6, n_kv=2, vocab=300, ctx=256,
@@ -256,6 +348,7 @@ def main():
     make(out + "/tiny-llama.gguf", "llama", 2, n_layer=2, dim=1152, ffn=1376, n_head=8, n_kv=4, vocab=301, ctx=256,
          biases=False, tied=False, embd_type=GGML_F16, q8_layer_v=1)
     make_k(out + "/tiny-llama-k.gguf", 4)
+    make_flint(out + "/tiny-flint.gguf", 5)
 
 
 if __name__ == "__main__":

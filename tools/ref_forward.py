@@ -31,7 +31,7 @@ import sys
 import numpy as np
 from gguf import GGUFReader
 
-Q4_0, Q8_0, F16, F32, Q4_K, Q5_K, Q6_K = 2, 8, 1, 0, 12, 13, 14
+Q4_0, Q8_0, F16, F32, Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_XS = 2, 8, 1, 0, 12, 13, 14, 21, 23
 
 
 def field(r, key, default=None):
@@ -61,7 +61,7 @@ def dequant(t):
         b = raw.reshape(-1, 34)
         d = b[:, :2].copy().view(np.float16).astype(np.float64)
         a = (d * b[:, 2:].view(np.int8).astype(np.float64)).reshape(-1)
-    elif tt in (Q4_K, Q5_K, Q6_K):
+    elif tt in (Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_XS):
         # the gguf package's own dequantizer (independent of the engine)
         from gguf.quants import dequantize
         from gguf import GGMLQuantizationType
@@ -76,8 +76,42 @@ def dequant(t):
     return a.reshape(rows, cols)
 
 
+def requant_q8(w):
+    """ggml's quantize_row_q8_0 of the rows of w (as the engine at load):
+    d = amax/127 in float32, stored as f16; q = round half away from zero of x * (1/d)."""
+    rows, cols = w.shape
+    nb = cols // 32
+    x = w.astype(np.float32).reshape(rows, nb, 32)
+    amax = np.abs(x).max(axis=2)
+    d = (amax / np.float32(127.0)).astype(np.float32)
+    idv = np.where(d == 0, np.float32(0), np.float32(1) / np.where(d == 0, np.float32(1), d)).astype(np.float32)
+    r = (x * idv[:, :, None]).astype(np.float32)
+    q = (np.sign(r) * np.floor(np.abs(r) + np.float32(0.5))).astype(np.int64)
+    return d.astype(np.float16).astype(np.float64), q
+
+
+class Raw:
+    """A slice of a dequantized tensor with the attributes Mat sets."""
+    pass
+
+
+def experts(t, n_exp, native_q5k):
+    """3-D expert tensor (GGUF ne = [cols, rows, n_exp]) -> list of Mat-like objects."""
+    m = Mat(t, native_q5k)
+    rows = m.w.shape[0] // n_exp
+    out = []
+    for e in range(n_exp):
+        x = Raw()
+        x.w = m.w[e * rows:(e + 1) * rows]
+        x.qint = m.qint
+        if m.qint:
+            x.q, x.d = m.q[e * rows:(e + 1) * rows], m.d[e * rows:(e + 1) * rows]
+        out.append(x)
+    return out
+
+
 class Mat:
-    def __init__(self, t):
+    def __init__(self, t, native_q5k=False):
         self.w = dequant(t)
         tt = int(t.tensor_type)
         # keep the integer form for the q8 mode (the engine's integer paths)
@@ -89,13 +123,13 @@ class Mat:
             self.d = raw[:, :2].copy().view(np.float16).astype(np.float64).reshape(rows, nb)
             q = np.concatenate([raw[:, 2:] & 15, raw[:, 2:] >> 4], axis=1).astype(np.int64) - 8
             self.q = q.reshape(rows, nb, 32)
-        elif tt in (Q4_K, Q6_K) and t.name != "token_embd.weight":
+        elif (tt in (Q4_K, Q6_K, IQ4_XS) or (tt == Q5_K and native_q5k)) and t.name != "token_embd.weight":
             # the engine keeps Q4_K (exact weights): q8 mode multiplies the
             # exact weights by the quantized activations
             self.q = self.w.reshape(rows, nb, 32)
             self.d = np.ones((rows, nb))
             self.qint = True
-        elif tt in (Q5_K, Q6_K):
+        elif tt in (Q5_K, Q6_K, IQ3_S):
             # the engine requantizes Q5_K (and a Q6_K embedding) to Q8_0 at load (ggml's
             # quantize_row_q8_0: d = amax/127 in float32, stored as f16;
             # q = round half away from zero of x * (1/d)); in q8 mode the
@@ -166,8 +200,10 @@ class Model:
         self.eps = field(r, a + ".attention.layer_norm_rms_epsilon", 1e-5)
         self.base = field(r, a + ".rope.freq_base", 10000.0)
         self.hd = self.dim // self.n_head
-        self.neox = a == "qwen2"
+        self.neox = a in ("qwen2", "flint")
         T = {t.name: t for t in r.tensors}
+        if a == "flint":
+            return self.load_flint(r, T)
         self.tok = dequant(T["token_embd.weight"])
         self.out = Mat(T["output.weight"] if "output.weight" in T else T["token_embd.weight"])
         self.out_norm = dequant(T["output_norm.weight"]).reshape(-1)
@@ -186,7 +222,98 @@ class Model:
         self.kc = [[] for _ in range(self.n_layer)]
         self.vc = [[] for _ in range(self.n_layer)]
 
+    def load_flint(self, r, T):
+        a = self.arch
+        self.flint = True
+        self.hd = field(r, a + ".attention.key_length")
+        self.n_exp = field(r, a + ".expert_count")
+        self.n_used = field(r, a + ".expert_used_count")
+        self.escale = field(r, a + ".expert_weights_scale", 1.0)
+        win = field(r, a + ".attention.sliding_window")
+        swp = [bool(r.get_field(a + ".attention.sliding_window_pattern").parts[i][0])
+               for i in r.get_field(a + ".attention.sliding_window_pattern").data]
+        rpp = [bool(r.get_field(a + ".attention.rope_pattern").parts[i][0]) for i in r.get_field(a + ".attention.rope_pattern").data]
+        self.tok = dequant(T["token_embd.weight"])
+        self.out = Mat(T["output.weight"], True)
+        self.out_norm = dequant(T["output_norm.weight"]).reshape(-1)
+        self.L = []
+        for l in range(self.n_layer):
+            p = "blk.%d." % l
+            g = lambda n: T.get(p + n)
+            L = {k: Mat(g(k + ".weight"), True) for k in ["attn_q", "attn_k", "attn_v", "attn_output"]}
+            for k in ["attn_norm", "ffn_norm", "attn_q_norm", "attn_k_norm", "attn_sinks"]:
+                L[k] = dequant(g(k + ".weight")).reshape(-1)
+            L["win"] = win if swp[l] else 0
+            L["rope"] = rpp[l]
+            if g("ffn_gate_inp.weight") is None:
+                for k in ["ffn_gate", "ffn_up", "ffn_down"]:
+                    L[k] = Mat(g(k + ".weight"), True)
+            else:
+                L["router"] = dequant(g("ffn_gate_inp.weight"))
+                b = g("exp_probs_b.bias")
+                L["ebias"] = dequant(b).reshape(-1) if b is not None else np.zeros(self.n_exp)
+                for k in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]:
+                    L[k] = experts(g(k + ".weight"), self.n_exp, True)
+                for k in ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"]:
+                    L[k] = Mat(g(k + ".weight"), True)
+            self.L.append(L)
+        self.kc = [[] for _ in range(self.n_layer)]
+        self.vc = [[] for _ in range(self.n_layer)]
+        self.min_gap = np.inf  # the smallest gap at the top-k boundary (routing near-ties)
+
+    def step_flint(self, tok, pos, mode):
+        hd, nh, nkv = self.hd, self.n_head, self.n_kv
+        x = self.tok[tok].copy()
+        for l, L in enumerate(self.L):
+            h = rmsnorm(x, L["attn_norm"], self.eps)
+            q = matvec(L["attn_q"], h, mode).reshape(nh, hd)
+            k = matvec(L["attn_k"], h, mode).reshape(nkv, hd)
+            v = matvec(L["attn_v"], h, mode).reshape(nkv, hd)
+            q = np.stack([rmsnorm(q[i], L["attn_q_norm"], self.eps) for i in range(nh)])
+            k = np.stack([rmsnorm(k[i], L["attn_k_norm"], self.eps) for i in range(nkv)])
+            if L["rope"]:
+                q = rope(q.reshape(-1), nh, hd, pos, self.base, True).reshape(nh, hd)
+                k = rope(k.reshape(-1), nkv, hd, pos, self.base, True).reshape(nkv, hd)
+            self.kc[l].append(k)
+            self.vc[l].append(v)
+            K, V = np.stack(self.kc[l]), np.stack(self.vc[l])
+            if L["win"]:
+                K, V = K[-L["win"]:], V[-L["win"]:]
+            grp = nh // nkv
+            att = np.zeros((nh, hd))
+            for hh in range(nh):
+                s = K[:, hh // grp, :] @ q[hh] / np.sqrt(hd)
+                sink = L["attn_sinks"][hh]
+                mx = max(s.max(), sink)
+                e = np.exp(s - mx)
+                att[hh] = (e @ V[:, hh // grp, :]) / (e.sum() + np.exp(sink - mx))
+            x = x + matvec(L["attn_output"], att.reshape(-1), mode)
+            h = rmsnorm(x, L["ffn_norm"], self.eps)
+            if "router" not in L:
+                g = matvec(L["ffn_gate"], h, mode)
+                u = matvec(L["ffn_up"], h, mode)
+                x = x + matvec(L["ffn_down"], g / (1 + np.exp(-g)) * u, mode)
+                continue
+            sg = 1 / (1 + np.exp(-(L["router"] @ h)))
+            c = sg + L["ebias"]
+            order = sorted(range(self.n_exp), key=lambda e: (-c[e], e))
+            sel = order[:self.n_used]
+            self.min_gap = min(self.min_gap, c[order[self.n_used - 1]] - c[order[self.n_used]])
+            w = sg[sel] / (sg[sel].sum() + 1e-20) * self.escale
+            g = matvec(L["ffn_gate_shexp"], h, mode)
+            u = matvec(L["ffn_up_shexp"], h, mode)
+            y = matvec(L["ffn_down_shexp"], g / (1 + np.exp(-g)) * u, mode)
+            for wk, e in zip(w, sel):
+                g = matvec(L["ffn_gate_exps"][e], h, mode)
+                u = matvec(L["ffn_up_exps"][e], h, mode)
+                y = y + wk * matvec(L["ffn_down_exps"][e], g / (1 + np.exp(-g)) * u, mode)
+            x = x + y
+        h = rmsnorm(x, self.out_norm, self.eps)
+        return matvec(self.out, h, mode)
+
     def step(self, tok, pos, mode):
+        if getattr(self, "flint", False):
+            return self.step_flint(tok, pos, mode)
         hd, nh, nkv = self.hd, self.n_head, self.n_kv
         x = self.tok[tok].copy()
         for l, L in enumerate(self.L):
@@ -283,6 +410,8 @@ def main():
           "greedy tokens %s -> %s" % (a.model.split("/")[-1], a.mode, len(rows), worst_abs, worst_rel, a.tol, med,
                                      a.tol_median, "identical" if tok_ok else "DIFFER", "PASS" if ok else "FAIL"))
     print("  per position rel err: " + " ".join("%.1e" % r for r in rels))
+    if getattr(m, "flint", False):
+        print("  routing: smallest top-k boundary gap %.3g (a near-tie can choose another expert)" % m.min_gap)
     sys.exit(0 if ok else 1)
 
 

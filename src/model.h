@@ -8,11 +8,11 @@
 
 #include "gguf.h"
 
-enum { ARCH_LLAMA = 0, ARCH_QWEN2 = 1, ARCH_QWEN35 = 2 };
+enum { ARCH_LLAMA = 0, ARCH_QWEN2 = 1, ARCH_QWEN35 = 2, ARCH_FLINT = 3 };
 enum { ROPE_NORM = 0, ROPE_NEOX = 1 }; /* NORM: pairs (2i, 2i+1); NEOX: (i, i + hd/2) */
 
 /* A weight matrix: rows x cols, y = W x. */
-enum { MAT_Q4 = 0, MAT_F32 = 1, MAT_Q8 = 2, MAT_Q4K = 3, MAT_Q6K = 4 };
+enum { MAT_Q4 = 0, MAT_F32 = 1, MAT_Q8 = 2, MAT_Q4K = 3, MAT_Q6K = 4, MAT_Q5K = 5, MAT_IQ4XS = 6 };
 typedef struct {
   int kind;
   uint32_t rows, cols, nb; /* nb = cols / 32 (Q4 and Q8) */
@@ -30,8 +30,13 @@ typedef struct {
   /* MAT_Q6K (GGUF Q6_K): qw = the low 4 bits as MAT_Q4 nibble words, then
    * 2 words of high bits per sub-block (ie_q6k_hw); qs = (sc0 | sc1 << 8)
    * (int8) per sub-block, then f16 d per super-block (ie_q6k_sc, ie_q6k_d). */
+  /* MAT_Q5K, MAT_IQ4XS: core/ie_ext.h. */
   /* MAT_F32: rows*cols floats (dequantized from F32/F16, or Q8_0 for the embedding). */
   float *f;
+  /* Experts (flint MoE): n_exp > 1 matrices of rows x cols, one after the
+   * other in qw, qs (or f); expert e starts at e * mat_qw_words(), e *
+   * mat_qs_n() (or e * rows * cols floats). n_exp 0 or 1: one matrix. */
+  uint32_t n_exp;
   /* Streaming load (ie_mat_sink set): the device copies of qw and qs (or
    * f in d0); the host arrays are then freed (NULL). */
   void *d0, *d1;
@@ -65,6 +70,16 @@ typedef struct {
   vec q_norm, k_norm;
   mat wlqkv, wz, wbeta, walpha, win;
   vec conv, dt_bias, ssm_a, ssm_norm;
+  /* flint: win = sliding window (tokens, the current one included; 0: full
+   * attention), norope = no RoPE in this layer, sinks = the learned logit
+   * per head added to the softmax denominator. moe: wr = router (n_exp rows,
+   * f32), egu = [gate_e; up_e] per expert (or eg, eu when their kinds
+   * differ), ed = down per expert, ebias = the router bias (selection only;
+   * n == 0: none); the shared expert is wgate, wup, wdown (wgu). */
+  uint32_t swin;
+  int norope, moe;
+  vec sinks, ebias;
+  mat wr, egu, eg, eu, ed;
 } layer;
 
 /* DFlash 2 drafter (z-lab/dflash, a separate GGUF, architecture "dflash"):
@@ -99,6 +114,10 @@ typedef struct {
   /* qwen35 linear attention: key heads, value heads, head dim (keys and
    * values), conv window; conv_dim = 2 * n_kh * sd + n_vh * sd. */
   uint32_t n_kh, n_vh, sd, d_conv, conv_dim;
+  /* flint MoE: experts, experts per token, expert FFN, shared expert FFN;
+   * the routing weights are normalized and scaled by escale */
+  uint32_t n_exp, n_used, eff, sff;
+  float escale;
   mat tok;   /* token_embd (Q4 repacked or F32), rows = vocab, cols = dim */
   mat out;   /* output; may share the arrays of tok (tied) */
   int tied;
@@ -146,6 +165,9 @@ void model_load(model *m, gguf_file *g);
 void model_free(model *m);
 /* Repack GGUF Q4_0 bytes (w->rows, w->cols, w->nb set) into w->qw, w->qs. */
 void repack_q4(mat *w, const uint8_t *src);
+/* A matrix of rows x cols from GGUF bytes of type ttype, as model_load
+ * makes it (Q8_0 kept as Q8; K and IQ kinds native where supported). */
+void model_mat_from_gguf(mat *w, uint32_t ttype, const uint8_t *src, uint32_t rows, uint32_t cols);
 /* Repack GGUF Q8_0 bytes into w->qw, w->qs (the verified Q8_0 layout). */
 void repack_q8(mat *w, const uint8_t *src);
 /* The text of token id t (malloc'ed, decoded bytes; *len set). */
@@ -191,6 +213,21 @@ enum {
   /* DFlash: b = attention(q = a) over the drafter KV cache of layer: query
    * at pos + t sees the positions within the window up to pos + T - 1 */
   OP_DF_ATTN,
+  OP_GEMV_Q5K,   /* b = W a, MAT_Q5K (a is a Q8 buffer) */
+  OP_GEMV_IQ4XS, /* b = W a, MAT_IQ4XS */
+  /* flint MoE. ROUTE: b = [nh expert ids (u32) | nh weights (f32)] from the
+   * router logits a (n experts): sigmoid, top nh by sigmoid + bias (v, or
+   * none), weights = sigmoid / sum * m->escale. */
+  OP_MOE_ROUTE,
+  /* b + s bstr = W_e (a + s astr) for slot s < nh, e = expert id s of the
+   * route buffer c (astr 0: one input for all slots); w->kind: Q8, Q4K, Q5K,
+   * Q6K, IQ4XS (a is Q8) or F32 */
+  OP_GEMV_EXP,
+  /* per slot s < nh: g = a + s astr (floats [gate n | up n]): g = silu(g) * up;
+   * the Q8 copy of slot s at qo + s q8_bytes(n / 32) */
+  OP_MOE_SWIGLU,
+  /* b = res + sum over slots s of weight_s (a + s n floats) (c: the route) */
+  OP_MOE_SUM,
 };
 
 typedef struct {
@@ -219,6 +256,13 @@ typedef struct {
    * gtoff / 4 + h * gstride of buffer gt (qwen35). */
   int gt;
   uint32_t gtoff, gstride;
+  /* QKN_ROPE_KV: qstr = floats from one q head to the next (qwen35: 2 hd,
+   * flint: hd), norope: no RoPE. ATTN: win (0: all positions), sk = the
+   * sinks (NULL: none). GEMV_EXP, MOE_SWIGLU: astr, bstr = byte strides of
+   * the slots. */
+  uint32_t qstr, win, astr, bstr;
+  int norope;
+  const vec *sk;
 } op;
 
 /* Activation buffers. Each has a size in bytes and, after planning, an
@@ -278,6 +322,11 @@ typedef struct {
   uint32_t n_mtp, i_dfc, i_dfb;
   int df_feat, df_logits, df_sel;
   float *rope_cos, *rope_sin; /* [n_ctx][n_rot/2] */
+  /* The KV cache of attention layer i (kvi): kv_len[i] positions (position
+   * p in slot p % kv_len[i]; n_ctx, or a ring for a sliding window layer)
+   * from entry kv_off[i] (in units of n_kv * hd values); kv_total entries */
+  uint32_t *kv_len;
+  uint64_t *kv_off, kv_total;
   uint64_t weight_bytes_per_token;
 } graph;
 
@@ -285,6 +334,14 @@ typedef struct {
  * the DFlash ops when m->df is set). */
 void graph_build(graph *gr, const model *m, uint32_t n_ctx, uint32_t T, int mtp);
 void graph_free(graph *gr);
+/* The ring of a sliding window layer: the smallest power of two >= win + IE_KV_SLACK
+ * (room for the tokens of one verify run), at most n_ctx. */
+#define IE_KV_SLACK 16u
+/* u32 words of qw and u16 entries of qs of one rows x cols matrix (one expert). */
+uint64_t mat_qw_words(int kind, uint32_t rows, uint32_t cols);
+uint64_t mat_qs_n(int kind, uint32_t rows, uint32_t cols);
+/* Expert e of w as a matrix of its own (the arrays point into w's). */
+mat mat_expert(const mat *w, uint32_t e);
 
 /* plan.c: give each buffer an arena offset; checks with ie_plan_check and
  * exits if the check fails. */

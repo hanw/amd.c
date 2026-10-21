@@ -18,7 +18,7 @@ GPU_CFLAGS = -x c -std=c11 -Wall -Wextra --target=amdgcn-amd-amdhsa -mcpu=$(GPU_
 B = build
 ENGINE_SRC = src/common.c src/gguf.c src/model.c src/plan.c src/cpu.c src/hip.c src/gen.c prof/sm_profiler.c
 SRC = $(ENGINE_SRC) src/main.c
-HDR = src/common.h src/gguf.h src/model.h src/backend.h src/gen.h core/ie_core.h $(B)/ie_mk_gen.h prof/sm_profiler.h
+HDR = src/common.h src/gguf.h src/model.h src/backend.h src/gen.h core/ie_core.h core/ie_ext.h src/iq3s_grid.h $(B)/ie_mk_gen.h prof/sm_profiler.h
 CFLAGS += -I$(B)
 
 all: $(B)/ie-run $(B)/ie-serve $(B)/smp_demo $(B)/smp_demo.hsaco $(B)/ie_kernels.hsaco $(B)/ie_mk.hsaco $(B)/ie_mk_mtp.hsaco
@@ -97,16 +97,20 @@ $(B)/laws_test: tests/laws_test.cpp laws/ie_laws.cpp core/ie_core.h core/lean_me
 TEST_SRC = src/common.c src/gguf.c src/model.c src/cpu.c
 $(B)/kernel_test: tests/kernel_test.c $(TEST_SRC) $(HDR) | $(B)
 	$(CC) $(CFLAGS) -o $@ tests/kernel_test.c $(TEST_SRC) $(LDLIBS)
+$(B)/ext_test: tests/ext_test.c core/ie_ext.h $(TEST_SRC) $(HDR) | $(B)
+	$(CC) $(CFLAGS) -o $@ tests/ext_test.c $(TEST_SRC) $(LDLIBS)
 
-MODELS = $(B)/tiny-qwen2.gguf $(B)/tiny-llama.gguf $(B)/tiny-llama-k.gguf
+MODELS = $(B)/tiny-qwen2.gguf $(B)/tiny-llama.gguf $(B)/tiny-llama-k.gguf $(B)/tiny-flint.gguf
 $(MODELS) &: tools/make_tiny_gguf.py | $(B)
 	$(PYTHON) tools/make_tiny_gguf.py $(B)
 
-test: all $(B)/laws_test $(B)/kernel_test $(B)/cache_check $(MODELS)
+test: all $(B)/laws_test $(B)/kernel_test $(B)/ext_test $(B)/cache_check $(MODELS)
 	@echo "== laws_test (the laws of laws/ie_laws.cpp on random inputs)"
 	./$(B)/laws_test
 	@echo "== kernel_test (CPU GEMV vs plain dot products, repack vs GGUF)"
 	./$(B)/kernel_test
+	@echo "== ext_test (Q5_K, IQ4_XS: core/ie_ext.h, tested, not proved)"
+	./$(B)/ext_test
 	@echo "== tiny qwen2: CPU backend vs numpy reference"
 	./$(B)/ie-run $(B)/tiny-qwen2.gguf --tokens 5,200,17,42,299,256 --n 10 --dump-logits $(B)/qwen2.logits
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-qwen2.gguf $(B)/qwen2.logits --mode q8 --tol-median 1e-5 --tol 2e-3
@@ -119,6 +123,11 @@ test: all $(B)/laws_test $(B)/kernel_test $(B)/cache_check $(MODELS)
 	./$(B)/ie-run $(B)/tiny-llama-k.gguf --tokens 1,300,77,259,3 --n 10 --dump-logits $(B)/llamak.logits
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-llama-k.gguf $(B)/llamak.logits --mode q8 --tol-median 1e-5 --tol 2e-3
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-llama-k.gguf $(B)/llamak.logits --mode float --tol 5e-2
+	@echo "== tiny flint (MoE, sinks, sliding window ring, Q5_K, IQ4_XS, IQ3_S): CPU backend vs numpy reference"
+	@echo "   (5 layers: a rounding-boundary flip of one Q8 activation stays in the KV cache, so a looser q8 median)"
+	./$(B)/ie-run $(B)/tiny-flint.gguf --tokens 5,200,17,42,299,256 --n 30 --dump-logits $(B)/flint.logits
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-flint.gguf $(B)/flint.logits --mode q8 --tol-median 1e-4 --tol 5e-3
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-flint.gguf $(B)/flint.logits --mode float --tol 5e-2
 	@echo "== prompt cache (gen_run): with and without the cache, the same answers (CPU)"
 	./$(B)/cache_check $(B)/tiny-qwen2.gguf
 	./$(B)/cache_check $(B)/tiny-llama-k.gguf

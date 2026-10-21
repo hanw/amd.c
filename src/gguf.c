@@ -110,6 +110,8 @@ uint64_t ggml_nbytes(uint32_t type, uint64_t n) {
     case GGML_Q4_K: return n % 256 ? 0 : n / 256 * 144;
     case GGML_Q5_K: return n % 256 ? 0 : n / 256 * 176;
     case GGML_Q6_K: return n % 256 ? 0 : n / 256 * 210;
+    case GGML_IQ3_S: return n % 256 ? 0 : n / 256 * 110;
+    case GGML_IQ4_XS: return n % 256 ? 0 : n / 256 * 136;
     default: return 0;
   }
 }
@@ -124,6 +126,8 @@ const char *ggml_type_name(uint32_t type) {
     case GGML_Q4_K: return "Q4_K";
     case GGML_Q5_K: return "Q5_K";
     case GGML_Q6_K: return "Q6_K";
+    case GGML_IQ3_S: return "IQ3_S";
+    case GGML_IQ4_XS: return "IQ4_XS";
     default: return "?";
   }
 }
