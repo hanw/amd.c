@@ -4138,6 +4138,123 @@ KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float 
 }
 
 /* out = res + sum over slots k of weight_k y_k (fma, slot order). */
+/* Decode attention, grouped (flint): workgroup kh * nsplit + s does the
+ * G = n_head / n_kv q heads of kv head kh (G <= 8, hd <= 128, hd % 8 == 0)
+ * over the positions p0 + s ch .. (n <= ch <= 256 of them; K/V of position p
+ * in row p % len). One thread per position for the scores (its K row read
+ * once for the G heads), one wave per head for the softmax, one thread per
+ * output for P V. One split: the output directly (sinks as ie_attn_sw);
+ * else partial results (M, L, o) per q head and the last workgroup of kv
+ * head kh merges, with the arithmetic of the ie_attn_sw merge. */
+static LDS float ag_q[8][128];
+#define AG_SC at_o /* the scores, then the weights: [head][position] */
+KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
+                  u32 len, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *sinks) {
+  const u32 kh = wgid() / nsplit, s = wgid() % nsplit, ng = n_head / n_kv, kvd = n_kv * hd, t = tid();
+  const float scale = 1.0f / __builtin_sqrtf((float)hd);
+  for (u32 i = t; i < ng * 128u; i += NT)
+    if ((i & 127u) < hd) ag_q[i >> 7][i & 127u] = q[(kh * ng + (i >> 7)) * hd + (i & 127u)];
+  barrier();
+  const u32 a0 = s * ch, n = a0 + ch < np ? ch : np - a0, r0 = (p0 + a0) % len;
+  if (t < n) {
+    const u32 slot = r0 + t < len ? r0 + t : r0 + t - len;
+    const G kvt *k = kc + (unsigned long)slot * kvd + kh * hd;
+    float d[8];
+    for (u32 g = 0; g < 8u; g++) d[g] = 0.0f;
+    for (u32 c = 0; c < hd; c += 8u) {
+      float kk[8];
+      for (u32 x = 0; x < 8u; x++) kk[x] = (float)k[c + x];
+      for (u32 g = 0; g < 8u; g++)
+        if (g < ng)
+          for (u32 x = 0; x < 8u; x++) d[g] += ag_q[g][c + x] * kk[x];
+    }
+    for (u32 g = 0; g < 8u; g++)
+      if (g < ng) AG_SC[g][t] = d[g] * scale;
+  }
+  barrier();
+  const u32 w = t >> 5, l = lane();
+  if (w < ng) {
+    float mx = -__builtin_inff();
+    for (u32 i = l; i < n; i += 32u) mx = __builtin_fmaxf(mx, AG_SC[w][i]);
+    mx = wave_max_any(mx);
+    float sm = 0.0f;
+    for (u32 i = l; i < n; i += 32u) {
+      const float e = __builtin_expf(AG_SC[w][i] - mx);
+      AG_SC[w][i] = e;
+      sm += e;
+    }
+    sm = wave_sum_all(sm);
+    if (l == 0u) at_m[w] = mx, at_l[w] = sm;
+  }
+  barrier();
+  const u32 dd = t & 127u, gb = t >> 7;
+  float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if (dd < hd) {
+    const G kvt *v = vc + kh * hd + dd;
+    u32 slot = r0;
+#pragma clang loop unroll_count(4)
+    for (u32 i = 0; i < n; i++) {
+      const float vv = (float)v[(unsigned long)slot * kvd];
+      for (u32 j = 0; j < 4u; j++)
+        if (gb + 2u * j < ng) o[j] += AG_SC[gb + 2u * j][i] * vv;
+      slot = slot + 1u == len ? 0u : slot + 1u;
+    }
+  }
+  if (nsplit == 1u) {
+    for (u32 j = 0; j < 4u; j++) {
+      const u32 g = gb + 2u * j, h = kh * ng + g;
+      if (g >= ng) break;
+      const float M = at_m[g], sk = sinks ? sinks[h] : -__builtin_inff(), M2 = __builtin_fmaxf(sk, M);
+      const float wt = __builtin_expf(M - M2);
+      float L2 = 0.0f + at_l[g] * wt;
+      if (sinks) L2 += __builtin_expf(sk - M2);
+      if (dd < hd) {
+        const float r = (0.0f + o[j] * wt) / L2;
+        out[h * hd + dd] = r;
+        if (oq) quant_wave(r, (h * hd + dd) >> 5, oq, (n_head * hd) >> 5);
+      }
+    }
+    return;
+  }
+  for (u32 j = 0; j < 4u; j++) {
+    const u32 g = gb + 2u * j, h = kh * ng + g;
+    if (g >= ng) break;
+    G float *pp = part + (unsigned long)(h * nsplit + s) * (hd + 2u);
+    if (dd < hd) pp[2u + dd] = o[j];
+    if (dd == 0u) pp[0] = at_m[g], pp[1] = at_l[g];
+  }
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  barrier();
+  if (t == 0u) at_last = __atomic_fetch_add(&count[kh], 1u, __ATOMIC_ACQ_REL) == nsplit - 1u;
+  barrier();
+  if (!at_last) return;
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  for (u32 g = 0; g < ng; g++) {
+    const u32 h = kh * ng + g;
+    G float *ph = part + (unsigned long)h * nsplit * (hd + 2u);
+    const float sk = sinks ? sinks[h] : -__builtin_inff();
+    float mv = sk;
+    for (u32 x = t; x < nsplit; x += NT) mv = __builtin_fmaxf(mv, ph[x * (hd + 2u)]);
+    const float M2 = wg_max(mv);
+    float lv = 0.0f;
+    for (u32 x = t; x < nsplit; x += NT) {
+      const float wt = __builtin_expf(ph[x * (hd + 2u)] - M2);
+      ph[x * (hd + 2u)] = wt;
+      lv += ph[x * (hd + 2u) + 1u] * wt;
+    }
+    float L2 = wg_sum(lv);
+    if (sinks) L2 += __builtin_expf(sk - M2);
+    if (t < hd) {
+      float r = 0.0f;
+      for (u32 x = 0; x < nsplit; x++) r += ph[x * (hd + 2u) + 2u + t] * ph[x * (hd + 2u)];
+      r = r / L2;
+      out[h * hd + t] = r;
+      if (oq) quant_wave(r, (h * hd + t) >> 5, oq, (n_head * hd) >> 5);
+    }
+  }
+  if (t == 0u) count[kh] = 0u;
+}
+
 KERNEL ie_moe_sum(const G float *y, G float *out, const G u32 *route, const G float *res, u32 n, u32 K) {
   const u32 j = wgid() * NT + tid();
   if (j >= n) return;
