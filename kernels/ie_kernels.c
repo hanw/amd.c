@@ -4142,11 +4142,12 @@ KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float 
  * G = n_head / n_kv q heads of kv head kh (G <= 8, hd <= 128, hd % 8 == 0)
  * over the positions p0 + s ch .. (n <= ch <= 256 of them; K/V of position p
  * in row p % len). One thread per position for the scores (its K row read
- * once for the G heads), one wave per head for the softmax, one thread per
- * output for P V. One split: the output directly (sinks as ie_attn_sw);
+ * once for the G heads, 64 dims of loads together), one wave per head for
+ * the softmax; P V: one thread per dim and position parity, all G heads. One split: the output directly (sinks as ie_attn_sw);
  * else partial results (M, L, o) per q head and the last workgroup of kv
  * head kh merges, with the arithmetic of the ie_attn_sw merge. */
-static LDS float ag_q[8][128];
+static LDS float ag_q[8][128]; /* q, then the P V sums of the odd positions */
+typedef kvt ag_kv8 __attribute__((ext_vector_type(8)));
 #define AG_SC at_o /* the scores, then the weights: [head][position] */
 KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
                   u32 len, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *sinks) {
@@ -4161,12 +4162,15 @@ KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
     const G kvt *k = kc + (unsigned long)slot * kvd + kh * hd;
     float d[8];
     for (u32 g = 0; g < 8u; g++) d[g] = 0.0f;
-    for (u32 c = 0; c < hd; c += 8u) {
-      float kk[8];
-      for (u32 x = 0; x < 8u; x++) kk[x] = (float)k[c + x];
-      for (u32 g = 0; g < 8u; g++)
-        if (g < ng)
-          for (u32 x = 0; x < 8u; x++) d[g] += ag_q[g][c + x] * kk[x];
+    for (u32 c0 = 0; c0 < hd; c0 += 64u) { /* 64 dims of the K row in registers: the loads together */
+      ag_kv8 kk[8];
+      for (u32 x = 0; x < 8u; x++)
+        if (c0 + 8u * x < hd) kk[x] = *(const G ag_kv8 *)(k + c0 + 8u * x);
+      for (u32 x = 0; x < 8u; x++)
+        if (c0 + 8u * x < hd)
+          for (u32 g = 0; g < 8u; g++)
+            if (g < ng)
+              for (u32 e = 0; e < 8u; e++) d[g] += ag_q[g][c0 + 8u * x + e] * (float)kk[x][e];
     }
     for (u32 g = 0; g < 8u; g++)
       if (g < ng) AG_SC[g][t] = d[g] * scale;
@@ -4187,42 +4191,57 @@ KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
     if (l == 0u) at_m[w] = mx, at_l[w] = sm;
   }
   barrier();
-  const u32 dd = t & 127u, gb = t >> 7;
-  float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  /* P V: thread t the dim t & 127 of all heads, positions of parity t >> 7,
+   * 16 V loads together; then the odd sums through ag_q */
+  const u32 dd = t & 127u, par = t >> 7;
+  float o[8];
+  for (u32 g = 0; g < 8u; g++) o[g] = 0.0f;
   if (dd < hd) {
     const G kvt *v = vc + kh * hd + dd;
-    u32 slot = r0;
-#pragma clang loop unroll_count(4)
-    for (u32 i = 0; i < n; i++) {
-      const float vv = (float)v[(unsigned long)slot * kvd];
-      for (u32 j = 0; j < 4u; j++)
-        if (gb + 2u * j < ng) o[j] += AG_SC[gb + 2u * j][i] * vv;
-      slot = slot + 1u == len ? 0u : slot + 1u;
+    for (u32 i0 = par; i0 < n; i0 += 32u) {
+      float vv[16];
+      for (u32 x = 0; x < 16u; x++) {
+        const u32 i = i0 + 2u * x, r = r0 + i, slot = r < len ? r : r - len;
+        vv[x] = i < n ? (float)v[(unsigned long)slot * kvd] : 0.0f;
+      }
+      for (u32 x = 0; x < 16u; x++)
+        if (i0 + 2u * x < n)
+          for (u32 g = 0; g < 8u; g++)
+            if (g < ng) o[g] += AG_SC[g][i0 + 2u * x] * vv[x];
     }
   }
+  barrier(); /* every thread is done with ag_q (the scores) */
+  if (par == 1u && dd < hd)
+    for (u32 g = 0; g < 8u; g++)
+      if (g < ng) ag_q[g][dd] = o[g];
+  barrier();
+  if (par == 1u) { /* the merge below: every thread meets at its barriers */
+    if (nsplit == 1u) return;
+  } else if (dd < hd)
+    for (u32 g = 0; g < 8u; g++)
+      if (g < ng) o[g] += ag_q[g][dd];
   if (nsplit == 1u) {
-    for (u32 j = 0; j < 4u; j++) {
-      const u32 g = gb + 2u * j, h = kh * ng + g;
-      if (g >= ng) break;
+    for (u32 g = 0; g < ng; g++) {
+      const u32 h = kh * ng + g;
       const float M = at_m[g], sk = sinks ? sinks[h] : -__builtin_inff(), M2 = __builtin_fmaxf(sk, M);
       const float wt = __builtin_expf(M - M2);
       float L2 = 0.0f + at_l[g] * wt;
       if (sinks) L2 += __builtin_expf(sk - M2);
       if (dd < hd) {
-        const float r = (0.0f + o[j] * wt) / L2;
+        const float r = (0.0f + o[g] * wt) / L2;
         out[h * hd + dd] = r;
         if (oq) quant_wave(r, (h * hd + dd) >> 5, oq, (n_head * hd) >> 5);
       }
     }
     return;
   }
-  for (u32 j = 0; j < 4u; j++) {
-    const u32 g = gb + 2u * j, h = kh * ng + g;
-    if (g >= ng) break;
-    G float *pp = part + (unsigned long)(h * nsplit + s) * (hd + 2u);
-    if (dd < hd) pp[2u + dd] = o[j];
-    if (dd == 0u) pp[0] = at_m[g], pp[1] = at_l[g];
-  }
+  if (par == 0u)
+    for (u32 g = 0; g < ng; g++) {
+      const u32 h = kh * ng + g;
+      G float *pp = part + (unsigned long)(h * nsplit + s) * (hd + 2u);
+      if (dd < hd) pp[2u + dd] = o[g];
+      if (dd == 0u) pp[0] = at_m[g], pp[1] = at_l[g];
+    }
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   barrier();
   if (t == 0u) at_last = __atomic_fetch_add(&count[kh], 1u, __ATOMIC_ACQ_REL) == nsplit - 1u;
