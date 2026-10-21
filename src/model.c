@@ -1400,6 +1400,7 @@ static int moe_block(gb *B, const model *m, const layer *L, int x) {
       matvec_into(B, &L->wgate, hn, hq, gu, 0, "sh_gate", NULL, -1);
       matvec_into(B, &L->wup, hn, hq, gu, m->sff * 4, "sh_up", NULL, -1);
     }
+    use_last(B, hn), use_last(B, rl); /* the router's input and output stay apart from gu: one megakernel phase */
     o = emit(B, OP_SWIGLU, gu, gu, -1), o->n = m->sff, o->boff = m->sff * 4;
     gq = L->wdown.kind != MAT_F32 ? fuse_quant(B, m->sff, "sh_mid_q8") : -1;
   }
@@ -1415,6 +1416,8 @@ static int moe_block(gb *B, const model *m, const layer *L, int x) {
   for (int i = 0; i < 2 && parts[i]; i++) {
     o = emit(B, OP_GEMV_EXP, parts[i]->kind == MAT_F32 ? hn : hq, ye, rt);
     o->w = parts[i], o->n = dim, o->nh = K, o->astr = 0, o->bstr = gstr, o->boff = i * eff * 4;
+    /* the shared down's input, residual and output stay apart from ye: one megakernel phase */
+    use_last(B, gq), use_last(B, x), use_last(B, xs);
   }
   const uint32_t qstr = (uint32_t)q8_bytes(eff / 32);
   int mq = new_buf(g, "exp_mid_q8", K * qstr);
