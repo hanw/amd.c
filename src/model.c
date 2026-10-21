@@ -1387,14 +1387,12 @@ static int moe_block(gb *B, const model *m, const layer *L, int x) {
   op *o;
   int hq;
   int hn = fuse_norm(B, &L->ffn_norm, dim, "ffn_in", 1, "ffn_in_q8", &hq);
-  /* the router: logits (f32 weights), then the top K experts and their weights */
+  /* The order lets independent GEMVs share a phase of the megakernel
+   * (hip.c mk_join): the router with the shared gate/up, the shared down with
+   * the experts' gate/up. The router: logits (f32 weights). */
   int rl = matvec(B, &L->wr, hn, hq, "router", NULL, -1);
-  int rt = new_buf(g, "route", 2 * K * 4);
-  o = emit(B, OP_MOE_ROUTE, rl, rt, -1), o->n = m->n_exp, o->nh = K, o->v = L->ebias.n ? &L->ebias : NULL;
-  /* the shared expert, with the residual: xs = x + down_s(silu(gate_s h) up_s h) */
-  int xs = x;
-  if (m->sff) {
-    int gu;
+  int gu = -1, gq = -1, xs = x;
+  if (m->sff) { /* the shared expert's gate and up */
     if (L->wgu.rows) {
       gu = matvec(B, &L->wgu, hn, hq, "sh_gate_up", NULL, -1);
     } else {
@@ -1403,9 +1401,13 @@ static int moe_block(gb *B, const model *m, const layer *L, int x) {
       matvec_into(B, &L->wup, hn, hq, gu, m->sff * 4, "sh_up", NULL, -1);
     }
     o = emit(B, OP_SWIGLU, gu, gu, -1), o->n = m->sff, o->boff = m->sff * 4;
-    int gq = L->wdown.kind != MAT_F32 ? fuse_quant(B, m->sff, "sh_mid_q8") : -1;
-    xs = matvec(B, &L->wdown, gu, gq, "xs", NULL, x);
+    gq = L->wdown.kind != MAT_F32 ? fuse_quant(B, m->sff, "sh_mid_q8") : -1;
   }
+  /* the top K experts and their weights */
+  int rt = new_buf(g, "route", 2 * K * 4);
+  o = emit(B, OP_MOE_ROUTE, rl, rt, -1), o->n = m->n_exp, o->nh = K, o->v = L->ebias.n ? &L->ebias : NULL;
+  /* the shared expert's down, with the residual: xs = x + down_s(silu(gate_s h) up_s h) */
+  if (m->sff) xs = matvec(B, &L->wdown, gu, gq, "xs", NULL, x);
   /* the experts: gate and up of each chosen expert, [gate | up] per slot */
   const uint32_t gstr = 2 * eff * 4;
   int ye = new_buf(g, "exp_gu", K * gstr);

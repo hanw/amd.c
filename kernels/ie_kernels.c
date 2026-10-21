@@ -3940,50 +3940,58 @@ KERNEL ie_gemv_iq4xsq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float
 
 /* The GEMVs of the chosen experts, one launch: grid x = the row groups of
  * one expert, grid y = slot s < K. Expert e = route[s]; its arrays start at
- * e qwn words, e qsn entries; input xq + s astr, output y + s bstr (bytes). */
-#define GEXP_KERNEL(NAME, ROWS, QST)                                                                                       \
-  KERNEL NAME(const G u32 *qw, const G QST *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G u32 *route,     \
-              unsigned long qwn, unsigned long qsn, u32 astr, u32 bstr) {                                               \
-    const u32 s = tokid(), e = route[s];                                                                               \
-    ROWS(wgid(), qw + e * qwn, qs + e * qsn, xq + (unsigned long)s * astr, (G float *)((G u8 *)y + (unsigned long)s * bstr), \
-         rows, nb, 0, 0);                                                                                              \
-  }
-GEXP_KERNEL(ie_gexp_q8, gemv_q8q8_rows, f16)
-GEXP_KERNEL(ie_gexp_q4k, gemv_q4kq8_rows, u16)
-GEXP_KERNEL(ie_gexp_q5k, gemv_q5kq8_rows, u16)
-GEXP_KERNEL(ie_gexp_q6k, gemv_q6kq8_rows, u16)
-GEXP_KERNEL(ie_gexp_iq4xs, gemv_iq4xsq8_rows, u16)
+ * e qwn words, e qsn entries; input xq + s astr, output y + s bstr (bytes).
+ * kind: MAT_Q8 (2), MAT_Q4K (3), MAT_Q6K (4), MAT_Q5K (5), MAT_IQ4XS (6) (src/model.h). */
+KERNEL ie_gexp(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G u32 *route, u32 qwn,
+               u32 qsn, u32 astr, u32 bstr, u32 kind) {
+  const u32 s = tokid(), e = route[s];
+  const G u32 *w = qw + (unsigned long)e * qwn;
+  const G u16 *q = qs + (unsigned long)e * qsn;
+  const G u8 *x = xq + (unsigned long)s * astr;
+  G float *o = (G float *)((G u8 *)y + (unsigned long)s * bstr);
+  if (kind == 2u) gemv_q8q8_rows(wgid(), w, (const G f16 *)q, x, o, rows, nb, 0, 0);
+  else if (kind == 3u) gemv_q4kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
+  else if (kind == 4u) gemv_q6kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
+  else if (kind == 5u) gemv_q5kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
+  else gemv_iq4xsq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
+}
 
-/* Routing (one workgroup, n <= 1024 experts): s = sigmoid(logit); the K
- * largest s + bias, one at a time (ties: the smaller index); out = [K ids |
- * K weights], weight k = s_k / (sum of the K s + 1e-20) * scale, the sum in
- * the order of the choice (as moe_route in cpu.c). */
-static LDS float mr_s[1024], mr_c[1024], mr_w[16];
+/* Routing (wave 0 alone, no LDS: the megakernel; n <= 1024 experts, K <=
+ * 16): s = sigmoid(logit); the K largest s + bias, one at a time (ties: the
+ * smaller index); out = [K ids | K weights], weight k = s_k / (sum of the K
+ * s + 1e-20) * scale, the sum in the order of the choice (as moe_route in
+ * cpu.c). Lane l holds the experts l, l + 32, ... */
 KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float scale, G u32 *out) {
-  for (u32 i = tid(); i < n; i += NT) {
-    const float sg = 1.0f / (1.0f + __builtin_expf(-lg[i]));
-    mr_s[i] = sg;
-    mr_c[i] = bias ? sg + bias[i] : sg;
+  if (tid() >= 32u) return;
+  const u32 l = lane();
+  float sg[32], c[32];
+  for (u32 j = 0; j < 32u; j++) {
+    const u32 i = l + 32u * j;
+    sg[j] = i < n ? 1.0f / (1.0f + __builtin_expf(-lg[i])) : 0.0f;
+    c[j] = i < n ? (bias ? sg[j] + bias[i] : sg[j]) : -__builtin_inff();
   }
-  barrier();
+  float wsel[16], sum = 0.0f;
+  u32 isel[16];
   for (u32 k = 0; k < K; k++) {
     float bv = -__builtin_inff();
     u32 bi = 0xFFFFFFFFu;
-    for (u32 i = tid(); i < n; i += NT)
-      if (better(mr_c[i], i, bv, bi)) bv = mr_c[i], bi = i;
-    wg_best(&bv, &bi);
-    if (tid() == 0u) {
-      out[k] = bi;
-      mr_w[k] = mr_s[bi];
-      mr_c[bi] = -__builtin_inff();
+    for (u32 j = 0; j < 32u; j++) /* the lane's best: its smallest index first (j ascending) */
+      if (l + 32u * j < n && better(c[j], l + 32u * j, bv, bi)) bv = c[j], bi = l + 32u * j;
+    for (u32 m = 16u; m >= 1u; m >>= 1) { /* the wave's best (ties: smaller index) */
+      const float ov = shfl_xor_f(bv, m);
+      const u32 oi = (u32)__builtin_amdgcn_ds_bpermute((int)((l ^ m) << 2), (int)bi);
+      if (better(ov, oi, bv, bi)) bv = ov, bi = oi;
     }
-    barrier();
+    for (u32 j = 0; j < 32u; j++) /* mark it used; its sigmoid to every lane */
+      if (l + 32u * j == bi) c[j] = -__builtin_inff();
+    float sb = 0.0f;
+    for (u32 j = 0; j < 32u; j++) sb = l + 32u * j == bi ? sg[j] : sb;
+    sb = I2F(__builtin_amdgcn_readlane(F2I(wave_max_pos(sb)), 0)); /* sigmoid > 0: the one non-zero */
+    isel[k] = bi, wsel[k] = sb, sum += sb;
   }
-  if (tid() == 0u) {
-    float sum = 0.0f;
-    for (u32 k = 0; k < K; k++) sum += mr_w[k];
+  if (l == 0u) {
     const float inv = 1.0f / (sum + 1e-20f);
-    for (u32 k = 0; k < K; k++) ((G float *)out)[K + k] = mr_w[k] * inv * scale;
+    for (u32 k = 0; k < K; k++) out[k] = isel[k], ((G float *)out)[K + k] = wsel[k] * inv * scale;
   }
 }
 

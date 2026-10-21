@@ -27,8 +27,9 @@
 #include "ie_kernels.c"
 #include "ie_mk_gen.h"
 #include "../prof/sm_profiler.h"
-_Static_assert(MK_N < 31, "the profiler has 32 event types: the kernels, 31 the grid barrier");
+/* the profiler has 32 event types: kernels 0 .. 29 their own, the later ones share 30, 31 the grid barrier */
 #define MK_EV_BARRIER 31u
+#define MK_EV(k) ((k) < 30u ? (k) : 30u)
 
 #define MK_CMD 256u
 
@@ -61,7 +62,7 @@ __attribute__((amdgpu_kernel, visibility("protected"))) void ie_mk(G u8 *cmds, u
        * workgroup p (prof/sm_profiler.h; thread 0 records) */
       if (t0) ts = smp_time_ns();
       mk_dispatch(kid, a);
-      if (t0) smp_rec_range(&tr, kid, ts, smp_time_ns());
+      if (t0) smp_rec_range(&tr, MK_EV(kid), ts, smp_time_ns());
     }
     /* word 3 of the next command: 1 = it joins this phase (independent
      * GEMVs, src/hip.c mk_join): no barrier */

@@ -100,11 +100,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_ATTN_FA, K_ATTN_FA_Q8, K_ATTN_FA2, K_GEMM_F32_S, K_GEMM_Q4KR_SB, K_REQUANT_SB, K_Q8_F16, K_GEMM_Q4K_H, K_GEMM_Q4K_H256, K_COPY_ROWS, K_DF_CONV, K_DF_QKV, K_DF_ATTN, K_GEMV_Q5K, K_GEMV_IQ4XS, K_GEXP_Q8, K_GEXP_Q4K, K_GEXP_Q5K, K_GEXP_Q6K, K_GEXP_IQ4XS, K_MOE_ROUTE, K_MOE_SUM, K_QKN_ROPE_KV2, K_ATTN_SW, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_ATTN_FA, K_ATTN_FA_Q8, K_ATTN_FA2, K_GEMM_F32_S, K_GEMM_Q4KR_SB, K_REQUANT_SB, K_Q8_F16, K_GEMM_Q4K_H, K_GEMM_Q4K_H256, K_COPY_ROWS, K_DF_CONV, K_DF_QKV, K_DF_ATTN, K_GEMV_Q5K, K_GEMV_IQ4XS, K_GEXP, K_MOE_ROUTE, K_MOE_SUM, K_QKN_ROPE_KV2, K_ATTN_SW, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv", "ie_attn_fa", "ie_attn_fa_q8", "ie_attn_fa2", "ie_gemm_f32_s", "ie_gemm_q4kr_sb", "ie_requant_sb", "ie_q8_f16", "ie_gemm_q4k_h", "ie_gemm_q4k_h256", "ie_copy_rows", "ie_df_conv", "ie_df_qkv", "ie_df_attn", "ie_gemv_q5kq8", "ie_gemv_iq4xsq8", "ie_gexp_q8", "ie_gexp_q4k", "ie_gexp_q5k", "ie_gexp_q6k", "ie_gexp_iq4xs", "ie_moe_route", "ie_moe_sum", "ie_qkn_rope_kv2", "ie_attn_sw"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv", "ie_attn_fa", "ie_attn_fa_q8", "ie_attn_fa2", "ie_gemm_f32_s", "ie_gemm_q4kr_sb", "ie_requant_sb", "ie_q8_f16", "ie_gemm_q4k_h", "ie_gemm_q4k_h256", "ie_copy_rows", "ie_df_conv", "ie_df_qkv", "ie_df_attn", "ie_gemv_q5kq8", "ie_gemv_iq4xsq8", "ie_gexp", "ie_moe_route", "ie_moe_sum", "ie_qkn_rope_kv2", "ie_attn_sw"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 /* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
  * linear layer are gpu_backend.ns: at least the tokens of a verify run */
@@ -378,7 +378,7 @@ static int mk_gemv_rng(u32 i, mk_rng *g) {
   uint64_t p[8];
   u32 rows, n2, t[4];
   memset(g, 0, sizeof *g);
-  if (k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8) {
+  if (k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8 || k == K_GEMV_Q5K || k == K_GEMV_IQ4XS) {
     /* qw qs xq y rows nb bias res nw ... */
     memcpy(p, c, 32), memcpy(&rows, c + 32, 4), memcpy(&n2, c + 36, 4), memcpy(p + 4, c + 40, 24);
     if (p[6]) return 0;
@@ -395,6 +395,13 @@ static int mk_gemv_rng(u32 i, mk_rng *g) {
     memcpy(p, c, 32), memcpy(&rows, c + 32, 4), memcpy(&n2, c + 36, 4), memcpy(p + 4, c + 40, 16), memcpy(t, c + 56, 16);
     g->r = mk_sr1(p[2], (uint64_t)n2 * 40u, t[1], t[0]), g->w = mk_sr1(p[3], (uint64_t)rows * 4u, t[2] * 4ull, t[0]);
     g->s = mk_sr1(p[5], (uint64_t)rows * 4u, t[3] * 4ull, t[0]);
+  } else if (k == K_GEXP) {
+    /* qw qs xq y rows nb route qwn qsn astr bstr kind; grid y: the K slots (xq: astr apart, or one input; y: bstr apart) */
+    u32 gy, as, bs;
+    memcpy(p, c, 32), memcpy(&rows, c + 32, 4), memcpy(&n2, c + 36, 4), memcpy(&as, c + 56, 4), memcpy(&bs, c + 60, 4);
+    memcpy(&gy, c - 8, 4);
+    g->r = mk_sr1(p[2], (uint64_t)n2 * 40u, as, as ? gy : 1u), g->w = mk_sr1(p[3], (uint64_t)rows * 4u, bs, gy);
+    return 1; /* no bias, no residual; the route is read (a GEMV phase does not write it) */
   } else if (k == K_GEMV_F32_T) {
     /* w x y rows cols bias res xs ys rs (bytes); grid y: the tokens */
     u32 gy;
@@ -498,9 +505,10 @@ static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **ar
   /* bit 1: the waves need not meet between workgroup bodies (no LDS, no
    * workgroup barrier): the GEMVs without the fused norm, the multi-token
    * GEMVs, the element-wise kernels */
-  const int fk = k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8 || k == K_GEMV_Q4;
+  const int fk = k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8 || k == K_GEMV_Q4 || k == K_GEMV_Q5K || k == K_GEMV_IQ4XS;
   const int fr = (fk && !*(void **)args[8]) || k == K_GEMV_Q4K_TR || k == K_GEMV_Q6K_TR || k == K_GEMV_Q8_TR ||
-                 k == K_SWIGLU || k == K_EMBED_Q8 || k == K_EMBED_Q4 || k == K_EMBED_F32 || k == K_ROPE_KV || k == K_QUANT;
+                 k == K_SWIGLU || k == K_EMBED_Q8 || k == K_EMBED_Q4 || k == K_EMBED_F32 || k == K_ROPE_KV || k == K_QUANT ||
+                 k == K_GEXP || k == K_MOE_SUM || k == K_MOE_ROUTE; /* flint: no LDS, no workgroup barrier */
   const u32 h[4] = {(u32)id, gx, gy, fr && mk.free ? 2u : 0u};
   memcpy(c, h, sizeof h);
   size_t off = 16;
@@ -558,7 +566,6 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   /* on by default; IE_MK=0: off. Without the two files: off, with a note. */
   const char *mke = getenv("IE_MK");
   int mkon = !(mke && mke[0] == '0');
-  if (m->arch == ARCH_FLINT) mkon = 0; /* flint: its kernels are not in the megakernel (yet) */
   if (mkon) {
     const char *sl = strrchr(hsaco, '/');
     const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
@@ -653,7 +660,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
       const u32 nmax = mk.np[0] > mk.np[1] ? mk.np[0] : mk.np[1];
       mk.trace_at = getenv("IE_MK_TRACE_AT") ? (uint64_t)atoll(getenv("IE_MK_TRACE_AT")) : 10u;
       if ((mk.trace = smp_create(nmax, 1, 16384, 1))) {
-        for (int j = 0; j < MK_N; j++) smp_register_event(mk.trace, (uint32_t)j, mk_names[j] + 3);
+        for (int j = 0; j < MK_N && j < 30; j++) smp_register_event(mk.trace, (uint32_t)j, mk_names[j] + 3);
+        if (MK_N > 30) smp_register_event(mk.trace, 30, "other");
         smp_register_event(mk.trace, 31, "grid barrier");
       }
     }
@@ -1062,13 +1070,12 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
       }
       case OP_GEMV_EXP: {
         const mat *w = o->w;
-        const int k = w->kind == MAT_Q8 ? K_GEXP_Q8 : w->kind == MAT_Q4K ? K_GEXP_Q4K : w->kind == MAT_Q5K ? K_GEXP_Q5K
-                      : w->kind == MAT_Q6K ? K_GEXP_Q6K : w->kind == MAT_IQ4XS ? K_GEXP_IQ4XS : -1;
-        if (k < 0) ie_die("expert GEMV: kind %d has no GPU kernel", w->kind);
-        u32 rows = w->rows, nb = w->nb, as = o->astr, bs = o->bstr;
-        uint64_t qwn = mat_qw_words(w->kind, w->rows, w->cols), qsn = mat_qs_n(w->kind, w->rows, w->cols);
-        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &C, &qwn, &qsn, &as, &bs};
-        launch_t(b, k, gemv_groups(rows), o->nh, args);
+        if (w->kind != MAT_Q8 && w->kind != MAT_Q4K && w->kind != MAT_Q6K && w->kind != MAT_Q5K && w->kind != MAT_IQ4XS)
+          ie_die("expert GEMV: kind %d has no GPU kernel", w->kind);
+        u32 rows = w->rows, nb = w->nb, as = o->astr, bs = o->bstr, kind = (u32)w->kind;
+        u32 qwn = (u32)mat_qw_words(w->kind, w->rows, w->cols), qsn = (u32)mat_qs_n(w->kind, w->rows, w->cols);
+        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &C, &qwn, &qsn, &as, &bs, &kind};
+        launch_t(b, K_GEXP, gemv_groups(rows), o->nh, args);
         break;
       }
       case OP_MOE_SWIGLU: { /* per slot: ie_swiglu with the slot strides (grid y = slot) */
@@ -1654,9 +1661,7 @@ static int op_kernel(const gpu_backend *b, const op *o) {
     case OP_MOE_ROUTE: return K_MOE_ROUTE;
     case OP_MOE_SUM: return K_MOE_SUM;
     case OP_MOE_SWIGLU: return K_SWIGLU;
-    case OP_GEMV_EXP:
-      return o->w->kind == MAT_Q8 ? K_GEXP_Q8 : o->w->kind == MAT_Q4K ? K_GEXP_Q4K : o->w->kind == MAT_Q5K ? K_GEXP_Q5K
-             : o->w->kind == MAT_Q6K ? K_GEXP_Q6K : K_GEXP_IQ4XS;
+    case OP_GEMV_EXP: return K_GEXP;
     default: return K_ARGMAX;
   }
 }
