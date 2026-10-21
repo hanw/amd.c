@@ -54,7 +54,7 @@ static int64_t hmap_get(const hmap *h, const char *s, uint32_t n) {
 }
 
 /* ---- the tokenizer ---- */
-enum { PRE_QWEN2 = 0, PRE_QWEN35 = 1 };
+enum { PRE_QWEN2 = 0, PRE_QWEN35 = 1, PRE_FLINT = 2 };
 typedef struct {
   const char *s;
   uint32_t n, id;
@@ -110,8 +110,9 @@ tokenizer *tok_open(const model *m, const gguf_file *g, char *err, size_t errn) 
   int pt;
   if (pre && !strcmp(pre, "qwen35")) pt = PRE_QWEN35;
   else if (pre && (!strcmp(pre, "qwen2") || !strcmp(pre, "deepseek-r1-qwen"))) pt = PRE_QWEN2;
+  else if (pre && !strcmp(pre, "flint")) pt = PRE_FLINT;
   else {
-    snprintf(err, errn, "pre-tokenizer \"%s\" is not supported (qwen2, qwen35)", pre ? pre : "(none)");
+    snprintf(err, errn, "pre-tokenizer \"%s\" is not supported (qwen2, qwen35, flint)", pre ? pre : "(none)");
     free(pre);
     return NULL;
   }
@@ -195,12 +196,12 @@ static int uc_space(uint32_t cp) {
  * invalid byte becomes one code point of class "other" (cp 0xFFFFFFFF). */
 typedef struct {
   uint32_t *cp, *off;
-  uint8_t *cl; /* bits: UC_L, UC_M, UC_N, 8 = space, 16 = CR or LF */
+  uint16_t *cl; /* bits: UC_L, UC_M, UC_N, 8 = space, 16 = CR or LF; UC_UP .. UC_S (tok_unicode.h) */
   uint32_t n;
 } cps;
 
 static void decode(const char *s, size_t len, cps *c) {
-  c->cp = malloc((len + 1) * 4), c->off = malloc((len + 1) * 4), c->cl = malloc(len + 1);
+  c->cp = malloc((len + 1) * 4), c->off = malloc((len + 1) * 4), c->cl = malloc((len + 1) * 2);
   if (!c->cp || !c->off || !c->cl) ie_die("tok: out of memory");
   uint32_t n = 0;
   const unsigned char *p = (const unsigned char *)s;
@@ -220,7 +221,7 @@ static void decode(const char *s, size_t len, cps *c) {
     }
     if (cp == 0xFFFFFFFFu) k = 1;
     c->cp[n] = cp, c->off[n] = (uint32_t)i;
-    uint8_t cl = cp == 0xFFFFFFFFu ? 0 : (uint8_t)uc_flags(cp);
+    uint16_t cl = cp == 0xFFFFFFFFu ? 0 : (uint16_t)uc_flags(cp);
     if (cp != 0xFFFFFFFFu && uc_space(cp)) cl |= 8;
     if (cp == '\r' || cp == '\n') cl |= 16;
     c->cl[n++] = cl;
@@ -238,8 +239,8 @@ static uint32_t lower_ascii(uint32_t c) { return c >= 'A' && c <= 'Z' ? c + 32 :
  * excluded in the fourth. */
 static uint32_t match(const cps *c, uint32_t i, int pre) {
   const uint32_t n = c->n;
-  const uint8_t *cl = c->cl;
-  const uint8_t LET = pre == PRE_QWEN35 ? (UC_L | UC_M) : UC_L, OTH = LET | UC_N | 8;
+  const uint16_t *cl = c->cl;
+  const uint16_t LET = pre == PRE_QWEN35 ? (UC_L | UC_M) : UC_L, OTH = LET | UC_N | 8;
   /* 1: contractions */
   if (c->cp[i] == '\'' && i + 1 < n) {
     const uint32_t a = lower_ascii(c->cp[i + 1]);
@@ -282,6 +283,106 @@ static uint32_t match(const cps *c, uint32_t i, int pre) {
     return j;
   }
   return i + 1;
+}
+
+/* A contraction (?i:'s|'t|'re|'ve|'m|'ll|'d) at j (before n), or nothing: the end. */
+static uint32_t contraction(const cps *c, uint32_t j, uint32_t n) {
+  if (j + 1 < n && c->cp[j] == '\'') {
+    const uint32_t a = lower_ascii(c->cp[j + 1]);
+    if (a == 's' || a == 't' || a == 'm' || a == 'd') return j + 2;
+    if (j + 2 < n) {
+      const uint32_t b = lower_ascii(c->cp[j + 2]);
+      if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return j + 3;
+    }
+  }
+  return j;
+}
+
+/* flint: the end of the match of the third split's regex at i in [i, n), or
+ * i (no match: i is in a gap):
+ *   [^\r\n\p{L}\p{N}]?[U]*[W]+(?i:'s|..)?   U = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]
+ *   [^\r\n\p{L}\p{N}]?[U]+[W]*(?i:'s|..)?   W = [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+ *    ?[\p{P}\p{S}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * tried in order, each with its backtracking (the optional first char taken
+ * first; U* longest first). */
+static uint32_t match_flint(const cps *c, uint32_t i, uint32_t n) {
+  const uint16_t *cl = c->cl;
+#define FU(k) (cl[k] & (UC_UP | UC_LMO | UC_M))
+#define FW(k) (cl[k] & (UC_LO | UC_LMO | UC_M))
+#define FPRE(k) (!(cl[k] & (16 | UC_L | UC_N)))
+  for (uint32_t pf = 1; pf + 1 > 0; pf--) { /* 1: U* W+ */
+    if (pf && !FPRE(i)) continue;
+    const uint32_t j = i + pf;
+    uint32_t ue = j;
+    while (ue < n && FU(ue)) ue++;
+    for (uint32_t k = ue;; k--) {
+      uint32_t we = k;
+      while (we < n && FW(we)) we++;
+      if (we > k) return contraction(c, we, n);
+      if (k == j) break;
+    }
+  }
+  for (uint32_t pf = 1; pf + 1 > 0; pf--) { /* 2: U+ W* */
+    if (pf && !FPRE(i)) continue;
+    const uint32_t j = i + pf;
+    uint32_t ue = j;
+    while (ue < n && FU(ue)) ue++;
+    if (ue > j) {
+      while (ue < n && FW(ue)) ue++;
+      return contraction(c, ue, n);
+    }
+  }
+#undef FU
+#undef FW
+#undef FPRE
+  { /* 3: optional space, punctuation and symbols, then CR and LF */
+    const uint32_t j = i + (c->cp[i] == ' ' ? 1 : 0);
+    uint32_t k = j;
+    while (k < n && (cl[k] & (UC_P | UC_S))) k++;
+    if (k > j) {
+      while (k < n && (cl[k] & 16)) k++;
+      return k;
+    }
+  }
+  if (cl[i] & 8) {
+    uint32_t j = i;
+    while (j < n && (cl[j] & 8)) j++;
+    for (uint32_t k = j; k > i; k--) /* 4: \s*[\r\n]+ */
+      if (cl[k - 1] & 16) return k;
+    if (j == n) return j; /* 5: \s+(?!\S) */
+    if (j - 1 > i) return j - 1;
+    return j; /* 6: \s+ */
+  }
+  return i;
+}
+
+/* flint: [\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff] (CJK ideographs, hiragana, katakana) */
+static int cjk_kana(uint32_t cp) { return (cp >= 0x4E00 && cp <= 0x9FA5) || (cp >= 0x3040 && cp <= 0x30FF); }
+
+static void bpe(const tokenizer *t, const char *s, uint32_t len, tok_ids *out);
+/* flint: the pieces of code points [a, b) of the third split (regex
+ * matches; the unmatched characters between them form one piece each run) */
+static void flint_split3(const tokenizer *t, const char *s, const cps *c, uint32_t a, uint32_t b, tok_ids *out) {
+  uint32_t gap = a;
+  for (uint32_t i = a; i < b;) {
+    const uint32_t j = match_flint(c, i, b);
+    if (j == i) { i++; continue; }
+    if (gap < i) bpe(t, s + c->off[gap], c->off[i] - c->off[gap], out);
+    bpe(t, s + c->off[i], c->off[j] - c->off[i], out);
+    i = gap = j;
+  }
+  if (gap < b) bpe(t, s + c->off[gap], c->off[b] - c->off[gap], out);
+}
+/* flint: the second split (CJK and kana runs apart), then the third */
+static void flint_split2(const tokenizer *t, const char *s, const cps *c, uint32_t a, uint32_t b, tok_ids *out) {
+  for (uint32_t i = a; i < b;) {
+    uint32_t j = i;
+    const int k = cjk_kana(c->cp[i]);
+    while (j < b && cjk_kana(c->cp[j]) == k) j++;
+    if (k) bpe(t, s + c->off[i], c->off[j] - c->off[i], out);
+    else flint_split3(t, s, c, i, j, out);
+    i = j;
+  }
 }
 
 /* BPE on one piece (bytes s[0 .. len)). */
@@ -342,6 +443,21 @@ static void encode_plain(const tokenizer *t, const char *s, size_t len, tok_ids 
   if (!len) return;
   cps c;
   decode(s, len, &c);
+  if (t->pre == PRE_FLINT) { /* \p{N}{1,3} apart, then the second and third splits */
+    for (uint32_t i = 0; i < c.n;) {
+      uint32_t j = i;
+      if (c.cl[i] & UC_N) {
+        while (j < c.n && j < i + 3 && (c.cl[j] & UC_N)) j++;
+        bpe(t, s + c.off[i], c.off[j] - c.off[i], out);
+      } else {
+        while (j < c.n && !(c.cl[j] & UC_N)) j++;
+        flint_split2(t, s, &c, i, j, out);
+      }
+      i = j;
+    }
+    free(c.cp), free(c.off), free(c.cl);
+    return;
+  }
   for (uint32_t i = 0; i < c.n;) {
     const uint32_t j = match(&c, i, t->pre);
     bpe(t, s + c.off[i], c.off[j] - c.off[i], out);

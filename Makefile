@@ -48,6 +48,11 @@ $(B)/chat_render: tools/chat_render.c src/chat.c src/json.c src/chat.h src/json.
 LLAMA_CPP ?= ../llama.cpp
 $(B)/tok_check: tools/tok_check.c src/tok.c src/gguf.c src/common.c src/tok.h src/tok_unicode.h | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/tok_check.c src/tok.c src/gguf.c src/common.c $(LDLIBS)
+# flint (tests/tok-flint.*: llama.cpp's test texts and more, the ids from
+# Hugging Face tokenizers with the model's tokenizer.json):
+#   make tokcheck-flint FLINT=path/to/flint.gguf (the model file, or a vocabulary-only GGUF)
+tokcheck-flint: $(B)/tok_check
+	./$(B)/tok_check $(FLINT) tests/tok-flint.inp tests/tok-flint.out
 tokcheck: $(B)/tok_check
 	./$(B)/tok_check $(LLAMA_CPP)/models/ggml-vocab-qwen2.gguf $(LLAMA_CPP)/models/ggml-vocab-qwen2.gguf.inp $(LLAMA_CPP)/models/ggml-vocab-qwen2.gguf.out
 	./$(B)/tok_check $(LLAMA_CPP)/models/ggml-vocab-qwen35.gguf $(LLAMA_CPP)/models/ggml-vocab-qwen35.gguf.inp $(LLAMA_CPP)/models/ggml-vocab-qwen35.gguf.out
@@ -145,7 +150,7 @@ proofs:
 clean:
 	rm -rf $(B) tools/__pycache__
 
-.PHONY: all test proofs clean tokcheck
+.PHONY: all test proofs clean tokcheck tokcheck-flint
 
 # prof/: the per-wave event profiler (sm_profiler.h, after leepoly/sm-profiler)
 # and its demo: build/smp_demo build/smp_demo.hsaco -> demo_trace.json

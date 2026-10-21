@@ -399,3 +399,176 @@ bad:
   sb_free(&arr);
   return 0;
 }
+
+/* ---- flint ---- */
+
+/* the template's flint_text macro on a string: without NUL, <think> and
+ * </think>; the control tokens escaped (&lt;|user|&gt;) */
+static void flint_text(sbuf *b, const char *s, size_t n) {
+  static const char *const ctl[] = {"<|begin_of_text|>", "<|end_of_text|>", "<|system|>", "<|developer|>", "<|user|>", "<|assistant|>",
+                                    "<|observation|>"};
+  for (size_t i = 0; i < n;) {
+    if (!s[i]) { i++; continue; }
+    if (s[i] == '<') {
+      if (n - i >= 7 && !memcmp(s + i, "<think>", 7)) { i += 7; continue; }
+      if (n - i >= 8 && !memcmp(s + i, "</think>", 8)) { i += 8; continue; }
+      size_t k = 0;
+      for (; k < sizeof ctl / sizeof ctl[0]; k++) {
+        const size_t L = strlen(ctl[k]);
+        if (n - i >= L && !memcmp(s + i, ctl[k], L)) {
+          sb_puts(b, "&lt;"), sb_add(b, ctl[k] + 1, L - 2), sb_puts(b, "&gt;");
+          i += L;
+          break;
+        }
+      }
+      if (k < sizeof ctl / sizeof ctl[0]) continue;
+    }
+    sb_add(b, s + i, 1), i++;
+  }
+}
+
+/* a flint tool call: <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>
+ * (V: a string as it is, any other value as JSON) */
+static int flint_call(sbuf *b, const jval *tc, char *err, size_t errn) {
+  const jval *f = json_get(tc, "function");
+  if (f) tc = f;
+  const jval *name = json_get(tc, "name"), *args = json_get(tc, "arguments");
+  if (!name || name->t != J_STR) { snprintf(err, errn, "a tool call has no function name"); return 0; }
+  sb_puts(b, "<tool_call>"), sb_add(b, name->str, name->slen);
+  jval *parsed = NULL;
+  if (args && args->t == J_STR && args->slen) { /* OpenAI sends the arguments as a JSON string */
+    char e2[128];
+    parsed = json_parse(args->str, args->slen, e2, sizeof e2);
+    if (!parsed || parsed->t != J_OBJ) {
+      json_free(parsed);
+      snprintf(err, errn, "the arguments of a tool call are not a JSON object");
+      return 0;
+    }
+    args = parsed;
+  }
+  if (args && args->t == J_OBJ)
+    for (const jval *a = args->kid; a; a = a->next) {
+      sb_puts(b, "<arg_key>"), sb_puts(b, a->key), sb_puts(b, "</arg_key><arg_value>");
+      if (a->t == J_STR) sb_add(b, a->str, a->slen);
+      else py_json(b, a);
+      sb_puts(b, "</arg_value>");
+    }
+  sb_puts(b, "</tool_call>");
+  json_free(parsed);
+  return 1;
+}
+
+/* Jinja's truth of a message field: present, not null, not "" */
+static int truthy(const jval *v) { return v && v->t != J_NULL && v->t != J_FALSE && !(v->t == J_STR && !v->slen) && !(v->t == J_ARR && !v->kid); }
+
+int chat_render_flint(const jval *msgs, const jval *tools, chat_prompt *p, char *err, size_t errn) {
+  memset(p, 0, sizeof *p);
+  if (!msgs || msgs->t != J_ARR || !msgs->kid) { snprintf(err, errn, "\"messages\" must be a non-empty array"); return 0; }
+  if (tools && (tools->t != J_ARR || !tools->kid)) tools = NULL;
+  sbuf *b = &p->text, pre = {0};
+  if (tools) { /* the tool preamble */
+    sb_puts(&pre, "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with "
+                  "function signatures within <tools></tools> XML tags:\n<tools>");
+    for (const jval *t = tools->kid; t; t = t->next) {
+      const jval *fn = json_get(t, "function");
+      py_json(&pre, fn ? fn : t); /* back to back: trim_blocks (as transformers renders the template) */
+    }
+    sb_puts(&pre, "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n"
+                  "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n");
+  }
+  int pending = 1, ok = 0;
+  for (const jval *m = msgs->kid; m; m = m->next) {
+    const jval *r = json_get(m, "role");
+    if (!r || r->t != J_STR) { snprintf(err, errn, "a message has no role"); goto done; }
+    const char *role = r->str;
+    if (pending && strcmp(role, "system")) sb_add(b, pre.p ? pre.p : "", pre.n), pending = 0;
+    sbuf c = {0};
+    if (!content_of(json_get(m, "content"), &c)) { sb_free(&c); snprintf(err, errn, "only text content is supported"); goto done; }
+    if (!strcmp(role, "system") || !strcmp(role, "developer") || !strcmp(role, "user")) {
+      sb_puts(b, !strcmp(role, "system") ? "<|system|>" : !strcmp(role, "developer") ? "<|developer|>" : "<|user|>");
+      flint_text(b, c.p ? c.p : "", c.n);
+    } else if (!strcmp(role, "assistant")) {
+      sb_puts(b, "<|assistant|>");
+      const jval *rc = json_get(m, "reasoning_content");
+      if (truthy(rc) && rc->t == J_STR) sb_puts(b, "<think>"), sb_add(b, rc->str, rc->slen), sb_puts(b, "</think>");
+      if (c.n) sb_add(b, c.p, c.n);
+      const jval *tcs = json_get(m, "tool_calls");
+      if (tcs && tcs->t == J_ARR)
+        for (const jval *tc = tcs->kid; tc; tc = tc->next)
+          if (!flint_call(b, tc, err, errn)) { sb_free(&c); goto done; }
+    } else if (!strcmp(role, "tool")) {
+      sb_puts(b, "<|observation|><tool_response>"), flint_text(b, c.p ? c.p : "", c.n), sb_puts(b, "</tool_response>");
+    }
+    sb_free(&c);
+  }
+  if (pending) sb_add(b, pre.p ? pre.p : "", pre.n);
+  sb_puts(b, "<|assistant|>");
+  seg_push(p, SEG_TEXT, 0, b->n);
+  ok = 1;
+done:
+  sb_free(&pre);
+  if (!ok) chat_prompt_free(p);
+  return ok;
+}
+
+int chat_tool_calls_flint(const char *s, size_t n, const jval *tools, const char *id_prefix, sbuf *out) {
+  const char *e = s + n, *q = s;
+  sbuf arr = {0};
+  int k = 0;
+  sb_add(&arr, "[", 1);
+  while ((q = find(q, e, "<tool_call>"))) {
+    const char *name = q + 11, *end = find(name, e, "</tool_call>");
+    if (!end) end = e; /* the model may stop before </tool_call> */
+    const char *ne = find(name, end, "<arg_key>");
+    if (!ne) ne = end;
+    const char *nm = name;
+    size_t nn = (size_t)(ne - name);
+    py_trim(&nm, &nn);
+    if (!nn) goto bad;
+    if (k) sb_add(&arr, ",", 1);
+    sb_printf(&arr, "{\"id\":\"%s%d\",\"type\":\"function\",\"function\":{\"name\":", id_prefix, k);
+    sb_json_str(&arr, nm, nn);
+    sbuf args = {0};
+    sb_add(&args, "{", 1);
+    int np = 0;
+    for (const char *pp = ne; (pp = find(pp, end, "<arg_key>")) != NULL;) {
+      const char *key = pp + 9, *ke = find(key, end, "</arg_key>");
+      if (!ke) { sb_free(&args); goto bad; }
+      const char *v = find(ke, end, "<arg_value>");
+      if (!v) { sb_free(&args); goto bad; }
+      v += 11;
+      const char *ve = find(v, end, "</arg_value>");
+      if (!ve) ve = end;
+      const size_t kn = (size_t)(ke - key), vn = (size_t)(ve - v);
+      if (np++) sb_add(&args, ", ", 2);
+      sb_json_str(&args, key, kn);
+      sb_add(&args, ": ", 2);
+      const char *ty = param_type(tools, nm, nn, key, kn);
+      jval *jv = NULL;
+      if (strcmp(ty, "string")) { /* not a string by the schema (or unknown): the value as JSON if it is valid */
+        char e2[64];
+        jv = json_parse(v, vn, e2, sizeof e2);
+        if (jv && !*ty && jv->t == J_STR) json_free(jv), jv = NULL; /* unknown type: a JSON string stays the text itself */
+      }
+      if (jv) py_json(&args, jv);
+      else sb_json_str(&args, v, vn);
+      json_free(jv);
+      pp = ve == end ? end : ve + 12;
+    }
+    sb_add(&args, "}", 1);
+    sb_puts(&arr, ",\"arguments\":");
+    sb_json_str(&arr, args.p, args.n);
+    sb_puts(&arr, "}}");
+    sb_free(&args);
+    k++;
+    q = end == e ? e : end + 12;
+  }
+  sb_add(&arr, "]", 1);
+  if (!k) goto bad;
+  sb_add(out, arr.p, arr.n);
+  sb_free(&arr);
+  return k;
+bad:
+  sb_free(&arr);
+  return 0;
+}

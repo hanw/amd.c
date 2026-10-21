@@ -891,6 +891,40 @@ Q6_K（`MAT_Q6K`）：地址在数组内（`q6k_addr`）、高位打包和解包
 
 **没有测试**：长于 4020 个位置的上下文、Qwen2.5-0.5B 和 1.5B 以外的真实模型、头的大小超过 256 的模型（会走旧的注意力核函数）。
 
+### Flint（Recursive，flint 架构，2026-10-21，GPU 上还没有运行）
+
+模型：[RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint)，混合专家（MoE），共 398 亿参数，每个 token 约 25 亿参数参与计算。
+文件：unsloth/flint-GGUF 的 `flint-preview-UD-Q4_K_XL.gguf`（25.05 GB）。
+
+结构（`src/model.c` 的 `flint_layer`、`moe_block`）：
+
+- 49 层。前 2 层是普通 FFN，后 47 层是 MoE：256 个专家选 6 个，再加 1 个共享专家（没有门）。
+- 路由：sigmoid，按 sigmoid（加可选偏置）选前 6 个；权重 = sigmoid / 6 个的和。
+- 注意力：每个头先做 RMSNorm（q、k）；每个头有一个可学习的 sink（只进 softmax 的分母）。
+- 35 层是滑动窗口（513 个位置，含当前位置），用 RoPE；14 层是全注意力，不用 RoPE。
+- 滑动窗口层的 KV 缓存是环形（`graph.kv_len`、`kv_off`）：长度是 2 的幂，至少 513 + 一次运行的 token 数（1024）。
+
+新的权重格式（`core/ie_ext.h`：已测试，没有证明）：
+
+- `MAT_Q5K`：Q5_K 原生读取（以前转成 Q8_0）。低 4 位同 `MAT_Q4K`，第 5 位每 32 个权重一个字。只有 flint 默认使用（`IE_Q5K_NATIVE=1` 可用于其他模型）。
+- `MAT_IQ4XS`：IQ4_XS。4 位索引查 16 个值的表；GPU 用两次 `v_perm_b32` 加一次字节选择。
+- IQ3_S（文件里只有 1 层的 gate/up 专家）：加载时转成 Q8_0。
+
+测试（本机，CPU）：
+
+- `make test`：`ext_test`（Q5_K、IQ4_XS 的 GEMV 对照 GGUF 公式；IQ4 查表的 GPU 写法，65536 个输入）；`tiny-flint.gguf`（5 层，包含文件里的全部格式，窗口 4，环形缓存会回绕）对照 numpy 参考（q8 和 float 两种模式）；提示缓存检查。
+- 分词器：`make tokcheck-flint FLINT=模型文件`。64 段文本（llama.cpp 的测试文本，加代码、多种文字、表情、数字）与 Hugging Face tokenizers 的结果逐个 token 相同。
+- 聊天模板：`tools/chat_check.py --flint 模板文件 build/chat_render`。8 个请求与 transformers 渲染的文本相同；渲染后的 token 与 Hugging Face 相同。
+
+GPU（`ie_kernels.c` 末尾 flint 部分）：每次一个 token。专家 GEMV 一次启动做 6 个专家（grid y = 专家槽）。
+目前每个算子逐 token 运行（预填充也是），不用大核函数。
+
+`ie-serve`：flint 用自己的模板（`chat_render_flint`）；遇到 `tokenizer.ggml.eog_token_ids` 中的 token 停止；
+回答以 `<think>` 开始时，`</think>` 之前的文本是 reasoning_content；工具调用格式是
+`<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`。
+
+显存估计（引擎的格式 26.3 GB，加 KV 缓存）：上下文 65536 时 28.3 GB，131072 时 30.1 GB。
+
 ## 信任边界
 
 C 代码调用的是同一个验证头文件 `core/ie_core.h`；cpp-lean 把同一个文件翻译成 Lean。

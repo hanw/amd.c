@@ -79,8 +79,13 @@ static graph GR;
 static backend *B;
 static gen_ctx GC;
 static tokenizer *TK;          /* read-only after the start: the connection threads use it too */
-static int64_t STOP_IDS[4];    /* eos, <|im_end|>, <|endoftext|>; -1: none */
+static int64_t STOP_IDS[8];    /* eos, <|im_end|>, <|endoftext|> (flint: tokenizer.ggml.eog_token_ids); -1: none */
 static int64_t IM_START, IM_END;
+/* flint: its own chat template (chat_render_flint), the prompt tokenized with
+ * the control tokens; the model decides whether it reasons: an answer that
+ * starts with <think> (THINK_ID) is reasoning up to </think> */
+static int FLINT;
+static int64_t THINK_ID = -1;
 static char MODEL_ID[256];
 static time_t T_START;
 
@@ -104,7 +109,9 @@ typedef struct job {
   long tc_at;          /* the start of the first "<tool_call>" (-1: none) */
   uint32_t n_tok;      /* output tokens, without the stop token */
   int finish;          /* 0: length, 1: stop, 2: client gone */
-  int think;           /* the prompt ends with <think>\n: the answer text starts with it too */
+  int think;           /* the answer text starts with the opening of a reasoning block (rp bytes) */
+  int auto_think;      /* flint: think is set by the first token (<think>) */
+  size_t rp;           /* the bytes of that opening: 8 ("<think>\n", Qwen: the prompt's), 7 ("<think>", flint) */
   int content_started; /* split reasoning: a content character after </think> was sent */
   int dead;            /* a write failed */
 } job;
@@ -172,7 +179,7 @@ static int peer_gone(int fd) {
 
 /* ---- the response, written by the engine thread ---- */
 static int is_stop(uint32_t t) {
-  for (int i = 0; i < 4; i++)
+  for (int i = 0; i < 8; i++)
     if (STOP_IDS[i] >= 0 && (uint32_t)STOP_IDS[i] == t) return 1;
   return 0;
 }
@@ -271,7 +278,7 @@ static void flush_text(job *j, int final) {
   if (j->stream && !split_think(j)) sse_chunk(j, j->all.p + j->sent, e - j->sent, NULL);
   else if (j->stream) {
     const char *s = j->all.p;
-    size_t a = j->sent > 8 ? j->sent : 8, re = reason_end(j, e);
+    size_t a = j->sent > j->rp ? j->sent : j->rp, re = reason_end(j, e);
     if (a < re) sse_field(j, "reasoning_content", s + a, re - a);
     if (j->think_end >= 0) {
       size_t c = j->sent > (size_t)j->think_end ? j->sent : (size_t)j->think_end;
@@ -289,6 +296,8 @@ static int on_tokens(void *ctx, const uint32_t *t, uint32_t n) {
       j->finish = 1;
       return 1;
     }
+    if (j->auto_think && j->n_tok == 0 && THINK_ID >= 0 && t[i] == (uint32_t)THINK_ID) /* flint: a reasoning block */
+      j->think = 1, j->think_end = -1, j->rp = 7;
     uint32_t len;
     char *s = model_detok(&M, t[i], &len);
     sb_add(&j->all, s, len);
@@ -313,7 +322,7 @@ static void run_job(job *j) {
     if (send_all(j->fd, h, strlen(h))) return;
     sse_chunk(j, NULL, 0, NULL); /* the role */
   }
-  j->think_end = j->think ? -1 : 0, j->tc_at = -1;
+  j->think_end = j->think ? -1 : 0, j->tc_at = -1, j->rp = 8;
   sb_add(&j->all, "", 0);
   if (j->think) sb_add(&j->all, "<think>\n", 8); /* the prompt opened <think>: the client sees the whole block (Open WebUI folds it) */
   flush_text(j, 0);
@@ -327,7 +336,8 @@ static void run_job(job *j) {
   snprintf(idp, sizeof idp, "call_%lx%lu_", (unsigned long)T_START, j->rid);
   int n_calls = 0;
   if (j->tc_at >= 0 && j->finish != 2) {
-    n_calls = chat_tool_calls(j->all.p + j->tc_at, j->all.n - (size_t)j->tc_at, j->tools, idp, &calls);
+    n_calls = FLINT ? chat_tool_calls_flint(j->all.p + j->tc_at, j->all.n - (size_t)j->tc_at, j->tools, idp, &calls)
+                    : chat_tool_calls(j->all.p + j->tc_at, j->all.n - (size_t)j->tc_at, j->tools, idp, &calls);
     if (!n_calls) j->tc_at = -1; /* not valid: send it as text */
   }
   flush_text(j, 1); /* the rest of the text (an invalid UTF-8 sequence becomes U+FFFD) */
@@ -374,10 +384,10 @@ static void run_job(job *j) {
       const char *s = j->all.p;
       size_t c = j->think_end >= 0 ? (size_t)j->think_end : cn, re = reason_end(j, cn);
       while (c < cn && strchr(" \t\r\n", s[c])) c++;
-      while (re > 8 && strchr(" \t\r\n", s[re - 1])) re--;
+      while (re > j->rp && strchr(" \t\r\n", s[re - 1])) re--;
       sb_json_str(&b, c < cn ? s + c : "", c < cn ? cn - c : 0);
       sb_puts(&b, ",\"reasoning_content\":");
-      sb_json_str(&b, re > 8 ? s + 8 : "", re > 8 ? re - 8 : 0);
+      sb_json_str(&b, re > j->rp ? s + j->rp : "", re > j->rp ? re - j->rp : 0);
     }
     if (n_calls) sb_puts(&b, ",\"tool_calls\":"), sb_add(&b, calls.p, calls.n);
     sb_printf(&b, "},\"finish_reason\":\"%s\"}],\"usage\":%s}", fin, us.p);
@@ -421,13 +431,28 @@ static void *engine_main(void *arg) {
   }
   char err[256];
   if (!(TK = tok_open(&M, &G, err, sizeof err))) ie_die("tokenizer: %s", err);
-  IM_START = tok_find(TK, "<|im_start|>"), IM_END = tok_find(TK, "<|im_end|>");
-  if (IM_START < 0 || IM_END < 0) ie_die("the vocabulary has no <|im_start|> or <|im_end|> (ChatML)");
+  for (int i = 0; i < 8; i++) STOP_IDS[i] = -1;
   int64_t eos = -1;
   if (!gguf_get_int(&G, "tokenizer.ggml.eos_token_id", &eos)) eos = -1;
-  STOP_IDS[0] = eos, STOP_IDS[1] = IM_END, STOP_IDS[2] = tok_find(TK, "<|endoftext|>"), STOP_IDS[3] = -1;
+  FLINT = M.arch == ARCH_FLINT;
+  if (FLINT) { /* the end-of-generation tokens: <|end_of_text|>, <|user|>, <|observation|>, <|developer|> */
+    THINK_ID = tok_find(TK, "<think>");
+    const gguf_kv *eg = gguf_find(&G, "tokenizer.ggml.eog_token_ids");
+    int ns = 0;
+    if (eg && eg->type == GGUF_ARR && (eg->arr_type == GGUF_I32 || eg->arr_type == GGUF_U32))
+      for (uint64_t i = 0; i < eg->arr_n && ns < 7; i++) {
+        int32_t x;
+        memcpy(&x, eg->arr_data + 4 * i, 4);
+        STOP_IDS[ns++] = x;
+      }
+    if (!ns) STOP_IDS[ns++] = eos, STOP_IDS[ns++] = tok_find(TK, "<|user|>"), STOP_IDS[ns++] = tok_find(TK, "<|observation|>");
+  } else {
+    IM_START = tok_find(TK, "<|im_start|>"), IM_END = tok_find(TK, "<|im_end|>");
+    if (IM_START < 0 || IM_END < 0) ie_die("the vocabulary has no <|im_start|> or <|im_end|> (ChatML)");
+    STOP_IDS[0] = eos, STOP_IDS[1] = IM_END, STOP_IDS[2] = tok_find(TK, "<|endoftext|>");
+  }
   const char *xs = getenv("IE_EXTRA_STOP"); /* tests: one more stop token id */
-  if (xs) STOP_IDS[3] = atoll(xs);
+  if (xs) STOP_IDS[7] = atoll(xs);
   if (!O.name) {
     char *gn = gguf_get_str(&G, "general.name");
     snprintf(MODEL_ID, sizeof MODEL_ID, "%s", gn ? gn : "amd-infer");
@@ -442,8 +467,11 @@ static void *engine_main(void *arg) {
   plan_arena(&GR, 1);
   B = gpu ? gpu_open(&M, &GR, O.hsaco) : cpu_open(&M, &GR);
   gen_init(&GC, B, &M, &GR);
-  fprintf(stderr, "model \"%s\": vocab %u, pre-tokenizer %s, context %u, drafts %u%s, stop tokens %lld %lld %lld\n", MODEL_ID, M.vocab,
-          tok_pre(TK), O.ctx, O.draft, M.df ? " (+ DFlash)" : "", (long long)STOP_IDS[0], (long long)STOP_IDS[1], (long long)STOP_IDS[2]);
+  fprintf(stderr, "model \"%s\": vocab %u, pre-tokenizer %s, context %u, drafts %u%s, stop tokens", MODEL_ID, M.vocab, tok_pre(TK), O.ctx,
+          O.draft, M.df ? " (+ DFlash)" : "");
+  for (int i = 0; i < 8; i++)
+    if (STOP_IDS[i] >= 0) fprintf(stderr, " %lld", (long long)STOP_IDS[i]);
+  fprintf(stderr, "%s\n", FLINT ? " (flint chat template)" : "");
 
   pthread_mutex_lock(&QM);
   IS_READY = 1;
@@ -542,6 +570,10 @@ static int same_secret(const char *a, const char *b) {
 /* The prompt tokens: control tokens as ids, text without control tokens
  * (a user cannot write <|im_start|> into the prompt). */
 static void prompt_tokens(const chat_prompt *p, tok_ids *out) {
+  if (FLINT) { /* the whole text with the control tokens (see chat_render_flint) */
+    tok_encode(TK, p->text.p, p->text.n, 1, out);
+    return;
+  }
   for (size_t i = 0; i < p->n_seg; i++) {
     const chat_seg *s = &p->seg[i];
     if (s->kind == SEG_IM_START) tok_ids_push(out, (uint32_t)IM_START);
@@ -578,7 +610,7 @@ static void handle_chat(int fd, const request *r) {
   if (num_field(root, "top_k", &v)) j->gp.top_k = v < 0 ? 0 : (uint32_t)v;
   j->gp.seed = num_field(root, "seed", &v) ? (uint64_t)(int64_t)v : (uint64_t)time(NULL) ^ ((uint64_t)fd << 32);
   j->gp.draft = O.draft, j->gp.pmin = O.pmin, j->gp.chunk = O.chunk, j->gp.cache = O.cache;
-  j->gp.stops = STOP_IDS, j->gp.n_stops = 4;
+  j->gp.stops = STOP_IDS, j->gp.n_stops = 8;
   if (num_field(root, "n", &v) && v != 1) {
     http_error(fd, 400, "invalid_request_error", "only n = 1 is supported");
     goto bad;
@@ -595,14 +627,15 @@ static void handle_chat(int fd, const request *r) {
   const jval *ef = json_get(root, "reasoning_effort");
   if (!ef || ef->t != J_STR) ef = json_get(kw, "reasoning_effort");
   if (ef && ef->t == J_STR) effort = ef->str;
-  j->think = think;
+  j->think = FLINT ? 0 : think, j->auto_think = FLINT;
 
   /* tools: rendered into the prompt, and the answer's <tool_call> blocks become tool_calls */
   const jval *tools = json_get(root, "tools"), *tc = json_get(root, "tool_choice");
   if (!tools || tools->t != J_ARR || !tools->kid || (tc && tc->t == J_STR && !strcmp(tc->str, "none"))) tools = NULL;
   j->tools = tools;
   chat_prompt cp;
-  if (!chat_render(json_get(root, "messages"), tools, think, effort, &cp, err, sizeof err)) {
+  if (FLINT ? !chat_render_flint(json_get(root, "messages"), tools, &cp, err, sizeof err)
+            : !chat_render(json_get(root, "messages"), tools, think, effort, &cp, err, sizeof err)) {
     http_error(fd, 400, "invalid_request_error", "%s", err);
     goto bad;
   }
