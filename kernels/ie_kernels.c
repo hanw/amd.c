@@ -3956,43 +3956,38 @@ KERNEL ie_gexp(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32
   else gemv_iq4xsq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
 }
 
-/* Routing (wave 0 alone, no LDS: the megakernel; n <= 1024 experts, K <=
- * 16): s = sigmoid(logit); the K largest s + bias, one at a time (ties: the
- * smaller index); out = [K ids | K weights], weight k = s_k / (sum of the K
- * s + 1e-20) * scale, the sum in the order of the choice (as moe_route in
- * cpu.c). Lane l holds the experts l, l + 32, ... */
+/* Routing (wave 0 alone, no LDS, few registers: the megakernel; n <= 1024
+ * experts, K <= 16 <= 32): s = sigmoid(logit); the K largest s + bias, one
+ * at a time (ties: the smaller index); out = [K ids | K weights], weight k =
+ * s_k / (sum of the K s + 1e-20) * scale, the sum in the order of the choice
+ * (as moe_route in cpu.c). Lane l owns the experts l + 32 j (bit j of its
+ * used mask); each round computes their sigmoids again; lane k keeps choice k. */
 KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float scale, G u32 *out) {
   if (tid() >= 32u) return;
-  const u32 l = lane();
-  float sg[32], c[32];
-  for (u32 j = 0; j < 32u; j++) {
-    const u32 i = l + 32u * j;
-    sg[j] = i < n ? 1.0f / (1.0f + __builtin_expf(-lg[i])) : 0.0f;
-    c[j] = i < n ? (bias ? sg[j] + bias[i] : sg[j]) : -__builtin_inff();
-  }
-  float wsel[16], sum = 0.0f;
-  u32 isel[16];
+  const u32 l = lane(), nj = (n + 31u) >> 5;
+  u32 used = 0u, myid = 0u;
+  float myw = 0.0f, sum = 0.0f;
   for (u32 k = 0; k < K; k++) {
-    float bv = -__builtin_inff();
+    float bv = -__builtin_inff(), bs = 0.0f;
     u32 bi = 0xFFFFFFFFu;
-    for (u32 j = 0; j < 32u; j++) /* the lane's best: its smallest index first (j ascending) */
-      if (l + 32u * j < n && better(c[j], l + 32u * j, bv, bi)) bv = c[j], bi = l + 32u * j;
-    for (u32 m = 16u; m >= 1u; m >>= 1) { /* the wave's best (ties: smaller index) */
-      const float ov = shfl_xor_f(bv, m);
-      const u32 oi = (u32)__builtin_amdgcn_ds_bpermute((int)((l ^ m) << 2), (int)bi);
-      if (better(ov, oi, bv, bi)) bv = ov, bi = oi;
+    for (u32 j = 0; j < nj; j++) { /* the lane's best: its smallest index first */
+      const u32 i = l + 32u * j;
+      if (i < n && !((used >> j) & 1u)) {
+        const float sg = 1.0f / (1.0f + __builtin_expf(-lg[i])), c = bias ? sg + bias[i] : sg;
+        if (better(c, i, bv, bi)) bv = c, bi = i, bs = sg;
+      }
     }
-    for (u32 j = 0; j < 32u; j++) /* mark it used; its sigmoid to every lane */
-      if (l + 32u * j == bi) c[j] = -__builtin_inff();
-    float sb = 0.0f;
-    for (u32 j = 0; j < 32u; j++) sb = l + 32u * j == bi ? sg[j] : sb;
-    sb = I2F(__builtin_amdgcn_readlane(F2I(wave_max_pos(sb)), 0)); /* sigmoid > 0: the one non-zero */
-    isel[k] = bi, wsel[k] = sb, sum += sb;
+    for (u32 m = 16u; m >= 1u; m >>= 1) { /* the wave's best (ties: the smaller index) */
+      const float ov = shfl_xor_f(bv, m), os = shfl_xor_f(bs, m);
+      const u32 oi = (u32)__builtin_amdgcn_ds_bpermute((int)((l ^ m) << 2), (int)bi);
+      if (better(ov, oi, bv, bi)) bv = ov, bi = oi, bs = os;
+    }
+    if ((bi & 31u) == l) used |= 1u << (bi >> 5);
+    if (l == k) myid = bi, myw = bs;
+    sum += bs;
   }
-  if (l == 0u) {
-    const float inv = 1.0f / (sum + 1e-20f);
-    for (u32 k = 0; k < K; k++) out[k] = isel[k], ((G float *)out)[K + k] = wsel[k] * inv * scale;
-  }
+  const float inv = 1.0f / (sum + 1e-20f);
+  if (l < K) out[l] = myid, ((G float *)out)[K + l] = myw * inv * scale;
 }
 
 /* out = res + sum over slots k of weight_k y_k (fma, slot order). */
