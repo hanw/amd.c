@@ -4051,8 +4051,66 @@ KERNEL ie_gexp(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32
  * s_k / (sum of the K s + 1e-20) * scale, the sum in the order of the choice
  * (as moe_route in cpu.c). Lane l owns the experts l + 32 j (bit j of its
  * used mask); each round computes their sigmoids again; lane k keeps choice k. */
+/* The wave maximum (any sign; v of every lane), in every lane: DPP inside
+ * each row of 16 (a lane past the row keeps its own value), then the two rows. */
+static inline float wave_max_any(float v) {
+  v = __builtin_fmaxf(v, I2F(__builtin_amdgcn_update_dpp(F2I(v), F2I(v), 0x108, 0xF, 0xF, false)));
+  v = __builtin_fmaxf(v, I2F(__builtin_amdgcn_update_dpp(F2I(v), F2I(v), 0x104, 0xF, 0xF, false)));
+  v = __builtin_fmaxf(v, I2F(__builtin_amdgcn_update_dpp(F2I(v), F2I(v), 0x102, 0xF, 0xF, false)));
+  v = __builtin_fmaxf(v, I2F(__builtin_amdgcn_update_dpp(F2I(v), F2I(v), 0x101, 0xF, 0xF, false)));
+  return __builtin_fmaxf(I2F(__builtin_amdgcn_readlane(F2I(v), 0)), I2F(__builtin_amdgcn_readlane(F2I(v), 16)));
+}
+static inline u32 wave_min_u(u32 v) {
+  u32 t;
+  t = (u32)__builtin_amdgcn_update_dpp((int)v, (int)v, 0x108, 0xF, 0xF, false), v = t < v ? t : v;
+  t = (u32)__builtin_amdgcn_update_dpp((int)v, (int)v, 0x104, 0xF, 0xF, false), v = t < v ? t : v;
+  t = (u32)__builtin_amdgcn_update_dpp((int)v, (int)v, 0x102, 0xF, 0xF, false), v = t < v ? t : v;
+  t = (u32)__builtin_amdgcn_update_dpp((int)v, (int)v, 0x101, 0xF, 0xF, false), v = t < v ? t : v;
+  const u32 a = (u32)__builtin_amdgcn_readlane((int)v, 0), b = (u32)__builtin_amdgcn_readlane((int)v, 16);
+  return a < b ? a : b;
+}
+/* ie_moe_route for n <= 256: lane l keeps the sigmoids (and choice values) of
+ * its 8 experts l + 32 j; per round the largest choice value (wave_max_any),
+ * then the smallest index that has it (wave_min_u): the same choice and the
+ * same sum order as the general form. */
+static inline void moe_route8(const G float *lg, u32 n, u32 K, const G float *bias, float scale, G u32 *out) {
+  const u32 l = lane();
+  float sg[8], c[8];
+  for (u32 j = 0; j < 8u; j++) {
+    const u32 i = l + 32u * j;
+    sg[j] = i < n ? 1.0f / (1.0f + __builtin_expf(-lg[i])) : 0.0f;
+    c[j] = i < n ? (bias ? sg[j] + bias[i] : sg[j]) : -__builtin_inff();
+  }
+  u32 myid = 0u;
+  float myw = 0.0f, sum = 0.0f;
+  for (u32 k = 0; k < K; k++) {
+    float bv = -__builtin_inff();
+    for (u32 j = 0; j < 8u; j++) bv = __builtin_fmaxf(bv, c[j]);
+    const float M = wave_max_any(bv);
+    u32 bi = 0xFFFFFFFFu;
+    for (u32 j = 8u; j-- > 0u;) /* the smallest index of this lane with the maximum */
+      if (c[j] == M) bi = l + 32u * j;
+    bi = wave_min_u(bi);
+    const u32 own = bi & 31u, jj = bi >> 5;
+    float sb = 0.0f;
+    for (u32 j = 0; j < 8u; j++)
+      if (j == jj) {
+        sb = sg[j];
+        if (l == own) c[j] = -__builtin_inff();
+      }
+    sb = I2F(__builtin_amdgcn_readlane(F2I(sb), __builtin_amdgcn_readfirstlane(own)));
+    if (l == k) myid = bi, myw = sb;
+    sum += sb;
+  }
+  const float inv = 1.0f / (sum + 1e-20f);
+  if (l < K) out[l] = myid, ((G float *)out)[K + l] = myw * inv * scale;
+}
 KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float scale, G u32 *out) {
   if (tid() >= 32u) return;
+  if (n <= 256u) {
+    moe_route8(lg, n, K, bias, scale, out);
+    return;
+  }
   const u32 l = lane(), nj = (n + 31u) >> 5;
   u32 used = 0u, myid = 0u;
   float myw = 0.0f, sum = 0.0f;
@@ -4164,6 +4222,19 @@ KERNEL ie_attn_sw(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
   barrier();
   float M = at_m[0];
   for (u32 x = 1; x < 8u; x++) M = __builtin_fmaxf(M, at_m[x]);
+  if (nsplit == 1u) { /* one split: the output directly (no partial results, no count) */
+    const float sk = sinks ? sinks[h] : -__builtin_inff(), M2 = __builtin_fmaxf(M, sk);
+    float L = sinks ? __builtin_expf(sk - M2) : 0.0f;
+    for (u32 x = 0; x < 8u; x++) L += at_m[x] == -__builtin_inff() ? 0.0f : at_l[x] * __builtin_expf(at_m[x] - M2);
+    if (tid() < hd) {
+      float o = 0.0f;
+      for (u32 x = 0; x < 8u; x++) o += at_m[x] == -__builtin_inff() ? 0.0f : at_o[x][tid()] * __builtin_expf(at_m[x] - M2);
+      o = o / L;
+      out[h * hd + tid()] = o;
+      if (oq) quant_wave(o, (h * hd + tid()) >> 5, oq, (n_head * hd) >> 5);
+    }
+    return;
+  }
   G float *pp = part + (unsigned long)(h * nsplit + s) * (hd + 2u);
   if (tid() < hd) {
     float o = 0.0f;
