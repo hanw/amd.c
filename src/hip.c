@@ -140,6 +140,8 @@ typedef struct {
   int attn_split;          /* use ie_attn_split (hd <= IE_ATT_MAX_HD, and not IE_ATTN=old) */
   int attn_gq;             /* flint: ie_attn_gq for decode (IE_ATTN_SW=1: ie_attn_sw) */
   uint32_t gq_ch;          /* its chunk: 256 positions (IE_ATTN_GQ_CH: 1 .. 256, for tests) */
+  uint32_t gq_min;         /* from this position count on (IE_ATTN_GQ_MIN) */
+  int flint;               /* the model is flint (its megakernel builds) */
   int attn_kv;             /* use ie_attn_kv for decode and verify (the K/V of a split read once; not IE_ATTN=split) */
   /* IE_ATTN=check: after each ie_attn_split, also run ie_attn into chk and
    * compare the two outputs on the host (max |a - b| / max |a|). */
@@ -178,6 +180,14 @@ typedef struct {
   double *pms;
   uint32_t psteps;
 } gpu_backend;
+
+/* flint: ie_attn_gq (the q heads of a kv head together) for a token at
+ * position pos when pos + 1 >= gq_min, else ie_attn_sw; the whole step the
+ * same (the megakernel build). IE_GQ_MIN: measured, see README. */
+#ifndef IE_GQ_MIN
+#define IE_GQ_MIN 4096u
+#endif
+static int gq_use(const gpu_backend *b, uint32_t pos) { return b->attn_gq && pos + 1u >= b->gq_min; }
 
 static void *upload(gpu_backend *b, const void *host, size_t bytes) {
   for (uint32_t i = 0; i < b->nh; i++)
@@ -491,6 +501,9 @@ static void mk_check(u32 pos) {
  * wave (ie_gemv_q4kq8_tr, ie_gemv_q6kq8_tr; bitwise equal to the others):
  * the 8-row ones (ts2, tr8) need about 192 VGPRs alone, and with them the
  * megakernel spills (IE_MK_LIGHT=0: keep them, launched apart). */
+/* the builds (the sets of tools/mk_gen.py, in order), next to the kernels */
+static const char *const mk_file[MK_NSETS] = {"ie_mk.hsaco", "ie_mk_mtp.hsaco", "ie_mk_flint.hsaco", "ie_mk_flintl.hsaco"};
+static const char *const mk_setname[MK_NSETS] = {"decode", "verify", "flint decode", "flint decode (long)"};
 static int mk_light(void) { return mk.rec && mk.set == MKSET_MTP && mk.light; }
 /* 1: the launch went to the list */
 static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **args) {
@@ -499,7 +512,7 @@ static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **ar
     /* a kernel the build does not have: the runs of this kind go back to
      * launches (a list cut at every such kernel is slower than launches) */
     if (!mk.off[mk.set])
-      fprintf(stderr, "gpu: megakernel off for %s runs (%s is not in it)\n", mk.set == MKSET_DECODE ? "decode" : "verify",
+      fprintf(stderr, "gpu: megakernel off for %s runs (%s is not in it)\n", mk_setname[mk.set],
               kname[k]);
     mk.off[mk.set] = 1;
     mk_flush();
@@ -577,11 +590,10 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   if (mkon) {
     const char *sl = strrchr(hsaco, '/');
     const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
-    static const char *const mkf0[2] = {"ie_mk.hsaco", "ie_mk_mtp.hsaco"};
-    for (int st = 0; st < 2 && mkon; st++) {
+    for (int st = 0; st < MK_NSETS && mkon; st++) {
       char *path = malloc(dl + 32);
       memcpy(path, hsaco, dl);
-      strcpy(path + dl, mkf0[st]);
+      strcpy(path + dl, mk_file[st]);
       FILE *mf = fopen(path, "rb");
       if (!mf) fprintf(stderr, "gpu: megakernel off (no %s; IE_MK=0 to turn it off quietly)\n", path), mkon = 0;
       else fclose(mf);
@@ -591,11 +603,10 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   if (mkon) {
     const char *sl = strrchr(hsaco, '/');
     const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
-    static const char *const mkf[MK_NSETS] = {"ie_mk.hsaco", "ie_mk_mtp.hsaco"};
     for (int st = 0; st < MK_NSETS; st++) {
       char *path = malloc(dl + 32);
       memcpy(path, hsaco, dl);
-      strcpy(path + dl, mkf[st]);
+      strcpy(path + dl, mk_file[st]);
       FILE *mf = fopen(path, "rb");
       if (!mf) ie_die("IE_MK: cannot open %s (make %s)", path, path);
       fseek(mf, 0, SEEK_END);
@@ -621,6 +632,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     }
     mk.np[MKSET_DECODE] = getenv("IE_MK_NP") ? (u32)atoi(getenv("IE_MK_NP")) : 128u;
     mk.np[MKSET_MTP] = getenv("IE_MK_NP_MTP") ? (u32)atoi(getenv("IE_MK_NP_MTP")) : 128u;
+    mk.np[MKSET_FLINT] = mk.np[MKSET_FLINTL] = mk.np[MKSET_DECODE];
     /* IE_MK_MTP: 3 (default) verify runs only, 1 verify runs and drafts, 2 drafts only, 0 neither
      * (measured, MTP code 7 drafts: launches 94.2, 3: 99.2, 1: 98.4 tokens/s; a draft has
      * few launches, and a cooperative launch costs more than an ordinary one) */
@@ -656,7 +668,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
         void *a0[] = {&mk.dring[0], &zero, &mk.ws, &mk.base, &mk.dprof, &nul};
         if (H.ModuleLaunchCooperativeKernel(mk.f[st], mk.np[st], 1, 1, 256, 1, 1, 0, cur_stream, a0) == 0) break;
         if (mk.np[st] <= 32u) {
-          fprintf(stderr, "gpu: megakernel off for %s runs (no cooperative launch)\n", st == MKSET_DECODE ? "decode" : "verify");
+          fprintf(stderr, "gpu: megakernel off for %s runs (no cooperative launch)\n", mk_setname[st]);
           mk.off[st] = 1;
           break;
         }
@@ -665,7 +677,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     }
     HIP(H.DeviceSynchronize());
     if ((mk.trace_file = getenv("IE_MK_TRACE")) && mk.trace_file[0]) {
-      const u32 nmax = mk.np[0] > mk.np[1] ? mk.np[0] : mk.np[1];
+      u32 nmax = 0;
+      for (int st = 0; st < MK_NSETS; st++) nmax = mk.np[st] > nmax ? mk.np[st] : nmax;
       mk.trace_at = getenv("IE_MK_TRACE_AT") ? (uint64_t)atoll(getenv("IE_MK_TRACE_AT")) : 10u;
       if ((mk.trace = smp_create(nmax, 1, 16384, 1))) {
         for (int j = 0; j < MK_N && j < 30; j++) smp_register_event(mk.trace, (uint32_t)j, mk_names[j] + 3);
@@ -699,6 +712,8 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   b->attn_split = m->hd <= IE_ATT_MAX_HD && ie_att_max_split(g->n_ctx) <= IE_ATT_MAX_SPLIT && !(ae && !strcmp(ae, "old"));
   b->attn_check = b->attn_split && ae && !strcmp(ae, "check");
   b->attn_gq = !(getenv("IE_ATTN_SW") && atoi(getenv("IE_ATTN_SW")));
+  b->flint = m->arch == ARCH_FLINT;
+  b->gq_min = getenv("IE_ATTN_GQ_MIN") ? (uint32_t)atoi(getenv("IE_ATTN_GQ_MIN")) : IE_GQ_MIN;
   b->gq_ch = getenv("IE_ATTN_GQ_CH") ? (uint32_t)atoi(getenv("IE_ATTN_GQ_CH")) : 256u;
   if (b->gq_ch < 1u || b->gq_ch > 256u) ie_die("IE_ATTN_GQ_CH: 1 .. 256");
   b->attn_kv = b->attn_split && !(ae && (!strcmp(ae, "split") || !strcmp(ae, "check"))) && ie_att_ch(0) % 8u == 0u &&
@@ -1286,7 +1301,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           u32 len = g->kv_len[m->l[o->layer].kvi], p0 = o->win && pos + 1u > o->win ? pos + 1u - o->win : 0u, np = pos + 1u - p0;
           /* ie_attn_gq (the q heads of a kv head together, chunks of 256
            * positions) when it can; IE_ATTN_SW=1: ie_attn_sw */
-          const int gq = b->attn_gq && nhd / nkv <= 8u && hd <= 128u && hd % 8u == 0u;
+          const int gq = gq_use(b, pos) && nhd / nkv <= 8u && hd <= 128u && hd % 8u == 0u;
           u32 ch = gq ? b->gq_ch : ie_att_ch(pos), nsplit = (np + ch - 1u) / ch;
           void *SK = b->d[i].w1; /* the sinks (gpu_open), or NULL */
           void *args[] = {&A, &kc, &vc, &C, &B, &p0, &np, &len, (void *)&hd, (void *)&nhd, (void *)&nkv, &nsplit, &ch,
@@ -1488,7 +1503,8 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   struct timespec h0, h1;
   clock_gettime(CLOCK_MONOTONIC, &h0);
   tr_run("decode", pos, 1);
-  mk.rec = mk.on && !mk.off[MKSET_DECODE], mk.set = MKSET_DECODE;
+  mk.set = b->flint ? (gq_use(b, pos) ? MKSET_FLINTL : MKSET_FLINT) : MKSET_DECODE;
+  mk.rec = mk.on && !mk.off[mk.set];
   run_ops(b, 0, g->n_main, &tok, 1, pos, 0); /* state: slot -> slot */
   mk.rec = 0;
   mk_flush();
@@ -1676,7 +1692,7 @@ static int op_kernel(const gpu_backend *b, const op *o) {
     case OP_ROPE: return K_ROPE;
     case OP_KV: return K_KV;
     case OP_ROPE_KV: return K_ROPE_KV;
-    case OP_ATTN: return m->arch == ARCH_FLINT ? (b->attn_gq ? K_ATTN_GQ : K_ATTN_SW) : b->attn_kv ? K_ATTN_KV : b->attn_split ? K_ATTN_SPLIT : K_ATTN;
+    case OP_ATTN: return m->arch == ARCH_FLINT ? (b->attn_gq && b->gq_min <= 1u ? K_ATTN_GQ : K_ATTN_SW) : b->attn_kv ? K_ATTN_KV : b->attn_split ? K_ATTN_SPLIT : K_ATTN;
     case OP_GEMV_Q5K: return K_GEMV_Q5K;
     case OP_GEMV_IQ4XS: return K_GEMV_IQ4XS;
     case OP_MOE_ROUTE: return K_MOE_ROUTE;
