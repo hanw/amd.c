@@ -4153,8 +4153,8 @@ KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
                   u32 len, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *sinks) {
   const u32 kh = wgid() / nsplit, s = wgid() % nsplit, ng = n_head / n_kv, kvd = n_kv * hd, t = tid();
   const float scale = 1.0f / __builtin_sqrtf((float)hd);
-  for (u32 i = t; i < ng * 128u; i += NT)
-    if ((i & 127u) < hd) ag_q[i >> 7][i & 127u] = q[(kh * ng + (i >> 7)) * hd + (i & 127u)];
+  for (u32 i = t; i < 8u * 128u; i += NT) /* zero past the heads and dims: the score loop has constant bounds */
+    ag_q[i >> 7][i & 127u] = (i >> 7) < ng && (i & 127u) < hd ? q[(kh * ng + (i >> 7)) * hd + (i & 127u)] : 0.0f;
   barrier();
   const u32 a0 = s * ch, n = a0 + ch < np ? ch : np - a0, r0 = (p0 + a0) % len;
   if (t < n) {
@@ -4162,15 +4162,18 @@ KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
     const G kvt *k = kc + (unsigned long)slot * kvd + kh * hd;
     float d[8];
     for (u32 g = 0; g < 8u; g++) d[g] = 0.0f;
-    for (u32 c0 = 0; c0 < hd; c0 += 64u) { /* 64 dims of the K row in registers: the loads together */
+    for (u32 c0 = 0; c0 < 128u; c0 += 64u) { /* 64 dims of the K row in registers: the loads together */
       ag_kv8 kk[8];
+#pragma unroll
+      for (u32 x = 0; x < 8u; x++) /* past hd: a valid row (dim 0), q is 0 there */
+        kk[x] = *(const G ag_kv8 *)(k + (c0 + 8u * x < hd ? c0 + 8u * x : 0u));
+#pragma unroll
       for (u32 x = 0; x < 8u; x++)
-        if (c0 + 8u * x < hd) kk[x] = *(const G ag_kv8 *)(k + c0 + 8u * x);
-      for (u32 x = 0; x < 8u; x++)
-        if (c0 + 8u * x < hd)
-          for (u32 g = 0; g < 8u; g++)
-            if (g < ng)
-              for (u32 e = 0; e < 8u; e++) d[g] += ag_q[g][c0 + 8u * x + e] * (float)kk[x][e];
+#pragma unroll
+        for (u32 g = 0; g < 8u; g++)
+#pragma unroll
+          for (u32 e = 0; e < 8u; e++) d[g] += ag_q[g][c0 + 8u * x + e] * (float)kk[x][e];
+      if (c0 + 64u >= hd) break;
     }
     for (u32 g = 0; g < 8u; g++)
       if (g < ng) AG_SC[g][t] = d[g] * scale;
@@ -4221,7 +4224,8 @@ KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
     for (u32 g = 0; g < 8u; g++)
       if (g < ng) o[g] += ag_q[g][dd];
   if (nsplit == 1u) {
-    for (u32 g = 0; g < ng; g++) {
+    for (u32 g = 0; g < 8u; g++) { /* constant bounds: o in registers */
+      if (g >= ng) break;
       const u32 h = kh * ng + g;
       const float M = at_m[g], sk = sinks ? sinks[h] : -__builtin_inff(), M2 = __builtin_fmaxf(sk, M);
       const float wt = __builtin_expf(M - M2);
@@ -4236,7 +4240,8 @@ KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
     return;
   }
   if (par == 0u)
-    for (u32 g = 0; g < ng; g++) {
+    for (u32 g = 0; g < 8u; g++) { /* constant bounds: o in registers */
+      if (g >= ng) break;
       const u32 h = kh * ng + g;
       G float *pp = part + (unsigned long)(h * nsplit + s) * (hd + 2u);
       if (dd < hd) pp[2u + dd] = o[g];
