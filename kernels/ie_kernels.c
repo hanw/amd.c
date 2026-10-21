@@ -4155,7 +4155,7 @@ typedef kvt ag_kv8 __attribute__((ext_vector_type(8)));
 #define AG_QL (*(LDSP f16(*)[8][128]) & ag_q[4][0])       /* and lo */
 _Static_assert(NT * 4u == 8u * 128u, "ie_attn_gq: 4 q values per thread");
 #define AG_SC at_o /* the scores, then the weights: [head][position] */
-KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
+KERNEL_CALL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
                   u32 len, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *sinks) {
   const u32 kh = wgid() / nsplit, s = wgid() % nsplit, ng = n_head / n_kv, kvd = n_kv * hd, t = tid();
   const float scale = 1.0f / __builtin_sqrtf((float)hd);
@@ -4404,7 +4404,7 @@ KERNEL ie_qkn_rope_kv2(const G float *qkv, G float *qo, G kvt *kc, G kvt *vc, co
  * positions). As ie_attn_split: workgroup h * nsplit + s does the positions
  * p0 + s ch .. (ch of them) with 8 waves, the last workgroup of head h
  * merges. sinks (or NULL): logit sinks[h] in the softmax denominator only. */
-KERNEL ie_attn_sw(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
+KERNEL_CALL ie_attn_sw(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
                   u32 len, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *sinks) {
   const u32 h = wgid() / nsplit, s = wgid() % nsplit;
   const u32 kh = h / (n_head / n_kv), kvd = n_kv * hd;
