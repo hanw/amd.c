@@ -4151,12 +4151,61 @@ typedef kvt ag_kv8 __attribute__((ext_vector_type(8)));
 /* The value of v in a register here: the loads before it, one wait for all
  * of them (the compiler would wait for each load before its use). */
 #define AG_HOLD(v) __asm__ volatile("" : "+v"(v))
+#define AG_QH (*(LDSP f16(*)[8][128]) & ag_q[0][0])       /* q in f16: hi (fp16 KV) */
+#define AG_QL (*(LDSP f16(*)[8][128]) & ag_q[4][0])       /* and lo */
 _Static_assert(NT * 4u == 8u * 128u, "ie_attn_gq: 4 q values per thread");
 #define AG_SC at_o /* the scores, then the weights: [head][position] */
 KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
                   u32 len, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *sinks) {
   const u32 kh = wgid() / nsplit, s = wgid() % nsplit, ng = n_head / n_kv, kvd = n_kv * hd, t = tid();
   const float scale = 1.0f / __builtin_sqrtf((float)hd);
+#ifndef IE_KV_F32
+  /* the scores with WMMA (f16 x f16 -> f32): S^T = Q K^T, Q rows = the heads
+   * (q = hi + lo, two f16, so the products are those of q in f32 to about
+   * 2^-22), K columns = 16 positions. Lane layout as ie_attn_fa: A lane l
+   * head l % 16, dims 8 (l / 16) .. + 7 of the 16 of a step; B lane l the
+   * position l % 16, the same dims; D lane l, v: head 8 (l / 16) + v. */
+#pragma unroll
+  for (u32 x = 0; x < 4u; x++) {
+    const u32 i = t + NT * x, ok = (i >> 7) < ng && (i & 127u) < hd;
+    const float qv = q[ok ? (kh * ng + (i >> 7)) * hd + (i & 127u) : 0u];
+    const f16 hi = ok ? (f16)qv : (f16)0.0f;
+    AG_QH[i >> 7][i & 127u] = hi, AG_QL[i >> 7][i & 127u] = ok ? (f16)(qv - (float)hi) : (f16)0.0f;
+  }
+  barrier();
+  const u32 a0 = s * ch, n = a0 + ch < np ? ch : np - a0, r0 = (p0 + a0) % len;
+  {
+    const u32 l = lane(), rl = l & 15u, hl = l >> 4;
+    const v8f zero = (v8f){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const h8 hz = (h8){0, 0, 0, 0, 0, 0, 0, 0};
+    for (u32 tb = 16u * (t >> 5); tb < n; tb += 128u) { /* 16 positions per wave */
+      const u32 pi = tb + rl < n ? tb + rl : 0u, r = r0 + pi, slot = r < len ? r : r - len;
+      const G kvt *k = kc + (unsigned long)slot * kvd + kh * hd;
+      h8 kb[8];
+#pragma unroll
+      for (u32 st = 0; st < 8u; st++) { /* past hd: dim 0 (q is 0 there) */
+        const u32 c = 16u * st + 8u * hl;
+        kb[st] = *(const G h8 *)(k + (c < hd ? c : 0u));
+      }
+#pragma unroll
+      for (u32 st = 0; st < 8u; st++) AG_HOLD(kb[st]);
+      v8f acc = zero;
+#pragma unroll
+      for (u32 st = 0; st < 8u; st++) {
+        if (16u * st >= hd) break;
+        const u32 c = 16u * st + 8u * hl;
+        const h8 ah = rl < 8u ? *(const LDSP h8 *)(&AG_QH[rl & 7u][c & 127u]) : hz;
+        const h8 al = rl < 8u ? *(const LDSP h8 *)(&AG_QL[rl & 7u][c & 127u]) : hz;
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ah, kb[st], acc);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(al, kb[st], acc);
+      }
+      if (hl == 0u && tb + rl < n)
+#pragma unroll
+        for (u32 v = 0; v < 8u; v++)
+          if (v < ng) AG_SC[v][tb + rl] = acc[v] * scale;
+    }
+  }
+#else
   { /* zero past the heads and dims: the score loop has constant bounds */
     float qq[4];
 #pragma unroll
@@ -4197,6 +4246,7 @@ KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
     for (u32 g = 0; g < 8u; g++)
       if (g < ng) AG_SC[g][t] = d[g] * scale;
   }
+#endif
   barrier();
   const u32 w = t >> 5, l = lane();
   if (w < ng) {
