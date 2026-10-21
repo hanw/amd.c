@@ -3942,6 +3942,71 @@ KERNEL ie_gemv_iq4xsq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float
  * one expert, grid y = slot s < K. Expert e = route[s]; its arrays start at
  * e qwn words, e qsn entries; input xq + s astr, output y + s bstr (bytes).
  * kind: MAT_Q8 (2), MAT_Q4K (3), MAT_Q6K (4), MAT_Q5K (5), MAT_IQ4XS (6) (src/model.h). */
+/* The sum of the 16 lanes of each half of a wave (lanes 0 and 16 hold it):
+ * the steps 2 to 5 of wave_tree_f (shuffle down 8, 4, 2, 1 inside each row
+ * of 16). With the other half zero, wave_tree_f gives the same value. */
+static inline float half_tree_f(float v) {
+  v += I2F(shl_i(F2I(v), 8));
+  v += I2F(shl_i(F2I(v), 4));
+  v += I2F(shl_i(F2I(v), 2));
+  v += I2F(shl_i(F2I(v), 1));
+  return v;
+}
+/* One block (b) of row r of an expert matrix of the given kind against the
+ * Q8 activations x: the term the row functions add for it (from acc = 0). */
+static inline float gexp_block(u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, u32 rows, u32 nb, u32 r, u32 b) {
+#pragma clang fp contract(off)
+  const G u32 *aw = (const G u32 *)x;
+  const float da = ((const G float *)(x + 32u * nb))[b];
+  const u32x4 a0 = *(const G u32x4 *)(aw + b * 8u), a1 = *(const G u32x4 *)(aw + b * 8u + 4u);
+  const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+  const Mem am = {av};
+  if (kind == 2u) {
+    const G u32 *wp = qw + ie_q8_dst_word(r, b, 0u, nb);
+    const u32x4 w0 = *(const G u32x4 *)wp, w1 = *(const G u32x4 *)(wp + 4u);
+    const u32 wq[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+    const Mem qm = {wq};
+    const float sc = (float)((const G f16 *)qs)[ie_q8_dst_scale(r, b, nb)] * da;
+    return 0.0f + sc * (float)(int)ie_q8q8_block(qm, 0u, am, 0u);
+  }
+  const u32x4 w4 = *(const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb));
+  const u32 wq[4] = {w4.x, w4.y, w4.z, w4.w};
+  const Mem qm = {wq};
+  if (kind == 4u) {
+    const u32 hb = ie_q6k_hw(rows, r, b, 0u, nb), hq[2] = {qw[hb], qw[hb + 1u]};
+    const Mem hm = {hq};
+    const int d0 = (int)ie_q6k_dots(qm, 0u, hm, 0u, am, 0u, 0u), d1 = (int)ie_q6k_dots(qm, 0u, hm, 1u, am, 0u, 1u);
+    const u32 sc = qs[ie_q6k_sc(r, b, nb)];
+    const float dv = (float)((const G f16 *)qs)[ie_q6k_d(rows, r, b, nb)];
+    const float s0 = dv * (float)(int)(signed char)(sc & 255u), s1 = dv * (float)(int)(signed char)(sc >> 8);
+    return __builtin_fmaf(__builtin_fmaf(s1, (float)d1, s0 * (float)d0), da, 0.0f);
+  }
+  const u32 sm = qs[ie_q4k_sm(r, b, nb)];
+  const float dv = (float)((const G f16 *)qs)[ie_q4k_dd(rows, r, b, nb)];
+  if (kind == 6u) { /* IQ4_XS */
+    const int dq = (int)ie_iq4_dot(qm, 0u, am, 0u);
+    const float sc = dv * (float)((int)(sm & 63u) - 32);
+    return __builtin_fmaf(sc * (float)dq, da, 0.0f);
+  }
+  /* Q4_K (3), Q5_K (5) */
+  const int dq = kind == 5u ? (int)ie_q5k_dot(qm, 0u, qw[ie_q5k_hw(rows, r, b, nb)], am, 0u) : (int)ie_q4k_dot(qm, 0u, am, 0u);
+  const float mv = (float)((const G f16 *)qs)[ie_q4k_dd(rows, r, b, nb) + 1u];
+  const float sc = dv * (float)(sm & 63u), mm = mv * (float)(sm >> 8);
+  const float xa = da * (float)(int)((const G u32 *)(x + 36u * nb))[b];
+  return __builtin_fmaf(-mm, xa, __builtin_fmaf(sc * (float)dq, da, 0.0f));
+}
+
+/* nb <= 16 (the expert down matrices: 512 columns): two rows per wave, one
+ * per half (lane & 15: the block); 16 rows per workgroup. Each row's value
+ * is that of the row functions (one block per lane, the same tree). */
+static inline void gexp_half_rows(u32 g, u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, G float *y, u32 rows, u32 nb) {
+  const u32 l = lane(), r = (g * 8u + (tid() >> 5)) * 2u + (l >> 4), b = l & 15u;
+  float v = 0.0f;
+  if (r < rows && b < nb) v = gexp_block(kind, qw, qs, x, rows, nb, r, b);
+  v = half_tree_f(v);
+  if ((l & 15u) == 0u && r < rows) y[r] = v;
+}
+
 KERNEL ie_gexp(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G u32 *route, u32 qwn,
                u32 qsn, u32 astr, u32 bstr, u32 kind) {
   const u32 s = tokid(), e = route[s];
@@ -3949,7 +4014,8 @@ KERNEL ie_gexp(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32
   const G u16 *q = qs + (unsigned long)e * qsn;
   const G u8 *x = xq + (unsigned long)s * astr;
   G float *o = (G float *)((G u8 *)y + (unsigned long)s * bstr);
-  if (kind == 2u) gemv_q8q8_rows(wgid(), w, (const G f16 *)q, x, o, rows, nb, 0, 0);
+  if (nb <= 16u) gexp_half_rows(wgid(), kind, w, q, x, o, rows, nb);
+  else if (kind == 2u) gemv_q8q8_rows(wgid(), w, (const G f16 *)q, x, o, rows, nb, 0, 0);
   else if (kind == 3u) gemv_q4kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
   else if (kind == 4u) gemv_q6kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
   else if (kind == 5u) gemv_q5kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
