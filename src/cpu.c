@@ -26,6 +26,7 @@ typedef struct {
    * (ring[slot][conv_dim], slot = pos % 4) and S[head][i (key)][j (value)] */
   float *ring, *st;
   float *snap_ring[2], *snap_st[2]; /* the prompt cache snapshots (cpu_snap) */
+  float *snap_kv[2];                /* and the KV rings of the sliding window layers (flint) */
 } cpu_backend;
 
 #define BUF(b, id) ((void *)((b)->arena + (b)->g->bufs[id].off))
@@ -435,6 +436,21 @@ static void cpu_snap(backend *bk, int save, int k, int hbuf) {
   if (!b->snap_ring[k]) b->snap_ring[k] = ie_alloc(rb + 4), b->snap_st[k] = ie_alloc(sb + 4);
   memcpy(save ? b->snap_ring[k] : b->ring, save ? b->ring : b->snap_ring[k], rb);
   memcpy(save ? b->snap_st[k] : b->st, save ? b->st : b->snap_st[k], sb);
+  /* a ring slot is reused by a later position: keep the rings (K and V) */
+  const graph *g = b->g;
+  const size_t kvd = (size_t)m->n_kv * m->hd;
+  size_t nr = 0;
+  for (uint32_t i = 0; i < m->n_kvl; i++)
+    if (g->kv_len[i] < g->n_ctx) nr += g->kv_len[i];
+  if (!nr) return;
+  if (!b->snap_kv[k]) b->snap_kv[k] = ie_alloc(2 * nr * kvd * 4);
+  float *sp = b->snap_kv[k];
+  for (uint32_t i = 0; i < m->n_kvl; i++) {
+    if (g->kv_len[i] >= g->n_ctx) continue;
+    const size_t n = g->kv_len[i] * kvd, o = g->kv_off[i] * kvd;
+    memcpy(save ? sp : b->kc + o, save ? b->kc + o : sp, n * 4), sp += n;
+    memcpy(save ? sp : b->vc + o, save ? b->vc + o : sp, n * 4), sp += n;
+  }
 }
 
 backend *cpu_open(const model *m, const graph *g) {
@@ -460,7 +476,7 @@ static void cpu_close(backend *bk) {
   free(b->vc);
   free(b->ring);
   free(b->st);
-  for (int k = 0; k < 2; k++) free(b->snap_ring[k]), free(b->snap_st[k]);
+  for (int k = 0; k < 2; k++) free(b->snap_ring[k]), free(b->snap_st[k]), free(b->snap_kv[k]);
   free(b);
 }
 

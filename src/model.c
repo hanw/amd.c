@@ -1639,7 +1639,7 @@ void graph_build(graph *g, const model *m, uint32_t n_ctx, uint32_t T, int mtp) 
     uint32_t len = n_ctx;
     if (L->swin) {
       uint32_t r = 1;
-      while (r < L->swin + IE_KV_SLACK) r *= 2;
+      while (r < L->swin + (g->T > IE_KV_SLACK ? g->T : IE_KV_SLACK)) r *= 2; /* room for a run of T tokens */
       if (r < len) len = r;
     }
     g->kv_len[L->kvi] = len;

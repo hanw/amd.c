@@ -12,6 +12,7 @@
  * flat work group size 256 is written into the IR by the Makefile (clang 18
  * does not accept amdgpu_flat_work_group_size in C). */
 #include "../core/ie_core.h"
+#include "../core/ie_ext.h"
 
 #define G __attribute__((address_space(1))) /* global memory */
 #define LDS __attribute__((address_space(3), loader_uninitialized))
@@ -631,11 +632,10 @@ KERNEL_HEAVY ie_gemv_q4kq8_tr8(const G u32 *qw, const G u16 *qs, const G u8 *xq,
  * dot products d0, d1 (ie_q6k_dots, law q6k_dots: the q - 32 bytes, signed dot4), then
  *   acc = fma(fma(d sc1, d1, (d sc0) d0), da, acc)
  * (explicit fma: the same in ie_gemv_q6kq8_tr and the CPU). */
-KERNEL ie_gemv_q6kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
-                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
-                     G u32 *count) {
+static inline void gemv_q6kq8_rows(u32 g, const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                                   const G float *bias, const G float *res) {
 #pragma clang fp contract(off)
-  const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
+  const u32 r = ie_gemv_row(g, tid() >> 5), l = lane();
   if (r < rows) {
     const G u32 *aw = (const G u32 *)xq;
     const G float *da = (const G float *)(xq + 32u * nb);
@@ -671,6 +671,11 @@ KERNEL ie_gemv_q6kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *
     acc = wave_tree_f(acc);
     if (l == 0u) y[r] = epilogue(acc, r, bias, res);
   }
+}
+KERNEL ie_gemv_q6kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                     G u32 *count) {
+  gemv_q6kq8_rows(wgid(), qw, qs, xq, y, rows, nb, bias, res);
   if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
 }
 
@@ -795,10 +800,9 @@ KERNEL_HEAVY ie_gemv_q6kq8_ts2(const G u32 *qw, const G u16 *qs, const G u8 *xq,
 /* y = W x: W is Q8_0 (GPU layout: 8 int8 words per block in qw, f16 scales
  * qs), x is Q8. The same grid, lane split and reduction as ie_gemv_q4q8;
  * the block dot product is ie_q8q8_block (8 v_dot4_i32_iu8, both signed). */
-KERNEL ie_gemv_q8q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
-                  const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
-                  G u32 *count) {
-  const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
+static inline void gemv_q8q8_rows(u32 g, const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                                   const G float *bias, const G float *res) {
+  const u32 r = ie_gemv_row(g, tid() >> 5), l = lane();
   if (r < rows) {
     const G u32 *aw = (const G u32 *)xq;
     const G float *da = (const G float *)(xq + 32u * nb);
@@ -829,6 +833,11 @@ KERNEL ie_gemv_q8q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y
     acc = wave_tree_f(acc);
     if (l == 0u) y[r] = epilogue(acc, r, bias, res);
   }
+}
+KERNEL ie_gemv_q8q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                     G u32 *count) {
+  gemv_q8q8_rows(wgid(), qw, qs, xq, y, rows, nb, bias, res);
   if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
 }
 
@@ -3822,4 +3831,284 @@ KERNEL ie_topk_merge(const G float *cv, const G u32 *ci, u32 nc, u32 K, G float 
   for (u32 p = tid(); p < nc; p += NT) tk_v[p] = cv[(unsigned long)r * nc + p], tk_i[p] = ci[(unsigned long)r * nc + p];
   lbarrier();
   tk_select(nc, K, ov + (unsigned long)r * K, oi + (unsigned long)r * K);
+}
+
+/* ------------------------------------------------------------------ flint */
+/* Recursive flint (src/model.h ARCH_FLINT): the weight kinds MAT_Q5K and
+ * MAT_IQ4XS (core/ie_ext.h: tested, not proved), the MoE ops, and attention
+ * with a sliding window (a KV ring) and learned sinks. One token per launch
+ * (decode); the CPU backend (cpu.c) does the same arithmetic in the same
+ * order (expf and the reductions round differently on the two). */
+
+/* MAT_Q5K: as gemv_q4kq8_rows, with dq = ie_q5k_dot (q = 0..31). */
+static inline void gemv_q5kq8_rows(u32 g, const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows,
+                                   u32 nb, const G float *bias, const G float *res) {
+#pragma clang fp contract(off)
+  const u32 r = ie_gemv_row(g, tid() >> 5), l = lane();
+  if (r < rows) {
+    const G u32 *aw = (const G u32 *)xq;
+    const G float *da = (const G float *)(xq + 32u * nb);
+    const G u32 *asum = (const G u32 *)(xq + 36u * nb);
+    const G u16 *smr = qs + ie_q4k_sm(r, 0u, nb);
+    const G f16 *ddr = (const G f16 *)qs + ie_q4k_dd(rows, r, 0u, nb);
+    const G u32 *hwr = qw + ie_q5k_hw(rows, r, 0u, nb);
+    float acc = 0.0f;
+    for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
+      u32x4 w4[GEMV_U], a0[GEMV_U], a1[GEMV_U];
+      u32 hb[GEMV_U], sm[GEMV_U], as[GEMV_U];
+      float dv[GEMV_U], mv[GEMV_U], dav[GEMV_U];
+      int ok[GEMV_U];
+      for (u32 k = 0; k < GEMV_U; k++) {
+        ok[k] = ie_lane_blk(l, t + k) < nb;
+        const u32 b = ok[k] ? ie_lane_blk(l, t + k) : ie_lane_blk(l, t);
+        w4[k] = *(const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb));
+        hb[k] = hwr[b];
+        a0[k] = *(const G u32x4 *)(aw + b * 8u);
+        a1[k] = *(const G u32x4 *)(aw + b * 8u + 4u);
+        sm[k] = smr[b];
+        dv[k] = (float)ddr[(b >> 3) * 2u], mv[k] = (float)ddr[(b >> 3) * 2u + 1u];
+        as[k] = asum[b], dav[k] = da[b];
+      }
+      for (u32 k = 0; k < GEMV_U; k++) {
+        const u32 wq[4] = {w4[k].x, w4[k].y, w4[k].z, w4[k].w};
+        const u32 av[8] = {a0[k].x, a0[k].y, a0[k].z, a0[k].w, a1[k].x, a1[k].y, a1[k].z, a1[k].w};
+        const Mem qm = {wq}, am = {av};
+        const int dq = (int)ie_q5k_dot(qm, 0u, hb[k], am, 0u);
+        const float sc = dv[k] * (float)(sm[k] & 63u), mm = mv[k] * (float)(sm[k] >> 8);
+        const float x = dav[k] * (float)(int)as[k];
+        const float a1v = __builtin_fmaf(sc * (float)dq, dav[k], acc), a2 = __builtin_fmaf(-mm, x, a1v);
+        acc = ok[k] ? a2 : acc;
+      }
+    }
+    acc = wave_tree_f(acc);
+    if (l == 0u) y[r] = epilogue(acc, r, bias, res);
+  }
+}
+KERNEL ie_gemv_q5kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                     G u32 *count) {
+  gemv_q5kq8_rows(wgid(), qw, qs, xq, y, rows, nb, bias, res);
+  if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
+}
+
+/* MAT_IQ4XS: dq = ie_iq4_dot (the table values), acc = fma(d (ls - 32) dq, da, acc). */
+static inline void gemv_iq4xsq8_rows(u32 g, const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows,
+                                     u32 nb, const G float *bias, const G float *res) {
+#pragma clang fp contract(off)
+  const u32 r = ie_gemv_row(g, tid() >> 5), l = lane();
+  if (r < rows) {
+    const G u32 *aw = (const G u32 *)xq;
+    const G float *da = (const G float *)(xq + 32u * nb);
+    const G u16 *smr = qs + ie_q4k_sm(r, 0u, nb);
+    const G f16 *ddr = (const G f16 *)qs + ie_q4k_dd(rows, r, 0u, nb);
+    float acc = 0.0f;
+    for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
+      u32x4 w4[GEMV_U], a0[GEMV_U], a1[GEMV_U];
+      u32 sm[GEMV_U];
+      float dv[GEMV_U], dav[GEMV_U];
+      int ok[GEMV_U];
+      for (u32 k = 0; k < GEMV_U; k++) {
+        ok[k] = ie_lane_blk(l, t + k) < nb;
+        const u32 b = ok[k] ? ie_lane_blk(l, t + k) : ie_lane_blk(l, t);
+        w4[k] = *(const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb));
+        a0[k] = *(const G u32x4 *)(aw + b * 8u);
+        a1[k] = *(const G u32x4 *)(aw + b * 8u + 4u);
+        sm[k] = smr[b];
+        dv[k] = (float)ddr[(b >> 3) * 2u];
+        dav[k] = da[b];
+      }
+      for (u32 k = 0; k < GEMV_U; k++) {
+        const u32 wq[4] = {w4[k].x, w4[k].y, w4[k].z, w4[k].w};
+        const u32 av[8] = {a0[k].x, a0[k].y, a0[k].z, a0[k].w, a1[k].x, a1[k].y, a1[k].z, a1[k].w};
+        const Mem qm = {wq}, am = {av};
+        const int dq = (int)ie_iq4_dot(qm, 0u, am, 0u);
+        const float sc = dv[k] * (float)((int)(sm[k] & 63u) - 32);
+        const float a1v = __builtin_fmaf(sc * (float)dq, dav[k], acc);
+        acc = ok[k] ? a1v : acc;
+      }
+    }
+    acc = wave_tree_f(acc);
+    if (l == 0u) y[r] = epilogue(acc, r, bias, res);
+  }
+}
+KERNEL ie_gemv_iq4xsq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                       const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                       G u32 *count) {
+  gemv_iq4xsq8_rows(wgid(), qw, qs, xq, y, rows, nb, bias, res);
+  if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
+}
+
+/* The GEMVs of the chosen experts, one launch: grid x = the row groups of
+ * one expert, grid y = slot s < K. Expert e = route[s]; its arrays start at
+ * e qwn words, e qsn entries; input xq + s astr, output y + s bstr (bytes). */
+#define GEXP_KERNEL(NAME, ROWS, QST)                                                                                       \
+  KERNEL NAME(const G u32 *qw, const G QST *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G u32 *route,     \
+              unsigned long qwn, unsigned long qsn, u32 astr, u32 bstr) {                                               \
+    const u32 s = tokid(), e = route[s];                                                                               \
+    ROWS(wgid(), qw + e * qwn, qs + e * qsn, xq + (unsigned long)s * astr, (G float *)((G u8 *)y + (unsigned long)s * bstr), \
+         rows, nb, 0, 0);                                                                                              \
+  }
+GEXP_KERNEL(ie_gexp_q8, gemv_q8q8_rows, f16)
+GEXP_KERNEL(ie_gexp_q4k, gemv_q4kq8_rows, u16)
+GEXP_KERNEL(ie_gexp_q5k, gemv_q5kq8_rows, u16)
+GEXP_KERNEL(ie_gexp_q6k, gemv_q6kq8_rows, u16)
+GEXP_KERNEL(ie_gexp_iq4xs, gemv_iq4xsq8_rows, u16)
+
+/* Routing (one workgroup, n <= 1024 experts): s = sigmoid(logit); the K
+ * largest s + bias, one at a time (ties: the smaller index); out = [K ids |
+ * K weights], weight k = s_k / (sum of the K s + 1e-20) * scale, the sum in
+ * the order of the choice (as moe_route in cpu.c). */
+static LDS float mr_s[1024], mr_c[1024], mr_w[16];
+KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float scale, G u32 *out) {
+  for (u32 i = tid(); i < n; i += NT) {
+    const float sg = 1.0f / (1.0f + __builtin_expf(-lg[i]));
+    mr_s[i] = sg;
+    mr_c[i] = bias ? sg + bias[i] : sg;
+  }
+  barrier();
+  for (u32 k = 0; k < K; k++) {
+    float bv = -__builtin_inff();
+    u32 bi = 0xFFFFFFFFu;
+    for (u32 i = tid(); i < n; i += NT)
+      if (better(mr_c[i], i, bv, bi)) bv = mr_c[i], bi = i;
+    wg_best(&bv, &bi);
+    if (tid() == 0u) {
+      out[k] = bi;
+      mr_w[k] = mr_s[bi];
+      mr_c[bi] = -__builtin_inff();
+    }
+    barrier();
+  }
+  if (tid() == 0u) {
+    float sum = 0.0f;
+    for (u32 k = 0; k < K; k++) sum += mr_w[k];
+    const float inv = 1.0f / (sum + 1e-20f);
+    for (u32 k = 0; k < K; k++) ((G float *)out)[K + k] = mr_w[k] * inv * scale;
+  }
+}
+
+/* out = res + sum over slots k of weight_k y_k (fma, slot order). */
+KERNEL ie_moe_sum(const G float *y, G float *out, const G u32 *route, const G float *res, u32 n, u32 K) {
+  const u32 j = wgid() * NT + tid();
+  if (j >= n) return;
+  const G float *w = (const G float *)(route + K);
+  float acc = 0.0f;
+  for (u32 k = 0; k < K; k++) acc = __builtin_fmaf(w[k], y[(unsigned long)k * n + j], acc);
+  out[j] = res[j] + acc;
+}
+
+/* As ie_qkn_rope_kv, for heads of qstr floats (flint: q heads of hd, no
+ * gate): q head h at qkv + h qstr, key head h at qkv + nq qstr + h hd, value
+ * head h at qkv + nq qstr + nkv hd + h hd. nrot = 0: no RoPE. kc, vc: the
+ * cache rows of this position. One token. */
+KERNEL ie_qkn_rope_kv2(const G float *qkv, G float *qo, G kvt *kc, G kvt *vc, const G float *qw, const G float *kw,
+                       const G float *cs, const G float *sn, u32 nq, u32 nkv, u32 hd, u32 nrot, float eps, u32 qstr) {
+  const u32 g = wgid(), t = tid();
+  const G float *kb = qkv + nq * qstr;
+  if (g >= nq + nkv) { /* value head */
+    const u32 h = g - nq - nkv;
+    if (t < hd) vc[h * hd + t] = kb[nkv * hd + h * hd + t];
+    return;
+  }
+  const int is_k = g >= nq;
+  const u32 h = is_k ? g - nq : g;
+  const G float *src = is_k ? kb + h * hd : qkv + h * qstr;
+  const G float *w = is_k ? kw : qw;
+  const float x = t < hd ? src[t] : 0.0f;
+  const float ss = wg_sum(x * x);
+  const float y = x * (1.0f / __builtin_sqrtf(ss / (float)hd + eps)) * (t < hd ? w[t] : 0.0f);
+  if (t < hd) qk_buf[t] = y;
+  barrier();
+  float r = y;
+  const u32 h2 = nrot >> 1;
+  if (t < nrot) {
+    const u32 i = t < h2 ? t : t - h2;
+    const float a = qk_buf[i], b = qk_buf[i + h2];
+    r = t < h2 ? a * cs[i] - b * sn[i] : a * sn[i] + b * cs[i];
+  }
+  if (t < hd) {
+    if (is_k) kc[h * hd + t] = (kvt)r;
+    else qo[h * hd + t] = r;
+  }
+}
+
+/* Decode attention over the np positions p0 .. p0 + np - 1 (a window), the
+ * K/V of position p in row p % len of kc, vc (a ring, or len >= all
+ * positions). As ie_attn_split: workgroup h * nsplit + s does the positions
+ * p0 + s ch .. (ch of them) with 8 waves, the last workgroup of head h
+ * merges. sinks (or NULL): logit sinks[h] in the softmax denominator only. */
+KERNEL ie_attn_sw(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
+                  u32 len, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *sinks) {
+  const u32 h = wgid() / nsplit, s = wgid() % nsplit;
+  const u32 kh = h / (n_head / n_kv), kvd = n_kv * hd;
+  const u32 w = tid() >> 5, l = lane();
+  const float scale = 1.0f / __builtin_sqrtf((float)hd);
+  float qv[8], acc[8];
+  for (u32 j = 0; j < 8u; j++) {
+    const u32 i = l + 32u * j;
+    qv[j] = i < hd ? q[h * hd + i] : 0.0f;
+    acc[j] = 0.0f;
+  }
+  float m = -__builtin_inff(), sum = 0.0f;
+  const u32 a0 = s * ch, a1 = a0 + ch < np ? a0 + ch : np;
+  for (u32 a = a0 + w; a < a1; a += 8u) {
+    const u32 slot = (p0 + a) % len;
+    const G kvt *k = kc + (unsigned long)slot * kvd + kh * hd;
+    const G kvt *v = vc + (unsigned long)slot * kvd + kh * hd;
+    float d = 0.0f;
+    for (u32 j = 0; j < 8u; j++)
+      if (l + 32u * j < hd) d += qv[j] * (float)k[l + 32u * j];
+    d = wave_sum_all(d);
+    d *= scale;
+    const float mn = __builtin_fmaxf(m, d), c = __builtin_expf(m - mn), e = __builtin_expf(d - mn);
+    sum = sum * c + e;
+    for (u32 j = 0; j < 8u; j++)
+      if (l + 32u * j < hd) acc[j] = acc[j] * c + e * (float)v[l + 32u * j];
+    m = mn;
+  }
+  if (l == 0u) at_m[w] = m, at_l[w] = sum;
+  for (u32 j = 0; j < 8u; j++)
+    if (l + 32u * j < hd) at_o[w][l + 32u * j] = acc[j];
+  barrier();
+  float M = at_m[0];
+  for (u32 x = 1; x < 8u; x++) M = __builtin_fmaxf(M, at_m[x]);
+  G float *pp = part + (unsigned long)(h * nsplit + s) * (hd + 2u);
+  if (tid() < hd) {
+    float o = 0.0f;
+    for (u32 x = 0; x < 8u; x++) o += at_m[x] == -__builtin_inff() ? 0.0f : at_o[x][tid()] * __builtin_expf(at_m[x] - M);
+    pp[2u + tid()] = o;
+  }
+  if (tid() == 0u) {
+    float L = 0.0f;
+    for (u32 x = 0; x < 8u; x++) L += at_m[x] == -__builtin_inff() ? 0.0f : at_l[x] * __builtin_expf(at_m[x] - M);
+    pp[0] = M;
+    pp[1] = L;
+  }
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  barrier();
+  if (tid() == 0u) at_last = __atomic_fetch_add(&count[h], 1u, __ATOMIC_ACQ_REL) == nsplit - 1u;
+  barrier();
+  if (!at_last) return;
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  G float *ph = part + (unsigned long)h * nsplit * (hd + 2u);
+  const float sk = sinks ? sinks[h] : -__builtin_inff();
+  float mv = sk;
+  for (u32 t = tid(); t < nsplit; t += NT) mv = __builtin_fmaxf(mv, ph[t * (hd + 2u)]);
+  const float M2 = wg_max(mv);
+  float lv = 0.0f;
+  for (u32 t = tid(); t < nsplit; t += NT) {
+    const float wt = __builtin_expf(ph[t * (hd + 2u)] - M2);
+    ph[t * (hd + 2u)] = wt;
+    lv += ph[t * (hd + 2u) + 1u] * wt;
+  }
+  float L2 = wg_sum(lv);
+  if (sinks) L2 += __builtin_expf(sk - M2);
+  if (tid() < hd) {
+    float o = 0.0f;
+    for (u32 t = 0; t < nsplit; t++) o += ph[t * (hd + 2u) + 2u + tid()] * ph[t * (hd + 2u)];
+    o = o / L2;
+    out[h * hd + tid()] = o;
+    if (oq) quant_wave(o, (h * hd + tid()) >> 5, oq, (n_head * hd) >> 5);
+  }
+  if (tid() == 0u) count[h] = 0u;
 }

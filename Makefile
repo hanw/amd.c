@@ -131,6 +131,7 @@ test: all $(B)/laws_test $(B)/kernel_test $(B)/ext_test $(B)/cache_check $(MODEL
 	@echo "== prompt cache (gen_run): with and without the cache, the same answers (CPU)"
 	./$(B)/cache_check $(B)/tiny-qwen2.gguf
 	./$(B)/cache_check $(B)/tiny-llama-k.gguf
+	./$(B)/cache_check $(B)/tiny-flint.gguf
 	@echo "== GPU backend without a GPU: must fail with a clear message"
 	! ./$(B)/ie-run $(B)/tiny-qwen2.gguf --backend gpu --hsaco $(B)/ie_kernels.hsaco --n 1 2> $(B)/gpu.err
 	cat $(B)/gpu.err

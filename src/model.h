@@ -334,8 +334,8 @@ typedef struct {
  * the DFlash ops when m->df is set). */
 void graph_build(graph *gr, const model *m, uint32_t n_ctx, uint32_t T, int mtp);
 void graph_free(graph *gr);
-/* The ring of a sliding window layer: the smallest power of two >= win + IE_KV_SLACK
- * (room for the tokens of one verify run), at most n_ctx. */
+/* The ring of a sliding window layer: the smallest power of two >= win +
+ * max(IE_KV_SLACK, graph T) (room for the tokens of one run), at most n_ctx. */
 #define IE_KV_SLACK 16u
 /* u32 words of qw and u16 entries of qs of one rows x cols matrix (one expert). */
 uint64_t mat_qw_words(int kind, uint32_t rows, uint32_t cols);
