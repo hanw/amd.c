@@ -4222,14 +4222,18 @@ KERNEL ie_attn_sw(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
   barrier();
   float M = at_m[0];
   for (u32 x = 1; x < 8u; x++) M = __builtin_fmaxf(M, at_m[x]);
-  if (nsplit == 1u) { /* one split: the output directly (no partial results, no count) */
-    const float sk = sinks ? sinks[h] : -__builtin_inff(), M2 = __builtin_fmaxf(M, sk);
-    float L = sinks ? __builtin_expf(sk - M2) : 0.0f;
-    for (u32 x = 0; x < 8u; x++) L += at_m[x] == -__builtin_inff() ? 0.0f : at_l[x] * __builtin_expf(at_m[x] - M2);
+  if (nsplit == 1u) { /* one split: the output directly (no partial results,
+                       * no count), with the same arithmetic as the merge below */
+    const float sk = sinks ? sinks[h] : -__builtin_inff(), M2 = __builtin_fmaxf(sk, M);
+    const float wt = __builtin_expf(M - M2);
+    float L = 0.0f;
+    for (u32 x = 0; x < 8u; x++) L += at_m[x] == -__builtin_inff() ? 0.0f : at_l[x] * __builtin_expf(at_m[x] - M);
+    float L2 = 0.0f + L * wt;
+    if (sinks) L2 += __builtin_expf(sk - M2);
     if (tid() < hd) {
       float o = 0.0f;
-      for (u32 x = 0; x < 8u; x++) o += at_m[x] == -__builtin_inff() ? 0.0f : at_o[x][tid()] * __builtin_expf(at_m[x] - M2);
-      o = o / L;
+      for (u32 x = 0; x < 8u; x++) o += at_m[x] == -__builtin_inff() ? 0.0f : at_o[x][tid()] * __builtin_expf(at_m[x] - M);
+      o = (0.0f + o * wt) / L2;
       out[h * hd + tid()] = o;
       if (oq) quant_wave(o, (h * hd + tid()) >> 5, oq, (n_head * hd) >> 5);
     }
