@@ -4148,13 +4148,30 @@ KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float 
  * head kh merges, with the arithmetic of the ie_attn_sw merge. */
 static LDS float ag_q[8][128]; /* q, then the P V sums of the odd positions */
 typedef kvt ag_kv8 __attribute__((ext_vector_type(8)));
+/* The value of v in a register here: the loads before it, one wait for all
+ * of them (the compiler would wait for each load before its use). */
+#define AG_HOLD(v) __asm__ volatile("" : "+v"(v))
+_Static_assert(NT * 4u == 8u * 128u, "ie_attn_gq: 4 q values per thread");
 #define AG_SC at_o /* the scores, then the weights: [head][position] */
 KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
                   u32 len, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *sinks) {
   const u32 kh = wgid() / nsplit, s = wgid() % nsplit, ng = n_head / n_kv, kvd = n_kv * hd, t = tid();
   const float scale = 1.0f / __builtin_sqrtf((float)hd);
-  for (u32 i = t; i < 8u * 128u; i += NT) /* zero past the heads and dims: the score loop has constant bounds */
-    ag_q[i >> 7][i & 127u] = (i >> 7) < ng && (i & 127u) < hd ? q[(kh * ng + (i >> 7)) * hd + (i & 127u)] : 0.0f;
+  { /* zero past the heads and dims: the score loop has constant bounds */
+    float qq[4];
+#pragma unroll
+    for (u32 x = 0; x < 4u; x++) {
+      const u32 i = t + NT * x, ok = (i >> 7) < ng && (i & 127u) < hd;
+      qq[x] = q[ok ? (kh * ng + (i >> 7)) * hd + (i & 127u) : 0u];
+    }
+#pragma unroll
+    for (u32 x = 0; x < 4u; x++) AG_HOLD(qq[x]);
+#pragma unroll
+    for (u32 x = 0; x < 4u; x++) {
+      const u32 i = t + NT * x;
+      ag_q[i >> 7][i & 127u] = (i >> 7) < ng && (i & 127u) < hd ? qq[x] : 0.0f;
+    }
+  }
   barrier();
   const u32 a0 = s * ch, n = a0 + ch < np ? ch : np - a0, r0 = (p0 + a0) % len;
   if (t < n) {
@@ -4167,6 +4184,8 @@ KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
 #pragma unroll
       for (u32 x = 0; x < 8u; x++) /* past hd: a valid row (dim 0), q is 0 there */
         kk[x] = *(const G ag_kv8 *)(k + (c0 + 8u * x < hd ? c0 + 8u * x : 0u));
+#pragma unroll
+      for (u32 x = 0; x < 8u; x++) AG_HOLD(kk[x]);
 #pragma unroll
       for (u32 x = 0; x < 8u; x++)
 #pragma unroll
@@ -4202,15 +4221,22 @@ KERNEL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *p
   if (dd < hd) {
     const G kvt *v = vc + kh * hd + dd;
     for (u32 i0 = par; i0 < n; i0 += 32u) {
-      float vv[16];
-      for (u32 x = 0; x < 16u; x++) {
-        const u32 i = i0 + 2u * x, r = r0 + i, slot = r < len ? r : r - len;
-        vv[x] = i < n ? (float)v[(unsigned long)slot * kvd] : 0.0f;
+      kvt vh[16];
+#pragma unroll
+      for (u32 x = 0; x < 16u; x++) { /* past n: a valid row (r0), weight 0 */
+        const u32 i = i0 + 2u * x, r = r0 + (i < n ? i : 0u), slot = r < len ? r : r - len;
+        vh[x] = v[(unsigned long)slot * kvd];
       }
-      for (u32 x = 0; x < 16u; x++)
-        if (i0 + 2u * x < n)
-          for (u32 g = 0; g < 8u; g++)
-            if (g < ng) o[g] += AG_SC[g][i0 + 2u * x] * vv[x];
+#pragma unroll
+      for (u32 x = 0; x < 16u; x++) AG_HOLD(vh[x]);
+#pragma unroll
+      for (u32 x = 0; x < 16u; x++) {
+        const u32 i = i0 + 2u * x, ic = i < n ? i : 0u;
+        const float vv = i < n ? (float)vh[x] : 0.0f;
+#pragma unroll
+        for (u32 g = 0; g < 8u; g++)
+          if (g < ng) o[g] += AG_SC[g][ic] * vv;
+      }
     }
   }
   barrier(); /* every thread is done with ag_q (the scores) */
