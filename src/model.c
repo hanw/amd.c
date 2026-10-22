@@ -1419,7 +1419,8 @@ static int moe_block(gb *B, const model *m, const layer *L, int x) {
     /* the shared down's input, residual and output stay apart from ye: one megakernel phase */
     use_last(B, gq), use_last(B, x), use_last(B, xs);
   }
-  const uint32_t qstr = (uint32_t)q8_bytes(eff / 32);
+  /* a slot 256-aligned: a token's K slots fill its buffer stride (prompt chunks: pair p = t K + k at p qstr) */
+  const uint32_t qstr = ((uint32_t)q8_bytes(eff / 32) + 255u) & ~255u;
   int mq = new_buf(g, "exp_mid_q8", K * qstr);
   o = emit(B, OP_MOE_SWIGLU, ye, -1, -1), o->n = eff, o->nh = K, o->astr = gstr, o->qo = mq;
   use_last(B, mq);
