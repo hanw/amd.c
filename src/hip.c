@@ -505,6 +505,11 @@ static void mk_check(u32 pos) {
 /* the builds (the sets of tools/mk_gen.py, in order), next to the kernels */
 static const char *const mk_file[MK_NSETS] = {"ie_mk.hsaco", "ie_mk_mtp.hsaco", "ie_mk_flint.hsaco", "ie_mk_flintl.hsaco"};
 static const char *const mk_setname[MK_NSETS] = {"decode", "verify", "flint decode", "flint decode (long)"};
+/* the builds a model uses: flint its two, the others decode and MTP (the
+ * others are not loaded: off) */
+static int mk_need(const model *m, int st) {
+  return m->arch == ARCH_FLINT ? st == MKSET_FLINT || st == MKSET_FLINTL : st == MKSET_DECODE || st == MKSET_MTP;
+}
 static int mk_light(void) { return mk.rec && mk.set == MKSET_MTP && mk.light; }
 /* 1: the launch went to the list */
 static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **args) {
@@ -592,6 +597,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     const char *sl = strrchr(hsaco, '/');
     const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
     for (int st = 0; st < MK_NSETS && mkon; st++) {
+      if (!mk_need(m, st)) continue;
       char *path = malloc(dl + 32);
       memcpy(path, hsaco, dl);
       strcpy(path + dl, mk_file[st]);
@@ -605,6 +611,10 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     const char *sl = strrchr(hsaco, '/');
     const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
     for (int st = 0; st < MK_NSETS; st++) {
+      if (!mk_need(m, st)) {
+        mk.off[st] = 1;
+        continue;
+      }
       char *path = malloc(dl + 32);
       memcpy(path, hsaco, dl);
       strcpy(path + dl, mk_file[st]);
@@ -663,6 +673,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     /* the cooperative launch fails (720) when the workgroups cannot all be
      * resident: try an empty list; halve np down to 32, else off */
     for (int st = 0; st < MK_NSETS; st++) {
+      if (!mk_need(m, st)) continue;
       for (;;) {
         u32 zero = 0;
         void *nul = NULL;
