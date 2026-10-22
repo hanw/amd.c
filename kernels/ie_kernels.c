@@ -4089,6 +4089,9 @@ KERNEL ie_gexp(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32
  * wave, blocks l + 32 t): the values of decode. nb <= GXT_NBMAX. */
 #define GXT_P 8u
 #define GXT_RB 64u
+#ifndef GXT_W
+#define GXT_W 4u /* rows of a wave at a time */
+#endif
 #define GXT_NBMAX 128u
 static LDS u8 gxt_x[GXT_P * GXT_NBMAX * 40u];
 KERNEL ie_gexp_t(const G u32 *qw, const G u16 *qs, const G u8 *X, G u8 *Y, u32 rows, u32 nb, const G u32 *list,
@@ -4115,36 +4118,54 @@ KERNEL ie_gexp_t(const G u32 *qw, const G u16 *qs, const G u8 *X, G u8 *Y, u32 r
       *(LDSP u32x4 *)(gxt_x + i) = *(const G u32x4 *)(X + (unsigned long)(pj / xdiv) * xs + o);
     }
     barrier();
+    /* GXT_W rows of a wave at a time (their weight loads in flight together) */
     const u32 nit = half ? GXT_RB / 16u : GXT_RB / 8u;
-    for (u32 it = 0; it < nit; it++) {
-      const u32 r = half ? rb + (wv + 8u * it) * 2u + (l >> 4) : rb + wv + 8u * it;
-      if ((half ? r & ~1u : r) >= rows) break; /* the whole wave */
-      float acc[GXT_P];
+    for (u32 it = 0; it < nit; it += GXT_W) {
+      u32 r[GXT_W];
 #pragma unroll
-      for (u32 j = 0; j < GXT_P; j++) acc[j] = 0.0f;
+      for (u32 k = 0; k < GXT_W; k++)
+        r[k] = half ? rb + (wv + 8u * (it + k)) * 2u + (l >> 4) : rb + wv + 8u * (it + k);
+      if ((half ? r[0] & ~1u : r[0]) >= rows) break; /* the whole wave */
+      float acc[GXT_W][GXT_P];
+#pragma unroll
+      for (u32 k = 0; k < GXT_W; k++)
+#pragma unroll
+        for (u32 j = 0; j < GXT_P; j++) acc[k][j] = 0.0f;
       if (half) {
         const u32 b = l & 15u;
-        if (r < rows && b < nb)
+        if (b < nb)
 #pragma unroll
-          for (u32 j = 0; j < GXT_P; j++)
-            if (j < nj) acc[j] = gexp_block_l(0.0f, kind, w, q, gxt_x + j * xb, rows, nb, r, b);
+          for (u32 k = 0; k < GXT_W; k++)
+            if (r[k] < rows)
 #pragma unroll
-        for (u32 j = 0; j < GXT_P; j++) acc[j] = half_tree_f(acc[j]);
+              for (u32 j = 0; j < GXT_P; j++)
+                if (j < nj) acc[k][j] = gexp_block_l(0.0f, kind, w, q, gxt_x + j * xb, rows, nb, r[k], b);
+#pragma unroll
+        for (u32 k = 0; k < GXT_W; k++)
+#pragma unroll
+          for (u32 j = 0; j < GXT_P; j++) acc[k][j] = half_tree_f(acc[k][j]);
       } else {
         for (u32 t = 0; ie_lane_blk(l, t) < nb; t++)
 #pragma unroll
-          for (u32 j = 0; j < GXT_P; j++)
-            if (j < nj) acc[j] = gexp_block_l(acc[j], kind, w, q, gxt_x + j * xb, rows, nb, r, ie_lane_blk(l, t));
+          for (u32 k = 0; k < GXT_W; k++)
+            if (r[k] < rows)
 #pragma unroll
-        for (u32 j = 0; j < GXT_P; j++) acc[j] = wave_tree_f(acc[j]);
+              for (u32 j = 0; j < GXT_P; j++)
+                if (j < nj) acc[k][j] = gexp_block_l(acc[k][j], kind, w, q, gxt_x + j * xb, rows, nb, r[k], ie_lane_blk(l, t));
+#pragma unroll
+        for (u32 k = 0; k < GXT_W; k++)
+#pragma unroll
+          for (u32 j = 0; j < GXT_P; j++) acc[k][j] = wave_tree_f(acc[k][j]);
       }
-      if ((l & (half ? 15u : 31u)) == 0u && r < rows)
 #pragma unroll
-        for (u32 j = 0; j < GXT_P; j++)
-          if (j < nj) {
-            const G float *rr = res ? (const G float *)(res + (unsigned long)pid[j] * rs) : 0;
-            ((G float *)(Y + (unsigned long)pid[j] * ys))[r] = epilogue(acc[j], r, 0, rr);
-          }
+      for (u32 k = 0; k < GXT_W; k++)
+        if ((l & (half ? 15u : 31u)) == 0u && r[k] < rows)
+#pragma unroll
+          for (u32 j = 0; j < GXT_P; j++)
+            if (j < nj) {
+              const G float *rr = res ? (const G float *)(res + (unsigned long)pid[j] * rs) : 0;
+              ((G float *)(Y + (unsigned long)pid[j] * ys))[r[k]] = epilogue(acc[k][j], r[k], 0, rr);
+            }
     }
   }
 }
