@@ -1464,6 +1464,197 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
 #undef GK_STORE_X
 }
 
+/* ie_gemm_q4kr for MAT_Q4K (kind 3), MAT_Q5K (5: the high bit added to the
+ * nibble bytes) and MAT_IQ4XS (6: the nibbles mapped to the int8 table, the
+ * scale d (ls - 32), no min term), by groups like ie_gexp_t: group e = grid
+ * y (the pairs list[offs[e] .. offs[e + 1]), or 0 .. np - 1), workgroup =
+ * GK_R rows, the pairs GK_T at a time (pair p: Q8 row X + (p / xdiv) xs,
+ * output row Y + p ys, residual res + p rs, bytes). Not bitwise equal to
+ * decode (another order of the float sums). */
+KERNEL ie_gemm_kx(const G u32 *qw0, const G u16 *qs0, const G u8 *X, G u8 *Y, u32 rows, u32 nb, const G u32 *list,
+                  const G u32 *offs, u32 np, u32 qwn, u32 qsn, u32 xs, u32 ys, u32 xdiv, u32 kind, const G u8 *res, u32 rs) {
+  /* nb % GK_KB == 0 (src/hip.c checks): no partial K chunk */
+  const u32 e = tokid(), p0 = list ? offs[e] : 0u, p1 = list ? offs[e + 1u] : np, T = p1 - p0;
+  const u32 rt = wgid(), t0 = tid(), w = t0 >> 5, l = lane();
+  const u32 rbase = rt * GK_R, h = l >> 4, wr = 16u * GK_WI * w;
+  if (T == 0u || rbase >= rows) return; /* the whole workgroup */
+  const G u32 *qw = qw0 + (unsigned long)e * qwn;
+  const G u16 *qs = qs0 + (unsigned long)e * qsn;
+  for (u32 tbase = 0; tbase < T; tbase += GK_T) {
+  /* the pair of token slot tk of this tile: its Q8 row and its output row */
+#define KX_PID(tk_) (list ? list[p0 + (tk_)] : p0 + (tk_))
+  f8 acc[GK_WI][GK_WJ];
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++)
+#pragma unroll
+    for (u32 j = 0; j < GK_WJ; j++) acc[i][j] = (f8)(0.0f);
+  /* the addresses of chunk 0 (rows and tokens past the end are clamped:
+   * computed, not stored); chunk kb0 adds kb0 * 32 bytes (scales: kb0) */
+  const G u8 *wp[GK_WI];
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++) {
+    const u32 r = rbase + wr + 16u * i + (l & 15u);
+    wp[i] = (const G u8 *)qw + (unsigned long)(r < rows ? r : rows - 1u) * nb * 16u; /* the whole 16-byte nibble block */
+  }
+  const G u32 *hwp[GK_WI]; /* Q5_K: the high-bit word of each block of the lane's row */
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++) {
+    const u32 r = rbase + wr + 16u * i + (l & 15u);
+    hwp[i] = qw + ie_q5k_hw(rows, r < rows ? r : rows - 1u, 0u, nb);
+  }
+  const G u8 *xp[GK_T * 8u / NT];
+#pragma unroll
+  for (u32 i = 0; i < GK_T * 8u / NT; i++) {
+    const u32 p = t0 + NT * i, tk = p >> 3, gt = tbase + tk < T ? tbase + tk : T - 1u;
+    xp[i] = X + (unsigned long)(KX_PID(gt) / xdiv) * xs + (p & 7u) * 16u;
+  }
+  const u32 sr = rbase + t0 * 1u; /* scale rows of this thread: 1u consecutive (threads t0 * 1u < GK_R) */
+  const u32 srr = sr < rows ? sr : rows - 1u; /* idle threads: a valid row */
+  const G u16 *swp = qs + (unsigned long)srr * nb;
+  const G f16 *ddp = (const G f16 *)qs + (unsigned long)rows * nb + (unsigned long)srr * (nb >> 3) * 2u;
+  const u32 sxt = tbase + t0 / GK_KB;
+  const G u8 *sxr = X + (unsigned long)(KX_PID(sxt < T ? sxt : T - 1u) / xdiv) * xs;
+  const G float *sxp = (const G float *)(sxr + 32u * nb) + t0 % GK_KB;
+  const G int *sap = (const G int *)(sxr + 36u * nb) + t0 % GK_KB;
+  u32x4 wa[GK_KB][GK_WI], wn[GK_KB][GK_WI]; /* weights: current chunk, next chunk */
+  u32 ha[GK_KB][GK_WI], hn[GK_KB][GK_WI];    /* Q5_K high bits: current, next */
+  u32x4 rx[GK_T * 8u / NT];
+  u16 rsw[GK_KB];
+  f16 rdd[2];
+  float rsx;
+  int rsa; /* asum as loaded: converted at the store, so the fetch does not wait for its loads */
+#define GK_FETCH_W(dst_, hdst_, kb0_)                                                                           \
+  _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++)                                                             \
+    _Pragma("unroll") for (u32 i = 0; i < GK_WI; i++) {                                                         \
+      dst_[k][i] = *(const G u32x4 *)(wp[i] + ((kb0_) + k) * 16u);                                              \
+      hdst_[k][i] = kind == 5u ? hwp[i][(kb0_) + k] : 0u;                                                       \
+    }
+#define GK_FETCH_X(kb0_)                                                                                        \
+  do {                                                                                                          \
+    _Pragma("unroll") for (u32 i = 0; i < GK_T * 8u / NT; i++) rx[i] = *(const G u32x4 *)(xp[i] + (kb0_) * 32u); \
+    _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) rsw[k] = swp[(kb0_) + k];                                 \
+    rdd[0] = ddp[((kb0_) >> 3) * 2u], rdd[1] = ddp[((kb0_) >> 3) * 2u + 1u]; /* GK_KB divides 8: one super-block */ \
+    rsa = t0 < GK_T * GK_KB ? sap[(kb0_)] : 0;                                                                 \
+    rsx = t0 < GK_T * GK_KB ? sxp[(kb0_)] : 0.0f;                                                               \
+  } while (0)
+#define GK_STORE_X(bf_)                                                                                         \
+  do {                                                                                                          \
+    _Pragma("unroll") for (u32 i = 0; i < GK_T * 8u / NT; i++) {                                                \
+      const u32 p = t0 + NT * i;                                                                                \
+      *(LDSP u32x4 *)(gk_x[bf_] + (p >> 3) * GK_LS + (p & 7u) * 16u) = rx[i];                                   \
+    }                                                                                                           \
+    if (t0 < GK_R) {                                                                                            \
+      hk4 mh_;                                                                                                  \
+      _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) {                                                       \
+        gk_sw[bf_][k * GK_R + t0] = kind == 6u ? (float)rdd[0] * (float)((int)(rsw[k] & 63u) - 32)             \
+                                               : (float)rdd[0] * (float)(rsw[k] & 63u);                         \
+        mh_[k] = kind == 6u ? (f16)0.0f : (f16)(-((float)rdd[1] * (float)(rsw[k] >> 8)));                     \
+      }                                                                                                         \
+      gk_mh[bf_][t0] = mh_;                                                                                     \
+    }                                                                                                           \
+    if (t0 < GK_T * GK_KB) ((LDSP f16 *)gk_sh[bf_])[t0] = (f16)((float)rsa * rsx);                                    \
+    if (t0 < GK_T * GK_KB) gk_sx[bf_][t0] = rsx;                                                                \
+  } while (0)
+  GK_FETCH_W(wa, ha, 0u);
+  GK_FETCH_X(0u);
+  GK_STORE_X(0u);
+  barrier();
+  u32 bf = 0;
+#pragma unroll 1
+  for (u32 kb0 = 0; kb0 < nb; kb0 += GK_KB) {
+    const int more = kb0 + GK_KB < nb;
+    if (more) { /* in flight during the math below */
+      GK_FETCH_W(wn, hn, kb0 + GK_KB);
+      GK_FETCH_X(kb0 + GK_KB);
+    }
+    const LDSP u8 *lx = gk_x[bf];
+    const LDSP float *lsw = gk_sw[bf], *lsx = gk_sx[bf];
+    const u32 nk = nb - kb0 < GK_KB ? nb - kb0 : GK_KB; /* = GK_KB; the branch keeps the blocks apart for the scheduler */
+#pragma unroll
+    for (u32 k = 0; k < GK_KB; k++) {
+      if (k >= nk) break;
+      u32x4 b[GK_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GK_WJ; j++) b[j] = *(const LDSP u32x4 *)(lx + (16u * j + (l & 15u)) * GK_LS + k * 32u + 16u * h);
+      const v8i zm = (v8i)(0x4B400000); /* see ie_gemm_q8 */
+      float dx[GK_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GK_WJ; j++) dx[j] = lsx[(16u * j + (l & 15u)) * GK_KB + k];
+#pragma unroll
+      for (u32 i = 0; i < GK_WI; i++) { /* one row tile at a time (fewer registers) */
+        v8i c[GK_WJ];
+        /* lane half h: weights 16 h .. 16 h + 15 = the low (h = 0) or high nibbles of the 16 bytes */
+        u32x4 nb4 = h ? (wa[k][i] >> 4) & 0x0F0F0F0Fu : wa[k][i] & 0x0F0F0F0Fu;
+        if (kind == 5u) { /* Q5_K: bit 4 of weights 16 h + 4 c .. + 3 */
+          const u32 hb = ha[k][i] >> (16u * h);
+          nb4.x |= ie_spread4(hb) << 4u, nb4.y |= ie_spread4(hb >> 4u) << 4u;
+          nb4.z |= ie_spread4(hb >> 8u) << 4u, nb4.w |= ie_spread4(hb >> 12u) << 4u;
+        } else if (kind == 6u) { /* IQ4_XS: the int8 table values */
+          nb4.x = ie_iq4_map(nb4.x), nb4.y = ie_iq4_map(nb4.y), nb4.z = ie_iq4_map(nb4.z), nb4.w = ie_iq4_map(nb4.w);
+        }
+        const v2i a0 = {(int)nb4.x, (int)nb4.y}, a1 = {(int)nb4.z, (int)nb4.w};
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) {
+          const v2i b0 = {(int)b[j].x, (int)b[j].y};
+          c[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a0, 1, b0, zm, 0);
+        }
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) {
+          const v2i b1 = {(int)b[j].z, (int)b[j].w};
+          c[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a1, 1, b1, c[j], 0);
+        }
+        const f8 sw = *(const LDSP f8 *)(lsw + k * GK_R + wr + 16u * i + 8u * h);
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) acc[i][j] += (sw * dx[j]) * (__builtin_bit_cast(f8, c[j]) - 12582912.0f); /* (da d sc) dq */
+      }
+      __builtin_amdgcn_sched_barrier(0); /* keep the blocks apart: the scheduler otherwise overlaps them and spills */
+    }
+    { /* the min term of the chunk: lane half 0 holds K = blocks 0 .. GK_KB - 1, half 1 zeros */
+      const hk4 z4 = (hk4)(0.0f);
+      hk8 bm[GK_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GK_WJ; j++) {
+        const hk4 v = h ? z4 : gk_sh[bf][16u * j + (l & 15u)];
+        bm[j] = (hk8){v[0], v[1], v[2], v[3], 0, 0, 0, 0};
+      }
+#pragma unroll
+      for (u32 i = 0; i < GK_WI; i++) {
+        const hk4 v = h ? z4 : gk_mh[bf][wr + 16u * i + (l & 15u)];
+        const hk8 am = {v[0], v[1], v[2], v[3], 0, 0, 0, 0};
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(am, bm[j], acc[i][j]);
+      }
+    }
+    if (more) GK_STORE_X(bf ^ 1u); /* nobody reads that buffer in this chunk */
+    lbarrier();
+    bf ^= 1u;
+#pragma unroll
+    for (u32 k = 0; k < GK_KB; k++)
+#pragma unroll
+      for (u32 i = 0; i < GK_WI; i++) wa[k][i] = wn[k][i], ha[k][i] = hn[k][i];
+  }
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++)
+#pragma unroll
+    for (u32 j = 0; j < GK_WJ; j++) {
+      const u32 t = tbase + 16u * j + (l & 15u);
+      if (t >= T) continue;
+      const u32 pid = KX_PID(t);
+      G float *yr = (G float *)(Y + (unsigned long)pid * ys);
+      const G float *rr = res ? (const G float *)(res + (unsigned long)pid * rs) : 0;
+      for (u32 v = 0; v < 8u; v++) {
+        const u32 r = rbase + wr + 16u * i + 8u * h + v;
+        if (r < rows) yr[r] = epilogue(acc[i][j][v], r, 0, rr);
+      }
+    }
+  barrier(); /* the next token tile reuses the LDS buffers */
+  }
+#undef KX_PID
+#undef GK_FETCH_W
+#undef GK_FETCH_X
+#undef GK_STORE_X
+}
+
 /* Q4_K x fp16 activations for prompt chunks (ie_gemm_q4k_h). The Q8
  * activations of the chunk first become fp16 (ie_q8_f16: q d, exact up to
  * the fp16 rounding); the weights are dequantized to fp16 in LDS (w = d sc q
