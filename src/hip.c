@@ -141,6 +141,8 @@ typedef struct {
   int attn_gq;             /* flint: ie_attn_gq for decode (IE_ATTN_SW=1: ie_attn_sw) */
   uint32_t gq_ch;          /* its chunk: 256 positions (IE_ATTN_GQ_CH: 1 .. 256, for tests) */
   uint32_t gq_min;         /* from this position count on (IE_ATTN_GQ_MIN) */
+  uint32_t gq_s;           /* at most this many splits per kv head (IE_ATTN_GQ_S, default 32) */
+  int gq_ch_fixed;         /* IE_ATTN_GQ_CH set: that chunk always */
   int flint;               /* the model is flint (its megakernel builds) */
   u32 *ms_offs, *ms_list;  /* flint prompt chunks: the pairs by expert (ie_moe_sort) */
   int attn_kv;             /* use ie_attn_kv for decode and verify (the K/V of a split read once; not IE_ATTN=split) */
@@ -733,7 +735,10 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   b->flint = m->arch == ARCH_FLINT;
   b->gq_min = getenv("IE_ATTN_GQ_MIN") ? (uint32_t)atoi(getenv("IE_ATTN_GQ_MIN")) : IE_GQ_MIN;
   b->gq_ch = getenv("IE_ATTN_GQ_CH") ? (uint32_t)atoi(getenv("IE_ATTN_GQ_CH")) : 256u;
-  if (b->gq_ch < 1u || b->gq_ch > 256u) ie_die("IE_ATTN_GQ_CH: 1 .. 256");
+  b->gq_ch_fixed = getenv("IE_ATTN_GQ_CH") != NULL;
+  if (b->gq_ch < 1u) ie_die("IE_ATTN_GQ_CH: >= 1");
+  b->gq_s = getenv("IE_ATTN_GQ_S") ? (uint32_t)atoi(getenv("IE_ATTN_GQ_S")) : 32u;
+  if (b->gq_s < 1u) ie_die("IE_ATTN_GQ_S: >= 1");
   b->attn_kv = b->attn_split && !(ae && (!strcmp(ae, "split") || !strcmp(ae, "check"))) && ie_att_ch(0) % 8u == 0u &&
                IE_ATT_MAX_SPLIT <= 4096u && m->hd % 4u == 0u; /* ie_attn_kv: the merge weights in its LDS buffer, float4 loads */
   if (b->attn_check) {
@@ -1361,7 +1366,14 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           /* ie_attn_gq (the q heads of a kv head together, chunks of 256
            * positions) when it can; IE_ATTN_SW=1: ie_attn_sw */
           const int gq = gq_use(b, pos) && nhd / nkv <= 8u && hd <= 128u && hd % 8u == 0u;
-          u32 ch = gq ? b->gq_ch : ie_att_ch(pos), nsplit = (np + ch - 1u) / ch;
+          /* ie_attn_gq: passes of 256 positions; at most gq_s splits per kv head
+           * (long positions: fewer, longer splits, a cheap merge) */
+          u32 ch = gq ? b->gq_ch : ie_att_ch(pos);
+          if (gq && !b->gq_ch_fixed) {
+            const u32 per = (np + b->gq_s - 1u) / b->gq_s;
+            ch = per <= 256u ? 256u : (per + 255u) & ~255u;
+          }
+          u32 nsplit = (np + ch - 1u) / ch;
           void *SK = b->d[i].w1; /* the sinks (gpu_open), or NULL */
           void *args[] = {&A, &kc, &vc, &C, &B, &p0, &np, &len, (void *)&hd, (void *)&nhd, (void *)&nkv, &nsplit, &ch,
                           &b->at_count, &Q, &SK};

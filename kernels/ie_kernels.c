@@ -4246,6 +4246,7 @@ KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float 
  * else partial results (M, L, o) per q head and the last workgroup of kv
  * head kh merges, with the arithmetic of the ie_attn_sw merge. */
 static LDS float ag_q[8][128]; /* q, then the P V sums of the odd positions */
+static LDS float ag_c[8];      /* per pass: the rescale of each head's O and sum */
 typedef kvt ag_kv8 __attribute__((ext_vector_type(8)));
 /* The value of v in a register here: the loads before it, one wait for all
  * of them (the compiler would wait for each load before its use). */
@@ -4272,7 +4273,13 @@ KERNEL_CALL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G flo
     AG_QH[i >> 7][i & 127u] = hi, AG_QL[i >> 7][i & 127u] = ok ? (f16)(qv - (float)hi) : (f16)0.0f;
   }
   barrier();
-  const u32 a0 = s * ch, n = a0 + ch < np ? ch : np - a0, r0 = (p0 + a0) % len;
+  /* the chunk of this split (na <= ch positions) in passes of 256: the
+   * running maximum and sum per head (wave w < ng), O rescaled per pass */
+  const u32 a0 = s * ch, na = a0 + ch < np ? ch : np - a0;
+  float o[8], Mr = -__builtin_inff(), Lr = 0.0f;
+  for (u32 g = 0; g < 8u; g++) o[g] = 0.0f;
+  for (u32 sb = 0; sb < na; sb += 256u) {
+  const u32 n = na - sb < 256u ? na - sb : 256u, r0 = (p0 + a0 + sb) % len;
   {
     const u32 l = lane(), rl = l & 15u, hl = l >> 4;
     const v8f zero = (v8f){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -4321,7 +4328,13 @@ KERNEL_CALL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G flo
     }
   }
   barrier();
-  const u32 a0 = s * ch, n = a0 + ch < np ? ch : np - a0, r0 = (p0 + a0) % len;
+  /* the chunk of this split (na <= ch positions) in passes of 256: the
+   * running maximum and sum per head (wave w < ng), O rescaled per pass */
+  const u32 a0 = s * ch, na = a0 + ch < np ? ch : np - a0;
+  float o[8], Mr = -__builtin_inff(), Lr = 0.0f;
+  for (u32 g = 0; g < 8u; g++) o[g] = 0.0f;
+  for (u32 sb = 0; sb < na; sb += 256u) {
+  const u32 n = na - sb < 256u ? na - sb : 256u, r0 = (p0 + a0 + sb) % len;
   if (t < n) {
     const u32 slot = r0 + t < len ? r0 + t : r0 + t - len;
     const G kvt *k = kc + (unsigned long)slot * kvd + kh * hd;
@@ -4348,25 +4361,27 @@ KERNEL_CALL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G flo
 #endif
   barrier();
   const u32 w = t >> 5, l = lane();
-  if (w < ng) {
+  if (w < ng) { /* one pass (na <= 256): M = the maximum, c = 0, Lr = the sum, as before */
     float mx = -__builtin_inff();
     for (u32 i = l; i < n; i += 32u) mx = __builtin_fmaxf(mx, AG_SC[w][i]);
     mx = wave_max_any(mx);
+    const float M = __builtin_fmaxf(Mr, mx), c = __builtin_expf(Mr - M);
     float sm = 0.0f;
     for (u32 i = l; i < n; i += 32u) {
-      const float e = __builtin_expf(AG_SC[w][i] - mx);
+      const float e = __builtin_expf(AG_SC[w][i] - M);
       AG_SC[w][i] = e;
       sm += e;
     }
     sm = wave_sum_all(sm);
-    if (l == 0u) at_m[w] = mx, at_l[w] = sm;
+    Lr = Lr * c + sm, Mr = M;
+    if (l == 0u) ag_c[w] = c;
   }
   barrier();
   /* P V: thread t the dim t & 127 of all heads, positions of parity t >> 7,
    * 16 V loads together; then the odd sums through ag_q */
   const u32 dd = t & 127u, par = t >> 7;
-  float o[8];
-  for (u32 g = 0; g < 8u; g++) o[g] = 0.0f;
+  for (u32 g = 0; g < 8u; g++)
+    if (g < ng) o[g] *= ag_c[g];
   if (dd < hd) {
     const G kvt *v = vc + kh * hd + dd;
     for (u32 i0 = par; i0 < n; i0 += 32u) {
@@ -4388,6 +4403,10 @@ KERNEL_CALL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G flo
       }
     }
   }
+  barrier(); /* AG_SC and ag_c: the next pass */
+  }
+  if (t < 8u * 32u && (t >> 5) < ng && lane() == 0u) at_m[t >> 5] = Mr, at_l[t >> 5] = Lr;
+  const u32 dd = t & 127u, par = t >> 7;
   barrier(); /* every thread is done with ag_q (the scores) */
   if (par == 1u && dd < hd)
     for (u32 g = 0; g < 8u; g++)
