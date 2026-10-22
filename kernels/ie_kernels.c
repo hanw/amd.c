@@ -3386,8 +3386,10 @@ KERNEL ie_attn_pfg(const G float *q, const G kvt *kc, const G kvt *vc, G float *
 static LDS f16 fa_k[FA_NB * FA_KS];
 static LDS f16 fa_vt[FA_DC * FA_VS];
 static LDS f16 fa_p[8u][16u * FA_VS];
-KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
-                  u32 n_kv, const G float *gate, u32 gstride, u32 qs, u32 os, u32 gs, u32 T) {
+static inline __attribute__((always_inline)) void attn_fa_body(const G float *q, const G kvt *kc, const G kvt *vc, G float *out,
+                                                              u32 pos0, u32 hd, u32 n_head, u32 n_kv, const G float *gate,
+                                                              u32 gstride, u32 qs, u32 os, u32 gs, u32 T, const int sw, u32 win,
+                                                              u32 len, const G float *sinks) {
   const u32 ntile = (T + 15u) / 16u, nparts = (hd + FA_DC - 1u) / FA_DC;
   const u32 tile = wgid() % ntile, part = (wgid() / ntile) % nparts, kh = wgid() / (ntile * nparts), t0 = 16u * tile;
   const u32 ga = n_head / n_kv, kvd = n_kv * hd, w = tid() >> 5, l = lane(), hl = l >> 4, rl = l & 15u;
@@ -3410,19 +3412,21 @@ KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *o
   for (u32 nt = 0; nt < FA_DC / 16u; nt++) o[nt] = zero;
   for (u32 v = 0; v < 8u; v++) m[v] = -__builtin_inff(), ls[v] = 0.0f;
   const u32 h4 = hd >> 2, n4 = FA_NB * h4, c4 = nc >> 2; /* float4 per key row, per block; of the part */
-  for (u32 kb = 0; kb < kend; kb += FA_NB) {
+  /* sw (flint): a window of win keys (win 0: all), key p in row p % len, sinks */
+  const u32 kbeg = sw && win && pos0 + t0 + 1u > win ? pos0 + t0 + 1u - win : 0u;
+  for (u32 kb = kbeg; kb < kend; kb += FA_NB) {
     /* K (all of hd) and V (the part's columns) of keys kb .. kb + 31 to LDS (fp16); keys >= kend as zeros */
     for (u32 i4 = tid(); i4 < n4; i4 += NT) {
       const u32 r = i4 / h4, e4 = i4 - r * h4, p = kb + r;
       f32x4 kv = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};
-      if (p < kend) kv = KV4(kc, ((unsigned long)p * kvd + kh * hd) / 4u + e4);
+      if (p < kend) kv = KV4(kc, ((unsigned long)(sw ? p % len : p) * kvd + kh * hd) / 4u + e4);
       LDSP f16 *kd = fa_k + r * FA_KS + 4u * e4;
       kd[0] = (f16)kv.x, kd[1] = (f16)kv.y, kd[2] = (f16)kv.z, kd[3] = (f16)kv.w;
     }
     for (u32 i4 = tid(); i4 < FA_NB * c4; i4 += NT) {
       const u32 r = i4 / c4, e4 = i4 - r * c4, p = kb + r;
       f32x4 vv = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};
-      if (p < kend) vv = KV4(vc, ((unsigned long)p * kvd + kh * hd + c0) / 4u + e4);
+      if (p < kend) vv = KV4(vc, ((unsigned long)(sw ? p % len : p) * kvd + kh * hd + c0) / 4u + e4);
       fa_vt[(4u * e4 + 0u) * FA_VS + r] = (f16)vv.x;
       fa_vt[(4u * e4 + 1u) * FA_VS + r] = (f16)vv.y;
       fa_vt[(4u * e4 + 2u) * FA_VS + r] = (f16)vv.z;
@@ -3448,12 +3452,15 @@ KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *o
       for (u32 v = 0; v < 8u; v++) {
         const u32 tp = pos0 + t0 + 8u * hl + v; /* this row's position */
         const u32 k0 = kb + rl, k1 = kb + 16u + rl;
-        const float s0 = k0 <= tp ? s[0][v] : -__builtin_inff(), s1 = k1 <= tp ? s[1][v] : -__builtin_inff();
+        const int v0 = k0 <= tp && (!sw || !win || k0 + win > tp), v1 = k1 <= tp && (!sw || !win || k1 + win > tp);
+        const float s0 = v0 ? s[0][v] : -__builtin_inff(), s1 = v1 ? s[1][v] : -__builtin_inff();
         float rm = __builtin_fmaxf(s0, s1);
         for (u32 x = 1u; x < 16u; x <<= 1) rm = __builtin_fmaxf(rm, shfl_xor_f(rm, x)); /* the 16 lanes of the row */
         const float mn = __builtin_fmaxf(m[v], rm);
-        c[v] = __builtin_expf(m[v] - mn);
-        const float p0 = __builtin_expf(s0 - mn), p1 = __builtin_expf(s1 - mn);
+        /* sw: a row may have no key yet (its window starts later): then 0, not exp(-inf + inf) */
+        const float mz = sw && mn == -__builtin_inff() ? 0.0f : mn;
+        c[v] = __builtin_expf(m[v] - mz);
+        const float p0 = __builtin_expf(s0 - mz), p1 = __builtin_expf(s1 - mz);
         ls[v] = ls[v] * c[v] + p0 + p1;
         m[v] = mn;
         LDSP f16 *pr = fa_p[w] + (8u * hl + v) * FA_VS;
@@ -3481,6 +3488,7 @@ KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *o
     for (u32 v = 0; v < 8u; v++) {
       float x = ls[v];
       for (u32 s = 1u; s < 16u; s <<= 1) x += shfl_xor_f(x, s);
+      if (sw && sinks) x += __builtin_expf(sinks[h] - m[v]); /* the sink: in the denominator only */
       inv[v] = 1.0f / x;
     }
 #pragma unroll
@@ -3495,6 +3503,16 @@ KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *o
       }
     }
   }
+}
+KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
+                  u32 n_kv, const G float *gate, u32 gstride, u32 qs, u32 os, u32 gs, u32 T) {
+  attn_fa_body(q, kc, vc, out, pos0, hd, n_head, n_kv, gate, gstride, qs, os, gs, T, 0, 0u, 1u, 0);
+}
+/* ie_attn_fa for flint prompt chunks: keys in a window of win (0: all), key
+ * p in row p % len of kc, vc (a ring), sinks[h] in the denominator (or NULL). */
+KERNEL ie_attn_fa_sw(const G float *q, const G kvt *kc, const G kvt *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
+                     u32 n_kv, u32 qs, u32 os, u32 T, u32 win, u32 len, const G float *sinks) {
+  attn_fa_body(q, kc, vc, out, pos0, hd, n_head, n_kv, 0, 0u, qs, os, 0u, T, 1, win, len, sinks);
 }
 
 /* ie_attn_fa with S computed once (hd == 256): workgroup (kh, tile) = KV
@@ -4045,6 +4063,86 @@ KERNEL ie_gexp(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32
   else gemv_iq4xsq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
 }
 
+/* Prompt chunks: Y = W X for many tokens, by groups (the experts) or one
+ * matrix. Group e = grid y: the pairs list[offs[e] .. offs[e + 1]) (list
+ * NULL: one group, the pairs 0 .. np - 1); pair p reads the Q8 row
+ * X + (p / xdiv) xs and writes the row Y + p ys (bytes), plus the row
+ * res + p rs when res. Per (row, pair) the arithmetic and order of ie_gexp
+ * (nb <= 16: the half-wave rows) or of the row functions (else: one row per
+ * wave, blocks l + 32 t): the values of decode. Workgroup: 8 waves, 16 rows
+ * (nb <= 16) or 8; the pairs GXT_P at a time (the weights from the cache). */
+#define GXT_P 8u
+KERNEL ie_gexp_t(const G u32 *qw, const G u16 *qs, const G u8 *X, G u8 *Y, u32 rows, u32 nb, const G u32 *list,
+                 const G u32 *offs, u32 np, u32 qwn, u32 qsn, u32 xs, u32 ys, u32 xdiv, u32 kind, const G u8 *res, u32 rs) {
+  const u32 e = tokid(), l = lane(), wv = tid() >> 5, half = nb <= 16u;
+  const u32 p0 = list ? offs[e] : 0u, p1 = list ? offs[e + 1u] : np;
+  if (p0 >= p1) return;
+  const u32 r = half ? (wgid() * 8u + wv) * 2u + (l >> 4) : wgid() * 8u + wv;
+  if ((half ? r & ~1u : r) >= rows) return; /* the whole wave */
+  const G u32 *w = qw + (unsigned long)e * qwn;
+  const G u16 *q = qs + (unsigned long)e * qsn;
+  for (u32 pb = p0; pb < p1; pb += GXT_P) {
+    u32 pid[GXT_P];
+    float acc[GXT_P];
+#pragma unroll
+    for (u32 j = 0; j < GXT_P; j++) {
+      const u32 pj = pb + j < p1 ? pb + j : p1 - 1u;
+      pid[j] = list ? list[pj] : pj;
+      acc[j] = 0.0f;
+    }
+    if (half) {
+      const u32 b = l & 15u;
+      if (r < rows && b < nb)
+#pragma unroll
+        for (u32 j = 0; j < GXT_P; j++) acc[j] = gexp_block(0.0f, kind, w, q, X + (unsigned long)(pid[j] / xdiv) * xs, rows, nb, r, b);
+#pragma unroll
+      for (u32 j = 0; j < GXT_P; j++) acc[j] = half_tree_f(acc[j]);
+    } else {
+      for (u32 t = 0; ie_lane_blk(l, t) < nb; t++)
+#pragma unroll
+        for (u32 j = 0; j < GXT_P; j++)
+          acc[j] = gexp_block(acc[j], kind, w, q, X + (unsigned long)(pid[j] / xdiv) * xs, rows, nb, r, ie_lane_blk(l, t));
+#pragma unroll
+      for (u32 j = 0; j < GXT_P; j++) acc[j] = wave_tree_f(acc[j]);
+    }
+    if ((l & (half ? 15u : 31u)) == 0u && r < rows)
+#pragma unroll
+      for (u32 j = 0; j < GXT_P; j++)
+        if (pb + j < p1) {
+          const G float *rr = res ? (const G float *)(res + (unsigned long)pid[j] * rs) : 0;
+          ((G float *)(Y + (unsigned long)pid[j] * ys))[r] = epilogue(acc[j], r, 0, rr);
+        }
+  }
+}
+
+/* The pairs of a prompt chunk by expert: pair p = t K + k (token t, choice
+ * k) with expert route_t[k] (route_t = route + t rst bytes). offs[e] .. offs[e
+ * + 1]: the list entries of expert e, in pair order (one workgroup: the
+ * counts in LDS, then thread 0 places the pairs in order from LDS). */
+#define MS_MAXP 4096u /* pairs per chunk (src/hip.c checks) */
+static LDS u32 ms_cnt[1024];
+static LDS unsigned short ms_id[MS_MAXP];
+KERNEL ie_moe_sort(const G u32 *route, u32 rst, u32 T, u32 K, u32 n_exp, G u32 *offs, G u32 *list) {
+  const u32 t = tid(), np = T * K;
+  for (u32 e = t; e < n_exp; e += NT) ms_cnt[e] = 0u;
+  barrier();
+  for (u32 p = t; p < np; p += NT) {
+    const u32 e = ((const G u32 *)((const G u8 *)route + (unsigned long)(p / K) * rst))[p % K];
+    ms_id[p] = (unsigned short)e;
+    __atomic_fetch_add(&ms_cnt[e], 1u, __ATOMIC_RELAXED);
+  }
+  barrier();
+  if (t == 0u) { /* exclusive prefix sum, then the pairs in order (stable), from LDS */
+    u32 a = 0u;
+    for (u32 e = 0; e < n_exp; e++) {
+      const u32 c = ms_cnt[e];
+      offs[e] = a, ms_cnt[e] = a, a += c;
+    }
+    offs[n_exp] = a;
+    for (u32 p = 0; p < np; p++) list[ms_cnt[ms_id[p]]++] = p;
+  }
+}
+
 /* Routing (wave 0 alone, no LDS, few registers: the megakernel; n <= 1024
  * experts, K <= 16 <= 32): s = sigmoid(logit); the K largest s + bias, one
  * at a time (ties: the smaller index); out = [K ids | K weights], weight k =
@@ -4105,8 +4203,9 @@ static inline void moe_route8(const G float *lg, u32 n, u32 K, const G float *bi
   const float inv = 1.0f / (sum + 1e-20f);
   if (l < K) out[l] = myid, ((G float *)out)[K + l] = myw * inv * scale;
 }
-KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float scale, G u32 *out) {
+KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float scale, G u32 *out, u32 ls, u32 ost) {
   if (tid() >= 32u) return;
+  lg = TOKC(lg, ls), out = TOK(out, ost); /* token tokid() (grid y) */
   if (n <= 256u) {
     moe_route8(lg, n, K, bias, scale, out);
     return;
@@ -4355,9 +4454,12 @@ KERNEL_CALL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G flo
   if (t == 0u) count[kh] = 0u;
 }
 
-KERNEL ie_moe_sum(const G float *y, G float *out, const G u32 *route, const G float *res, u32 n, u32 K) {
+KERNEL ie_moe_sum(const G float *y, G float *out, const G u32 *route, const G float *res, u32 n, u32 K, u32 ys, u32 os,
+                  u32 rts, u32 rs) {
   const u32 j = wgid() * NT + tid();
   if (j >= n) return;
+  /* token tokid(): the strides in bytes (grid y; decode: one token) */
+  y = TOKC(y, ys), out = TOK(out, os), route = TOKC(route, rts), res = res ? TOKC(res, rs) : res;
   const G float *w = (const G float *)(route + K);
   float acc = 0.0f;
   for (u32 k = 0; k < K; k++) acc = __builtin_fmaf(w[k], y[(unsigned long)k * n + j], acc);
@@ -4369,8 +4471,14 @@ KERNEL ie_moe_sum(const G float *y, G float *out, const G u32 *route, const G fl
  * head h at qkv + nq qstr + nkv hd + h hd. nrot = 0: no RoPE. kc, vc: the
  * cache rows of this position. One token. */
 KERNEL ie_qkn_rope_kv2(const G float *qkv, G float *qo, G kvt *kc, G kvt *vc, const G float *qw, const G float *kw,
-                       const G float *cs, const G float *sn, u32 nq, u32 nkv, u32 hd, u32 nrot, float eps, u32 qstr) {
-  const u32 g = wgid(), t = tid();
+                       const G float *cs, const G float *sn, u32 nq, u32 nkv, u32 hd, u32 nrot, float eps, u32 qstr,
+                       u32 ins, u32 qos, u32 pos0, u32 len, u32 h2r) {
+  /* token tokid() of a chunk (grid y): position pos0 + tokid(); kc, vc: row 0
+   * of the layer (its K/V in row p % len); cs, sn: the tables (h2r per position) */
+  const u32 g = wgid(), t = tid(), pp = pos0 + tokid();
+  qkv = TOKC(qkv, ins), qo = TOK(qo, qos);
+  kc += (unsigned long)(pp % len) * nkv * hd, vc += (unsigned long)(pp % len) * nkv * hd;
+  cs += (unsigned long)pp * h2r, sn += (unsigned long)pp * h2r;
   const G float *kb = qkv + nq * qstr;
   if (g >= nq + nkv) { /* value head */
     const u32 h = g - nq - nkv;
