@@ -1422,7 +1422,7 @@ static int moe_block(gb *B, const model *m, const layer *L, int x) {
   /* a slot 256-aligned: a token's K slots fill its buffer stride (prompt chunks: pair p = t K + k at p qstr) */
   const uint32_t qstr = ((uint32_t)q8_bytes(eff / 32) + 255u) & ~255u;
   int mq = new_buf(g, "exp_mid_q8", K * qstr);
-  o = emit(B, OP_MOE_SWIGLU, ye, -1, -1), o->n = eff, o->nh = K, o->astr = gstr, o->qo = mq;
+  o = emit(B, OP_MOE_SWIGLU, ye, -1, -1), o->n = eff, o->nh = K, o->astr = gstr, o->bstr = qstr, o->qo = mq;
   use_last(B, mq);
   int yd = new_buf(g, "exp_down", K * dim * 4);
   o = emit(B, OP_GEMV_EXP, mq, yd, rt), o->w = &L->ed, o->n = eff, o->nh = K, o->astr = qstr, o->bstr = dim * 4;

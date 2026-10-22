@@ -593,7 +593,7 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
         for (u32 sl = 0; sl < o->nh; sl++) {
           float *gs = (float *)((char *)a + (size_t)sl * o->astr);
           for (u32 j = 0; j < o->n; j++) gs[j] = gs[j] / (1.0f + expf(-gs[j])) * gs[o->n + j];
-          cpu_quant_q8(gs, qo + (size_t)sl * q8_bytes(o->n / 32), o->n / 32);
+          cpu_quant_q8(gs, qo + (size_t)sl * o->bstr, o->n / 32);
         }
         break;
       case OP_MOE_SUM: {

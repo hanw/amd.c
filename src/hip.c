@@ -1155,7 +1155,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
       }
       case OP_MOE_SWIGLU: { /* per slot: ie_swiglu with the slot strides (grid y = slot) */
         void *Bu = (char *)A + (size_t)n * 4u;
-        u32 as = o->astr, qs = (u32)q8_bytes(n / 32u);
+        u32 as = o->astr, qs = o->bstr; /* the slot strides */
         void *args[] = {&A, &Bu, &n, &Q, &as, &qs};
         if (T > 1u && (g->bufs[o->a].stride != o->nh * as || g->bufs[o->qo].stride != o->nh * qs))
           ie_die("expert SwiGLU of a chunk: token strides %u, %u (slots %u, %u)", g->bufs[o->a].stride, g->bufs[o->qo].stride, as, qs);
