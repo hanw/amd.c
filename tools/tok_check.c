@@ -4,7 +4,8 @@
  * models/ggml-vocab-qwen35.gguf; a full model file also works). TESTS.inp:
  * texts separated by "\n__ggml_vocab_test__\n"; TESTS.out: the expected ids,
  * one line per text. Also:
- *   tok_check VOCAB.gguf --text "some text"   prints the ids */
+ *   tok_check VOCAB.gguf --text "some text"   prints the ids
+ *   tok_check VOCAB.gguf --file TEXT.txt      prints the ids of the file, comma separated */
 #include <string.h>
 
 #include "../src/common.h"
@@ -54,6 +55,21 @@ int main(int argc, char **argv) {
   char err[256];
   tokenizer *t = tok_open(&m, &g, err, sizeof err);
   if (!t) ie_die("%s", err);
+  if (!strcmp(argv[2], "--file")) {
+    FILE *f = fopen(argv[3], "rb");
+    if (!f) ie_die("cannot open %s", argv[3]);
+    fseek(f, 0, SEEK_END);
+    const long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *txt = malloc((size_t)n + 1);
+    if (fread(txt, 1, (size_t)n, f) != (size_t)n) ie_die("cannot read %s", argv[3]);
+    fclose(f);
+    tok_ids ids = {0};
+    tok_encode(t, txt, (size_t)n, 0, &ids);
+    for (uint32_t i = 0; i < ids.n; i++) printf("%s%u", i ? "," : "", ids.v[i]);
+    printf("\n");
+    return 0;
+  }
   if (!strcmp(argv[2], "--text")) {
     tok_ids ids = {0};
     tok_encode(t, argv[3], strlen(argv[3]), 1, &ids);
