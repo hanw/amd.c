@@ -29,7 +29,14 @@
 #include "../prof/sm_profiler.h"
 /* the profiler has 32 event types: kernels 0 .. 29 their own, the later ones share 30, 31 the grid barrier */
 #define MK_EV_BARRIER 31u
+#if defined(MKS_DECODE) || defined(MKS_MTP)
+/* their kernels are the first ids (tools/mk_gen.py checks < 30): the code of
+ * these builds as before the flint kernels (one more instruction in the
+ * loop moved the code by 4 bytes, and Qwen decode was 1.4% slower) */
+#define MK_EV(k) (k)
+#else
 #define MK_EV(k) ((k) < 30u ? (k) : 30u)
+#endif
 
 #define MK_CMD 256u
 
