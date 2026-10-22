@@ -183,9 +183,10 @@ typedef struct {
 
 /* flint: ie_attn_gq (the q heads of a kv head together) for a token at
  * position pos when pos + 1 >= gq_min, else ie_attn_sw; the whole step the
- * same (the megakernel build). IE_GQ_MIN: measured, see README. */
+ * same (the megakernel build). Default 1: ie_attn_gq at every position
+ * (UD-Q4_K_XL, ctx 4096: 5.79 against 5.85 ms per token). */
 #ifndef IE_GQ_MIN
-#define IE_GQ_MIN 4096u
+#define IE_GQ_MIN 1u
 #endif
 static int gq_use(const gpu_backend *b, uint32_t pos) { return b->attn_gq && pos + 1u >= b->gq_min; }
 
