@@ -1163,8 +1163,33 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           u32 xs = as ? as : at, xdiv = as ? 1u : K, zero = 0u;
           void *nul = NULL;
           void *ta[] = {&w0, &w1, &A, &B, &rows, &nb, &b->ms_list, &b->ms_offs, &zero, &qwn, &qsn, &xs, &bs, &xdiv, &kind, &nul, &zero};
-          if (gx_wmma(b, T, nb, kind) && !getenv("IE_GEMM_KX_NOE"))
+          if (gx_wmma(b, T, nb, kind) && !getenv("IE_GEMM_KX_NOE")) {
             launch_t(b, K_GEMM_KX, (rows + 127u) / 128u, m->n_exp, ta); /* WMMA, GK_R rows per workgroup */
+            if (getenv("IE_KX_CHECK")) { /* debug: against ie_gexp_t (into a copy), the worst pair and row */
+              const size_t need = (size_t)T * K * bs;
+              float *y1 = malloc(need), *y2 = malloc(need);
+              void *dev;
+              HIP(H.Malloc(&dev, need));
+              HIP(H.Memcpy(dev, B, need, hipMemcpyDeviceToDevice));
+              void *t2[] = {&w0, &w1, &A, &dev, &rows, &nb, &b->ms_list, &b->ms_offs, &zero, &qwn, &qsn, &xs, &bs, &xdiv, &kind, &nul, &zero};
+              HIP(H.Memcpy(y1, B, need, hipMemcpyDeviceToHost));
+              launch_t(b, K_GEXP_T, (rows + 63u) / 64u, m->n_exp, t2);
+              HIP(H.Memcpy(y2, dev, need, hipMemcpyDeviceToHost));
+              double mx = 0, d = 0;
+              size_t wi = 0;
+              int nn = 0;
+              for (size_t p = 0; p < (size_t)T * K; p++)
+                for (u32 r = 0; r < rows; r++) {
+                  const double u = y1[p * (bs / 4) + r], v = y2[p * (bs / 4) + r];
+                  if (u != u) nn++;
+                  if (fabs(v) > mx) mx = fabs(v);
+                  if (!(fabs(u - v) <= d)) d = fabs(u - v), wi = p * 100000 + r;
+                }
+              fprintf(stderr, "kx check layer %d %ux%u kind %u: max |kx - gexp_t| %.3e of %.3e (pair %zu row %zu), %d nan\n", o->layer, rows, w->cols,
+                      kind, d, mx, wi / 100000, wi % 100000, nn);
+              H.Free(dev), free(y1), free(y2);
+            }
+          }
           else {
             if (nb > 128u) ie_die("expert GEMV of a chunk: %u blocks per row (at most 128)", nb);
             launch_t(b, K_GEXP_T, (rows + 63u) / 64u, m->n_exp, ta); /* GXT_RB rows per workgroup */
