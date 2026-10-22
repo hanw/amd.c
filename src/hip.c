@@ -1109,7 +1109,8 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           u32 zero = 0u, one = 1u, kind = (u32)o->w->kind, xs = g->bufs[o->a].stride, ys = g->bufs[o->b].stride,
               rs = o->res >= 0 ? g->bufs[o->res].stride : 0u;
           void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &nul, &nul, &T, &zero, &zero, &xs, &ys, &one, &kind, &R, &rs};
-          launch(b, K_GEXP_T, nb <= 16u ? (rows + 15u) / 16u : (rows + 7u) / 8u, args);
+          if (nb > 128u) ie_die("Q5_K / IQ4_XS GEMV of several tokens: %u blocks per row (at most 128)", nb);
+          launch(b, K_GEXP_T, (rows + 63u) / 64u, args); /* GXT_RB rows per workgroup */
           break;
         }
         void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R, &NW, &NY, &NQ, &eps, &b->gm_count};
@@ -1148,7 +1149,8 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           u32 xs = as ? as : at, xdiv = as ? 1u : K, zero = 0u;
           void *nul = NULL;
           void *ta[] = {&w0, &w1, &A, &B, &rows, &nb, &b->ms_list, &b->ms_offs, &zero, &qwn, &qsn, &xs, &bs, &xdiv, &kind, &nul, &zero};
-          launch_t(b, K_GEXP_T, nb <= 16u ? (rows + 15u) / 16u : (rows + 7u) / 8u, m->n_exp, ta);
+          if (nb > 128u) ie_die("expert GEMV of a chunk: %u blocks per row (at most 128)", nb);
+          launch_t(b, K_GEXP_T, (rows + 63u) / 64u, m->n_exp, ta); /* GXT_RB rows per workgroup */
           break;
         }
         void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &C, &qwn, &qsn, &as, &bs, &kind, &two_off};

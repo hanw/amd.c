@@ -3970,14 +3970,10 @@ static inline float half_tree_f(float v) {
   v += I2F(shl_i(F2I(v), 1));
   return v;
 }
-/* acc after block b of row r of an expert matrix of the given kind against
- * the Q8 activations x, in the arithmetic and order of the row functions. */
-static inline float gexp_block(float acc, u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, u32 rows, u32 nb, u32 r, u32 b) {
+/* gexp_block's arithmetic with the activation words av, scale da and sum asb of block b */
+static inline float gexp_dot(float acc, u32 kind, const G u32 *qw, const G u16 *qs, u32 rows, u32 nb, u32 r, u32 b,
+                             const u32 av[8], float da, u32 asb) {
 #pragma clang fp contract(off)
-  const G u32 *aw = (const G u32 *)x;
-  const float da = ((const G float *)(x + 32u * nb))[b];
-  const u32x4 a0 = *(const G u32x4 *)(aw + b * 8u), a1 = *(const G u32x4 *)(aw + b * 8u + 4u);
-  const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
   const Mem am = {av};
   if (kind == 2u) {
     const G u32 *wp = qw + ie_q8_dst_word(r, b, 0u, nb);
@@ -4010,8 +4006,27 @@ static inline float gexp_block(float acc, u32 kind, const G u32 *qw, const G u16
   const int dq = kind == 5u ? (int)ie_q5k_dot(qm, 0u, qw[ie_q5k_hw(rows, r, b, nb)], am, 0u) : (int)ie_q4k_dot(qm, 0u, am, 0u);
   const float mv = (float)((const G f16 *)qs)[ie_q4k_dd(rows, r, b, nb) + 1u];
   const float sc = dv * (float)(sm & 63u), mm = mv * (float)(sm >> 8);
-  const float xa = da * (float)(int)((const G u32 *)(x + 36u * nb))[b];
+  const float xa = da * (float)(int)asb;
   return __builtin_fmaf(-mm, xa, __builtin_fmaf(sc * (float)dq, da, acc));
+}
+/* acc after block b of row r of an expert matrix of the given kind against
+ * the Q8 activations x, in the arithmetic and order of the row functions. */
+static inline float gexp_block(float acc, u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, u32 rows, u32 nb, u32 r, u32 b) {
+  const G u32 *aw = (const G u32 *)x;
+  const float da = ((const G float *)(x + 32u * nb))[b];
+  const u32x4 a0 = *(const G u32x4 *)(aw + b * 8u), a1 = *(const G u32x4 *)(aw + b * 8u + 4u);
+  const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+  const u32 asb = kind == 3u || kind == 5u ? ((const G u32 *)(x + 36u * nb))[b] : 0u;
+  return gexp_dot(acc, kind, qw, qs, rows, nb, r, b, av, da, asb);
+}
+/* the same, the activations in LDS */
+static inline float gexp_block_l(float acc, u32 kind, const G u32 *qw, const G u16 *qs, const LDSP u8 *x, u32 rows, u32 nb, u32 r, u32 b) {
+  const LDSP u32 *aw = (const LDSP u32 *)x;
+  const float da = ((const LDSP float *)(x + 32u * nb))[b];
+  const u32x4 a0 = *(const LDSP u32x4 *)(aw + b * 8u), a1 = *(const LDSP u32x4 *)(aw + b * 8u + 4u);
+  const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+  const u32 asb = kind == 3u || kind == 5u ? ((const LDSP u32 *)(x + 36u * nb))[b] : 0u;
+  return gexp_dot(acc, kind, qw, qs, rows, nb, r, b, av, da, asb);
 }
 
 /* nb <= 16 (the expert down matrices: 512 columns): two rows per wave, one
@@ -4067,51 +4082,70 @@ KERNEL ie_gexp(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32
  * matrix. Group e = grid y: the pairs list[offs[e] .. offs[e + 1]) (list
  * NULL: one group, the pairs 0 .. np - 1); pair p reads the Q8 row
  * X + (p / xdiv) xs and writes the row Y + p ys (bytes), plus the row
- * res + p rs when res. Per (row, pair) the arithmetic and order of ie_gexp
+ * res + p rs when res. Workgroup (grid x): GXT_RB rows; the pairs GXT_P at a
+ * time, their Q8 rows copied to LDS once (each row of the workgroup reads
+ * them from there). Per (row, pair) the arithmetic and order of ie_gexp
  * (nb <= 16: the half-wave rows) or of the row functions (else: one row per
- * wave, blocks l + 32 t): the values of decode. Workgroup: 8 waves, 16 rows
- * (nb <= 16) or 8; the pairs GXT_P at a time (the weights from the cache). */
+ * wave, blocks l + 32 t): the values of decode. nb <= GXT_NBMAX. */
 #define GXT_P 8u
+#define GXT_RB 64u
+#define GXT_NBMAX 128u
+static LDS u8 gxt_x[GXT_P * GXT_NBMAX * 40u];
 KERNEL ie_gexp_t(const G u32 *qw, const G u16 *qs, const G u8 *X, G u8 *Y, u32 rows, u32 nb, const G u32 *list,
                  const G u32 *offs, u32 np, u32 qwn, u32 qsn, u32 xs, u32 ys, u32 xdiv, u32 kind, const G u8 *res, u32 rs) {
-  const u32 e = tokid(), l = lane(), wv = tid() >> 5, half = nb <= 16u;
+  const u32 e = tokid(), l = lane(), wv = tid() >> 5, half = nb <= 16u, xb = 40u * nb, rb = wgid() * GXT_RB;
   const u32 p0 = list ? offs[e] : 0u, p1 = list ? offs[e + 1u] : np;
-  if (p0 >= p1) return;
-  const u32 r = half ? (wgid() * 8u + wv) * 2u + (l >> 4) : wgid() * 8u + wv;
-  if ((half ? r & ~1u : r) >= rows) return; /* the whole wave */
+  if (p0 >= p1 || rb >= rows) return; /* the whole workgroup */
   const G u32 *w = qw + (unsigned long)e * qwn;
   const G u16 *q = qs + (unsigned long)e * qsn;
   for (u32 pb = p0; pb < p1; pb += GXT_P) {
+    const u32 nj = p1 - pb < GXT_P ? p1 - pb : GXT_P;
     u32 pid[GXT_P];
-    float acc[GXT_P];
 #pragma unroll
     for (u32 j = 0; j < GXT_P; j++) {
-      const u32 pj = pb + j < p1 ? pb + j : p1 - 1u;
+      const u32 pj = pb + (j < nj ? j : 0u);
       pid[j] = list ? list[pj] : pj;
-      acc[j] = 0.0f;
     }
-    if (half) {
-      const u32 b = l & 15u;
-      if (r < rows && b < nb)
+    barrier(); /* the previous pairs are done with gxt_x */
+    for (u32 i = tid() * 16u; i < nj * xb; i += NT * 16u) {
+      const u32 j = i / xb, o = i - j * xb;
+      u32 pj = pid[0];
 #pragma unroll
-        for (u32 j = 0; j < GXT_P; j++) acc[j] = gexp_block(0.0f, kind, w, q, X + (unsigned long)(pid[j] / xdiv) * xs, rows, nb, r, b);
+      for (u32 k = 1; k < GXT_P; k++) pj = j == k ? pid[k] : pj;
+      *(LDSP u32x4 *)(gxt_x + i) = *(const G u32x4 *)(X + (unsigned long)(pj / xdiv) * xs + o);
+    }
+    barrier();
+    const u32 nit = half ? GXT_RB / 16u : GXT_RB / 8u;
+    for (u32 it = 0; it < nit; it++) {
+      const u32 r = half ? rb + (wv + 8u * it) * 2u + (l >> 4) : rb + wv + 8u * it;
+      if ((half ? r & ~1u : r) >= rows) break; /* the whole wave */
+      float acc[GXT_P];
 #pragma unroll
-      for (u32 j = 0; j < GXT_P; j++) acc[j] = half_tree_f(acc[j]);
-    } else {
-      for (u32 t = 0; ie_lane_blk(l, t) < nb; t++)
+      for (u32 j = 0; j < GXT_P; j++) acc[j] = 0.0f;
+      if (half) {
+        const u32 b = l & 15u;
+        if (r < rows && b < nb)
+#pragma unroll
+          for (u32 j = 0; j < GXT_P; j++)
+            if (j < nj) acc[j] = gexp_block_l(0.0f, kind, w, q, gxt_x + j * xb, rows, nb, r, b);
+#pragma unroll
+        for (u32 j = 0; j < GXT_P; j++) acc[j] = half_tree_f(acc[j]);
+      } else {
+        for (u32 t = 0; ie_lane_blk(l, t) < nb; t++)
+#pragma unroll
+          for (u32 j = 0; j < GXT_P; j++)
+            if (j < nj) acc[j] = gexp_block_l(acc[j], kind, w, q, gxt_x + j * xb, rows, nb, r, ie_lane_blk(l, t));
+#pragma unroll
+        for (u32 j = 0; j < GXT_P; j++) acc[j] = wave_tree_f(acc[j]);
+      }
+      if ((l & (half ? 15u : 31u)) == 0u && r < rows)
 #pragma unroll
         for (u32 j = 0; j < GXT_P; j++)
-          acc[j] = gexp_block(acc[j], kind, w, q, X + (unsigned long)(pid[j] / xdiv) * xs, rows, nb, r, ie_lane_blk(l, t));
-#pragma unroll
-      for (u32 j = 0; j < GXT_P; j++) acc[j] = wave_tree_f(acc[j]);
+          if (j < nj) {
+            const G float *rr = res ? (const G float *)(res + (unsigned long)pid[j] * rs) : 0;
+            ((G float *)(Y + (unsigned long)pid[j] * ys))[r] = epilogue(acc[j], r, 0, rr);
+          }
     }
-    if ((l & (half ? 15u : 31u)) == 0u && r < rows)
-#pragma unroll
-      for (u32 j = 0; j < GXT_P; j++)
-        if (pb + j < p1) {
-          const G float *rr = res ? (const G float *)(res + (unsigned long)pid[j] * rs) : 0;
-          ((G float *)(Y + (unsigned long)pid[j] * ys))[r] = epilogue(acc[j], r, 0, rr);
-        }
   }
 }
 
