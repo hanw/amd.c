@@ -891,6 +891,61 @@ Q6_K（`MAT_Q6K`）：地址在数组内（`q6k_addr`）、高位打包和解包
 
 **没有测试**：长于 4020 个位置的上下文、Qwen2.5-0.5B 和 1.5B 以外的真实模型、头的大小超过 256 的模型（会走旧的注意力核函数）。
 
+### Flint（Recursive，flint 架构，2026-10-21 起）
+
+模型：[RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint)，混合专家（MoE），共 398 亿参数，每个 token 约 25 亿参数参与计算。
+文件：unsloth/flint-GGUF 的 `flint-preview-UD-Q4_K_XL.gguf`（25.05 GB）。
+
+结构（`src/model.c` 的 `flint_layer`、`moe_block`）：
+
+- 49 层。前 2 层是普通 FFN，后 47 层是 MoE：256 个专家选 6 个，再加 1 个共享专家（没有门）。
+- 路由：sigmoid，按 sigmoid（加可选偏置）选前 6 个；权重 = sigmoid / 6 个的和。
+- 注意力：每个头先做 RMSNorm（q、k）；每个头有一个可学习的 sink（只进 softmax 的分母）。
+- 35 层是滑动窗口（513 个位置，含当前位置），用 RoPE；14 层是全注意力，不用 RoPE。
+- 滑动窗口层的 KV 缓存是环形（`graph.kv_len`、`kv_off`）：长度是 2 的幂，至少 513 + 一次运行的 token 数（1024）。
+
+新的权重格式（`core/ie_ext.h`：已测试，没有证明）：
+
+- `MAT_Q5K`：Q5_K 原生读取（以前转成 Q8_0）。低 4 位同 `MAT_Q4K`，第 5 位每 32 个权重一个字。只有 flint 默认使用（`IE_Q5K_NATIVE=1` 可用于其他模型）。
+- `MAT_IQ4XS`：IQ4_XS。4 位索引查 16 个值的表；GPU 用两次 `v_perm_b32` 加一次字节选择。
+- IQ3_S（文件里只有 1 层的 gate/up 专家）：加载时转成 Q8_0。
+
+测试（本机，CPU）：
+
+- `make test`：`ext_test`（Q5_K、IQ4_XS 的 GEMV 对照 GGUF 公式；IQ4 查表的 GPU 写法，65536 个输入）；`tiny-flint.gguf`（5 层，包含文件里的全部格式，窗口 4，环形缓存会回绕）对照 numpy 参考（q8 和 float 两种模式）；提示缓存检查。
+- 分词器：`make tokcheck-flint FLINT=模型文件`。64 段文本（llama.cpp 的测试文本，加代码、多种文字、表情、数字）与 Hugging Face tokenizers 的结果逐个 token 相同。
+- 聊天模板：`tools/chat_check.py --flint 模板文件 build/chat_render`。8 个请求与 transformers 渲染的文本相同；渲染后的 token 与 Hugging Face 相同。
+
+GPU（`ie_kernels.c` 末尾 flint 部分）：
+
+- 解码走 flint 自己的大核函数（`ie_mk_flint.hsaco`、`ie_mk_flintl.hsaco`；只加载模型用到的那一组）。
+  专家 GEMV 一次启动做 6 个专家（`ie_gexp`）；路由在一个 wave 的寄存器里完成（`ie_moe_route`）。
+- 解码注意力 `ie_attn_gq`：一个工作组算一个 KV 头的全部 q 头，K/V 只读一次；分数用 WMMA（q 拆成两个 f16）；
+  一个分段可以有多轮，每轮 256 个位置（在线 softmax），每个 KV 头最多 32 段（`IE_ATTN_GQ_S`）。
+- 预填充按块（默认 512 个 token）：`ie_moe_sort` 把 (token, 专家) 对按专家排序；
+  Q4_K / Q5_K / IQ4_XS 的专家和普通矩阵用分组 WMMA GEMM `ie_gemm_kx`（最小值项用 f32：f16 在第 46 到 48 层溢出）；
+  注意力 `ie_attn_fa_sw`（窗口、环形缓存、sink）。`IE_FLINT_PF=0`：逐 token（调试）。
+
+结果（R9700，UD-Q4_K_XL，wikitext-2 测试集）：
+
+| 项目 | 结果 |
+|---|---|
+| 解码，位置约 16（每秒 token 数） | 170.4（5.87 毫秒/token） |
+| 解码，位置 65436 | 86.1（11.6 毫秒/token） |
+| 解码，位置 130972（`--ctx 131072`） | 65.4（15.3 毫秒/token） |
+| 预填充 4096 个 token | 3718 个/秒 |
+| 预填充 65436 / 130972 个 token | 1775 / 1151 个/秒 |
+| 困惑度，256 个 token：CPU / GPU 逐 token / GPU 按块 | 24.31 / 23.87 / 24.14 |
+| 困惑度，8192 / 65536 / 131000 个 token | 19.63 / 16.05 / 14.35 |
+| 显存（`--ctx 131072`） | 权重 26.57 GB + KV 3.90 GB + 工作区 0.40 GB |
+
+不同算法之间困惑度相差 1% 到 2%（256 个 token 时）。推测原因：路由在接近相等时选了别的专家，误差被放大；评测越长差别越小（8192 个 token 时 0.8%）。
+
+`ie-serve`：flint 用自己的模板（`chat_render_flint`）；遇到 `tokenizer.ggml.eog_token_ids` 中的 token 停止；
+回答以 `<think>` 开始时，`</think>` 之前的文本是 reasoning_content；工具调用格式是
+`<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`。
+
+
 ## 信任边界
 
 C 代码调用的是同一个验证头文件 `core/ie_core.h`；cpp-lean 把同一个文件翻译成 Lean。

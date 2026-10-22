@@ -12,6 +12,7 @@
 #include <time.h>
 
 #include "../core/ie_core.h"
+#include "../core/ie_ext.h"
 #include "backend.h"
 #include "common.h"
 
@@ -25,6 +26,7 @@ typedef struct {
    * (ring[slot][conv_dim], slot = pos % 4) and S[head][i (key)][j (value)] */
   float *ring, *st;
   float *snap_ring[2], *snap_st[2]; /* the prompt cache snapshots (cpu_snap) */
+  float *snap_kv[2];                /* and the KV rings of the sliding window layers (flint) */
 } cpu_backend;
 
 #define BUF(b, id) ((void *)((b)->arena + (b)->g->bufs[id].off))
@@ -171,6 +173,67 @@ void cpu_gemv_q8(const mat *w, const uint8_t *xq, float *y) {
     }
 }
 
+/* MAT_Q5K matrix x Q8 activations: as Q4K, with dq = ie_q5k_dot (q = 0..31). */
+void cpu_gemv_q5k(const mat *w, const uint8_t *xq, float *y) {
+  const u32 nb = w->nb, rows = w->rows;
+  const Mem qw = {w->qw}, aw = {(const u32 *)xq};
+  const float *da = (const float *)(xq + 32u * nb);
+  const u32 *asum = (const u32 *)(xq + 36u * nb);
+  for (u32 r = 0; r < rows; r++) {
+    float lane[32];
+    for (u32 l = 0; l < ie_wave(); l++) {
+      float acc = 0.0f;
+      for (u32 t = 0; ie_lane_blk(l, t) < nb; t++) {
+        const u32 b = ie_lane_blk(l, t);
+        const int dq = (int)ie_q5k_dot(qw, ie_q4_dst_word(r, b, 0, nb), w->qw[ie_q5k_hw(rows, r, b, nb)], aw, b * 8u);
+        const uint16_t sm = w->qs[ie_q4k_sm(r, b, nb)];
+        const uint32_t dd = ie_q4k_dd(rows, r, b, nb);
+        const float s = ie_f16_to_f32(w->qs[dd]) * (float)(sm & 63u), mm = ie_f16_to_f32(w->qs[dd + 1]) * (float)(sm >> 8);
+        acc = fmaf(-mm, da[b] * (float)(int)asum[b], fmaf(s * (float)dq, da[b], acc));
+      }
+      lane[l] = acc;
+    }
+    y[r] = wave_tree(lane);
+  }
+}
+
+/* MAT_IQ4XS matrix x Q8 activations: dq = ie_iq4_dot (the table values),
+ * acc = fma(d (ls - 32) dq, da, acc). */
+void cpu_gemv_iq4xs(const mat *w, const uint8_t *xq, float *y) {
+  const u32 nb = w->nb, rows = w->rows;
+  const Mem qw = {w->qw}, aw = {(const u32 *)xq};
+  const float *da = (const float *)(xq + 32u * nb);
+  for (u32 r = 0; r < rows; r++) {
+    float lane[32];
+    for (u32 l = 0; l < ie_wave(); l++) {
+      float acc = 0.0f;
+      for (u32 t = 0; ie_lane_blk(l, t) < nb; t++) {
+        const u32 b = ie_lane_blk(l, t);
+        const int dq = (int)ie_iq4_dot(qw, ie_q4_dst_word(r, b, 0, nb), aw, b * 8u);
+        const float s = ie_f16_to_f32(w->qs[ie_q4k_dd(rows, r, b, nb)]) * (float)((int)(w->qs[ie_q4k_sm(r, b, nb)] & 63u) - 32);
+        acc = fmaf(s * (float)dq, da[b], acc);
+      }
+      lane[l] = acc;
+    }
+    y[r] = wave_tree(lane);
+  }
+}
+
+static void cpu_gemv_f32(const mat *w, const float *x, float *y);
+
+/* y = W x for any kind (x: Q8 bytes, or floats for MAT_F32). */
+static void cpu_gemv_any(const mat *w, const void *x, float *y) {
+  switch (w->kind) {
+    case MAT_Q4: cpu_gemv_q4(w, x, y); break;
+    case MAT_Q4K: cpu_gemv_q4k(w, x, y); break;
+    case MAT_Q5K: cpu_gemv_q5k(w, x, y); break;
+    case MAT_Q6K: cpu_gemv_q6k(w, x, y); break;
+    case MAT_Q8: cpu_gemv_q8(w, x, y); break;
+    case MAT_IQ4XS: cpu_gemv_iq4xs(w, x, y); break;
+    default: cpu_gemv_f32(w, x, y); break;
+  }
+}
+
 /* f32 matrix: the same grid and lane split over elements. */
 static void cpu_gemv_f32(const mat *w, const float *x, float *y) {
   for (u32 r = 0; r < w->rows; r++) {
@@ -231,30 +294,34 @@ static void rope(float *x, u32 nh, u32 hd, u32 nrot, int neox, const float *c, c
   }
 }
 
-/* Attention of one decode token. Scores buffer: [n_head][n_ctx]. */
-static void attention(const model *m, const float *q, const float *kc, const float *vc, u32 pos, u32 n_ctx, float *sc,
-                      float *out, const float *gate, u32 gstride) {
+/* Attention of one decode token over the positions p0 .. pos (win: the
+ * last win positions; 0: all), position p in slot p % len of the cache.
+ * sinks (or NULL): a logit per head in the softmax denominator only.
+ * Scores buffer: [n_head][n_ctx]. */
+static void attention(const model *m, const float *q, const float *kc, const float *vc, u32 pos, u32 len, u32 win, const float *sinks,
+                      u32 n_ctx, float *sc, float *out, const float *gate, u32 gstride) {
   const u32 hd = m->hd, kvd = m->n_kv * hd, grp = m->n_head / m->n_kv;
   const float scale = 1.0f / sqrtf((float)hd);
+  const u32 p0 = win && pos + 1 > win ? pos + 1 - win : 0, np = pos + 1 - p0;
   for (u32 h = 0; h < m->n_head; h++) {
     const float *qh = q + h * hd;
     const u32 kh = h / grp; /* GQA: the KV head of query head h */
     float *s = sc + (size_t)h * n_ctx;
-    float mx = -INFINITY;
-    for (u32 p = 0; p <= pos; p++) {
-      const float *k = kc + (size_t)p * kvd + kh * hd;
+    float mx = sinks ? sinks[h] : -INFINITY;
+    for (u32 i = 0; i < np; i++) {
+      const float *k = kc + (size_t)((p0 + i) % len) * kvd + kh * hd;
       float d = 0.0f;
-      for (u32 i = 0; i < hd; i++) d += qh[i] * k[i];
-      s[p] = d * scale;
-      mx = fmaxf(mx, s[p]);
+      for (u32 j = 0; j < hd; j++) d += qh[j] * k[j];
+      s[i] = d * scale;
+      mx = fmaxf(mx, s[i]);
     }
-    float sum = 0.0f;
-    for (u32 p = 0; p <= pos; p++) sum += (s[p] = expf(s[p] - mx));
+    float sum = sinks ? expf(sinks[h] - mx) : 0.0f;
+    for (u32 i = 0; i < np; i++) sum += (s[i] = expf(s[i] - mx));
     const float inv = 1.0f / sum;
     float *o = out + h * hd;
     for (u32 i = 0; i < hd; i++) {
       float acc = 0.0f;
-      for (u32 p = 0; p <= pos; p++) acc += s[p] * vc[(size_t)p * kvd + kh * hd + i];
+      for (u32 j = 0; j < np; j++) acc += s[j] * vc[(size_t)((p0 + j) % len) * kvd + kh * hd + i];
       o[i] = acc * inv;
       if (gate) o[i] = o[i] * (1.0f / (1.0f + expf(-gate[h * gstride + i])));
     }
@@ -263,11 +330,38 @@ static void attention(const model *m, const float *q, const float *kc, const flo
 
 static float silu(float x) { return x / (1.0f + expf(-x)); }
 
-/* qwen35: per head RMSNorm of hd values at src (weight w), RoPE of the
- * first nrot dims (NEOX pairs), into dst. */
-static void qk_head(const model *m, const float *src, const float *w, const float *cs, const float *sn, float *dst) {
+/* qwen35, flint: per head RMSNorm of hd values at src (weight w), RoPE of
+ * the first nrot dims (NEOX pairs; not if norope), into dst. */
+static void qk_head(const model *m, const float *src, const float *w, const float *cs, const float *sn, float *dst, int norope) {
   rmsnorm(src, w, dst, m->hd, m->eps);
-  rope(dst, 1, m->hd, m->n_rot, 1, cs, sn);
+  if (!norope) rope(dst, 1, m->hd, m->n_rot, 1, cs, sn);
+}
+
+/* flint routing: top K of sigmoid(logit) + bias (ties: the smaller index),
+ * weights = sigmoid / (their sum + 1e-20) * scale. out: [K ids | K weights]. */
+static void moe_route(const float *lg, u32 n, u32 K, const float *bias, float scale, u32 *out) {
+  float sg[1024], wsel[16];
+  if (n > 1024 || K > 16) ie_die("moe_route: too many experts");
+  for (u32 e = 0; e < n; e++) sg[e] = 1.0f / (1.0f + expf(-lg[e]));
+  uint8_t used[1024] = {0};
+  float sum = 0.0f;
+  for (u32 k = 0; k < K; k++) {
+    u32 best = n;
+    float bv = -INFINITY;
+    for (u32 e = 0; e < n; e++) {
+      const float c = bias ? sg[e] + bias[e] : sg[e];
+      if (!used[e] && (best == n || c > bv)) best = e, bv = c;
+    }
+    used[best] = 1;
+    out[k] = best;
+    wsel[k] = sg[best];
+    sum += sg[best];
+  }
+  const float inv = 1.0f / (sum + 1e-20f);
+  for (u32 k = 0; k < K; k++) {
+    const float wk = wsel[k] * inv * scale;
+    memcpy(&out[K + k], &wk, 4);
+  }
 }
 
 /* qwen35 linear attention (Gated DeltaNet) of one token, as ie_gdn. in =
@@ -342,6 +436,21 @@ static void cpu_snap(backend *bk, int save, int k, int hbuf) {
   if (!b->snap_ring[k]) b->snap_ring[k] = ie_alloc(rb + 4), b->snap_st[k] = ie_alloc(sb + 4);
   memcpy(save ? b->snap_ring[k] : b->ring, save ? b->ring : b->snap_ring[k], rb);
   memcpy(save ? b->snap_st[k] : b->st, save ? b->st : b->snap_st[k], sb);
+  /* a ring slot is reused by a later position: keep the rings (K and V) */
+  const graph *g = b->g;
+  const size_t kvd = (size_t)m->n_kv * m->hd;
+  size_t nr = 0;
+  for (uint32_t i = 0; i < m->n_kvl; i++)
+    if (g->kv_len[i] < g->n_ctx) nr += g->kv_len[i];
+  if (!nr) return;
+  if (!b->snap_kv[k]) b->snap_kv[k] = ie_alloc(2 * nr * kvd * 4);
+  float *sp = b->snap_kv[k];
+  for (uint32_t i = 0; i < m->n_kvl; i++) {
+    if (g->kv_len[i] >= g->n_ctx) continue;
+    const size_t n = g->kv_len[i] * kvd, o = g->kv_off[i] * kvd;
+    memcpy(save ? sp : b->kc + o, save ? b->kc + o : sp, n * 4), sp += n;
+    memcpy(save ? sp : b->vc + o, save ? b->vc + o : sp, n * 4), sp += n;
+  }
 }
 
 backend *cpu_open(const model *m, const graph *g) {
@@ -352,7 +461,7 @@ backend *cpu_open(const model *m, const graph *g) {
   b->m = m;
   b->g = g;
   b->arena = ie_alloc(g->arena);
-  const size_t kv = (size_t)m->n_kvl * g->n_ctx * m->n_kv * m->hd;
+  const size_t kv = (size_t)g->kv_total * m->n_kv * m->hd;
   b->kc = ie_alloc(kv * 4 + 4);
   b->vc = ie_alloc(kv * 4 + 4);
   b->ring = ie_alloc((size_t)m->n_rec * 4 * m->conv_dim * 4 + 4);
@@ -367,7 +476,7 @@ static void cpu_close(backend *bk) {
   free(b->vc);
   free(b->ring);
   free(b->st);
-  for (int k = 0; k < 2; k++) free(b->snap_ring[k]), free(b->snap_st[k]);
+  for (int k = 0; k < 2; k++) free(b->snap_ring[k]), free(b->snap_st[k]), free(b->snap_kv[k]);
   free(b);
 }
 
@@ -396,14 +505,12 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
       case OP_QUANT: cpu_quant_q8(a, (uint8_t *)bb, o->n / 32); break;
       case OP_GEMV_Q4:
       case OP_GEMV_Q4K:
+      case OP_GEMV_Q5K:
       case OP_GEMV_Q6K:
       case OP_GEMV_Q8:
+      case OP_GEMV_IQ4XS:
       case OP_GEMV_F32:
-        if (o->kind == OP_GEMV_Q4) cpu_gemv_q4(o->w, (const uint8_t *)a, bb);
-        else if (o->kind == OP_GEMV_Q4K) cpu_gemv_q4k(o->w, (const uint8_t *)a, bb);
-        else if (o->kind == OP_GEMV_Q6K) cpu_gemv_q6k(o->w, (const uint8_t *)a, bb);
-        else if (o->kind == OP_GEMV_Q8) cpu_gemv_q8(o->w, (const uint8_t *)a, bb);
-        else cpu_gemv_f32(o->w, a, bb);
+        cpu_gemv_any(o->w, a, bb);
         /* the fused epilogue, in the order of the GPU kernels */
         for (u32 j = 0; j < o->w->rows; j++) {
           float y = bb[j];
@@ -431,17 +538,19 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
         const float *cs = g->rope_cos + (size_t)pos * h2, *sn = g->rope_sin + (size_t)pos * h2;
         rope(a, o->nh, m->hd, m->n_rot, m->rope == ROPE_NEOX, cs, sn);
         rope(bb, m->n_kv, m->hd, m->n_rot, m->rope == ROPE_NEOX, cs, sn);
-        const size_t base = ((size_t)m->l[o->layer].kvi * g->n_ctx + pos) * kvd;
+        const u32 kvi = m->l[o->layer].kvi;
+        const size_t base = (g->kv_off[kvi] + pos % g->kv_len[kvi]) * kvd;
         memcpy(B->kc + base, bb, kvd * 4);
         memcpy(B->vc + base, cc, kvd * 4);
         break;
       }
       case OP_QKN_ROPE_KV: {
         const float *cs = g->rope_cos + (size_t)pos * h2, *sn = g->rope_sin + (size_t)pos * h2;
-        const size_t base = ((size_t)m->l[o->layer].kvi * g->n_ctx + pos) * kvd;
-        const u32 hd = m->hd, qr = 2 * o->n;
-        for (u32 h = 0; h < o->nh; h++) qk_head(m, a + h * 2 * hd, o->v->f, cs, sn, bb + h * hd);
-        for (u32 h = 0; h < m->n_kv; h++) qk_head(m, a + qr + h * hd, o->nv->f, cs, sn, B->kc + base + h * hd);
+        const u32 kvi = m->l[o->layer].kvi;
+        const size_t base = (g->kv_off[kvi] + pos % g->kv_len[kvi]) * kvd;
+        const u32 hd = m->hd, qr = o->nh * o->qstr;
+        for (u32 h = 0; h < o->nh; h++) qk_head(m, a + h * o->qstr, o->v->f, cs, sn, bb + h * hd, o->norope);
+        for (u32 h = 0; h < m->n_kv; h++) qk_head(m, a + qr + h * hd, o->nv->f, cs, sn, B->kc + base + h * hd, o->norope);
         memcpy(B->vc + base, a + qr + kvd, kvd * 4);
         break;
       }
@@ -452,15 +561,18 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
         break;
       }
       case OP_KV: {
-        const size_t base = ((size_t)m->l[o->layer].kvi * g->n_ctx + pos) * kvd;
+        const u32 kvi = m->l[o->layer].kvi;
+        const size_t base = (g->kv_off[kvi] + pos % g->kv_len[kvi]) * kvd;
         memcpy(B->kc + base, a, kvd * 4);
         memcpy(B->vc + base, bb, kvd * 4);
         break;
       }
       case OP_ATTN: {
-        const size_t base = (size_t)m->l[o->layer].kvi * g->n_ctx * kvd;
+        const u32 kvi = m->l[o->layer].kvi;
+        const size_t base = g->kv_off[kvi] * kvd;
         const float *gate = o->gt >= 0 ? (const float *)((char *)BUF(B, o->gt) + o->gtoff) : NULL;
-        attention(m, a, B->kc + base, B->vc + base, pos, g->n_ctx, cc, bb, gate, o->gstride);
+        attention(m, a, B->kc + base, B->vc + base, pos, g->kv_len[kvi], o->win, o->sk ? o->sk->f : NULL, g->n_ctx, cc, bb, gate,
+                  o->gstride);
         if (qo) cpu_quant_q8(bb, qo, o->n / 32);
         break;
       }
@@ -468,6 +580,31 @@ static uint32_t cpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
         for (u32 j = 0; j < o->n; j++) a[j] = a[j] / (1.0f + expf(-a[j])) * bb[j];
         if (qo) cpu_quant_q8(a, qo, o->n / 32);
         break;
+      case OP_MOE_ROUTE: moe_route(a, o->n, o->nh, o->v ? o->v->f : NULL, m->escale, (u32 *)bb); break;
+      case OP_GEMV_EXP: {
+        const u32 *ids = (const u32 *)cc;
+        for (u32 sl = 0; sl < o->nh; sl++) {
+          const mat e = mat_expert(o->w, ids[sl]);
+          cpu_gemv_any(&e, (const char *)a + (size_t)sl * o->astr, (float *)((char *)bb + (size_t)sl * o->bstr));
+        }
+        break;
+      }
+      case OP_MOE_SWIGLU:
+        for (u32 sl = 0; sl < o->nh; sl++) {
+          float *gs = (float *)((char *)a + (size_t)sl * o->astr);
+          for (u32 j = 0; j < o->n; j++) gs[j] = gs[j] / (1.0f + expf(-gs[j])) * gs[o->n + j];
+          cpu_quant_q8(gs, qo + (size_t)sl * o->bstr, o->n / 32);
+        }
+        break;
+      case OP_MOE_SUM: {
+        const float *wt = cc + o->nh;
+        for (u32 j = 0; j < o->n; j++) {
+          float acc = 0.0f;
+          for (u32 sl = 0; sl < o->nh; sl++) acc = fmaf(wt[sl], a[(size_t)sl * o->n + j], acc);
+          bb[j] = res[j] + acc;
+        }
+        break;
+      }
       case OP_ARGMAX: {
         u32 best = 0;
         for (u32 j = 1; j < o->n; j++)

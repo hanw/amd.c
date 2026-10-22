@@ -100,11 +100,11 @@ static void hip_load(void) {
 
 /* Kernels of ie_kernels.hsaco. */
 enum { K_EMBED_Q4, K_EMBED_F32, K_RMSNORM, K_QUANT, K_GEMV_Q4, K_GEMV_Q8, K_GEMV_F32, K_BIAS, K_ADD, K_SWIGLU, K_ROPE, K_KV,
-       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_ATTN_FA, K_ATTN_FA_Q8, K_ATTN_FA2, K_GEMM_F32_S, K_GEMM_Q4KR_SB, K_REQUANT_SB, K_Q8_F16, K_GEMM_Q4K_H, K_GEMM_Q4K_H256, K_COPY_ROWS, K_DF_CONV, K_DF_QKV, K_DF_ATTN, K_N };
+       K_ATTN, K_ARGMAX, K_ROPE_KV, K_ATTN_SPLIT, K_EMBED_Q8, K_QKN_ROPE_KV, K_GDN, K_GEMV_Q8_T, K_GEMV_Q8_TR, K_GEMM_Q8, K_RING_STORE, K_ATTN_PF, K_GEMM_H, K_GNORM, K_GDN1, K_RMSNORM_T, K_ATTN_PFG, K_GDN_PREP, K_GDN_WY, K_GDN_SEQ, K_GEMM_Q8R, K_GEMV_Q4K, K_GEMV_Q4K_TR, K_GEMM_Q4KR, K_GEMV_F32_T, K_GEMV_Q4K_TR8, K_GEMV_Q6K, K_GEMV_Q6K_TR, K_GEMV_Q6K_TR8, K_GEMM_Q6KR, K_GEMV_F32_TW, K_GEMV_Q4K_TS2, K_GEMV_Q6K_TS2, K_ATTN_SPLIT_T, K_TOPK_PART, K_TOPK_MERGE, K_ATTN_KV, K_ATTN_FA, K_ATTN_FA_Q8, K_ATTN_FA2, K_GEMM_F32_S, K_GEMM_Q4KR_SB, K_REQUANT_SB, K_Q8_F16, K_GEMM_Q4K_H, K_GEMM_Q4K_H256, K_COPY_ROWS, K_DF_CONV, K_DF_QKV, K_DF_ATTN, K_GEMV_Q5K, K_GEMV_IQ4XS, K_GEXP, K_MOE_ROUTE, K_MOE_SUM, K_QKN_ROPE_KV2, K_ATTN_SW, K_ATTN_GQ, K_GEXP_T, K_MOE_SORT, K_ATTN_FA_SW, K_GEMM_KX, K_N };
 static const char *kname[K_N] = {"ie_embed_q4", "ie_embed_f32", "ie_rmsnorm", "ie_quant_q8", "ie_gemv_q4q8", "ie_gemv_q8q8",
                                  "ie_gemv_f32", "ie_bias",      "ie_add",     "ie_swiglu",   "ie_rope",
                                  "ie_kv_store", "ie_attn",      "ie_argmax",   "ie_rope_kv", "ie_attn_split",
-                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv", "ie_attn_fa", "ie_attn_fa_q8", "ie_attn_fa2", "ie_gemm_f32_s", "ie_gemm_q4kr_sb", "ie_requant_sb", "ie_q8_f16", "ie_gemm_q4k_h", "ie_gemm_q4k_h256", "ie_copy_rows", "ie_df_conv", "ie_df_qkv", "ie_df_attn"};
+                                 "ie_embed_q8", "ie_qkn_rope_kv", "ie_gdn", "ie_gemv_q8q8_t", "ie_gemv_q8q8_tr", "ie_gemm_q8", "ie_ring_store", "ie_attn_pf", "ie_gemm_h", "ie_gnorm", "ie_gdn1", "ie_rmsnorm_t", "ie_attn_pfg", "ie_gdn_prep", "ie_gdn_wy", "ie_gdn_seq", "ie_gemm_q8r", "ie_gemv_q4kq8", "ie_gemv_q4kq8_tr", "ie_gemm_q4kr", "ie_gemv_f32_t", "ie_gemv_q4kq8_tr8", "ie_gemv_q6kq8", "ie_gemv_q6kq8_tr", "ie_gemv_q6kq8_tr8", "ie_gemm_q6kr", "ie_gemv_f32_tw", "ie_gemv_q4kq8_ts2", "ie_gemv_q6kq8_ts2", "ie_attn_split_t", "ie_topk_part", "ie_topk_merge", "ie_attn_kv", "ie_attn_fa", "ie_attn_fa_q8", "ie_attn_fa2", "ie_gemm_f32_s", "ie_gemm_q4kr_sb", "ie_requant_sb", "ie_q8_f16", "ie_gemm_q4k_h", "ie_gemm_q4k_h256", "ie_copy_rows", "ie_df_conv", "ie_df_qkv", "ie_df_attn", "ie_gemv_q5kq8", "ie_gemv_iq4xsq8", "ie_gexp", "ie_moe_route", "ie_moe_sum", "ie_qkn_rope_kv2", "ie_attn_sw", "ie_attn_gq", "ie_gexp_t", "ie_moe_sort", "ie_attn_fa_sw", "ie_gemm_kx"};
 /* ie_gdn: conv input ring slots and state slots per linear layer */
 /* ie_gdn: conv input ring slots (as in ie_kernels.c); the state slots per
  * linear layer are gpu_backend.ns: at least the tokens of a verify run */
@@ -138,6 +138,13 @@ typedef struct {
   u32 df_ring;
   u32 ns;                  /* ie_gdn: state slots per linear layer (4, or 8 for more than 3 drafts) */
   int attn_split;          /* use ie_attn_split (hd <= IE_ATT_MAX_HD, and not IE_ATTN=old) */
+  int attn_gq;             /* flint: ie_attn_gq for decode (IE_ATTN_SW=1: ie_attn_sw) */
+  uint32_t gq_ch;          /* its chunk: 256 positions (IE_ATTN_GQ_CH: 1 .. 256, for tests) */
+  uint32_t gq_min;         /* from this position count on (IE_ATTN_GQ_MIN) */
+  uint32_t gq_s;           /* at most this many splits per kv head (IE_ATTN_GQ_S, default 32) */
+  int gq_ch_fixed;         /* IE_ATTN_GQ_CH set: that chunk always */
+  int flint;               /* the model is flint (its megakernel builds) */
+  u32 *ms_offs, *ms_list;  /* flint prompt chunks: the pairs by expert (ie_moe_sort) */
   int attn_kv;             /* use ie_attn_kv for decode and verify (the K/V of a split read once; not IE_ATTN=split) */
   /* IE_ATTN=check: after each ie_attn_split, also run ie_attn into chk and
    * compare the two outputs on the host (max |a - b| / max |a|). */
@@ -158,6 +165,7 @@ typedef struct {
   float *ring, *st; /* qwen35 linear attention state (see cpu.c) */
   float *snap_ring[2], *snap_st[2]; /* the prompt cache snapshots (gpu_snap), allocated at the first save */
   char *snap_h[2];
+  char *snap_kv[2];  /* the KV rings of the sliding window layers (flint), at the first save */
   /* the chunked linear attention of prompt chunks (ie_gdn_prep/wy/seq):
    * scratch for T tokens, or NULL (graph T <= 16 or no linear layers) */
   float *cq_qk, *cq_v, *cq_bg, *cq_u, *cq_w, *cq_m, *cq_g;
@@ -175,6 +183,27 @@ typedef struct {
   double *pms;
   uint32_t psteps;
 } gpu_backend;
+
+/* flint: ie_attn_gq (the q heads of a kv head together) for a token at
+ * position pos when pos + 1 >= gq_min, else ie_attn_sw; the whole step the
+ * same (the megakernel build). Default 1: ie_attn_gq at every position
+ * (UD-Q4_K_XL, ctx 4096: 5.79 against 5.85 ms per token). */
+#ifndef IE_GQ_MIN
+#define IE_GQ_MIN 1u
+#endif
+/* flint chunks: ie_gemm_kx (WMMA) for Q4_K / Q5_K / IQ4_XS when T >= IE_GEMM_MIN
+ * (default 17) and nb % 4 == 0; else ie_gexp_t (the arithmetic of decode).
+ * IE_GEMM_KX=0: always ie_gexp_t. */
+static int gx_wmma(const gpu_backend *b, u32 T, u32 nb, u32 kind) {
+  (void)b;
+  static int on = -1, gmin = -1;
+  if (on < 0) on = getenv("IE_GEMM_KX") ? atoi(getenv("IE_GEMM_KX")) : 1; /* debug: a kind number = only that kind */
+  if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
+  return on && (on == 1 || (u32)on == kind) && (int)T >= gmin && nb % 4u == 0u &&
+         (kind == (u32)MAT_Q4K || kind == (u32)MAT_Q5K || kind == (u32)MAT_IQ4XS);
+}
+#define IE_MS_MAXP 4096u /* the pairs (token, choice) of a chunk: kernels/ie_kernels.c MS_MAXP */
+static int gq_use(const gpu_backend *b, uint32_t pos) { return b->attn_gq && pos + 1u >= b->gq_min; }
 
 static void *upload(gpu_backend *b, const void *host, size_t bytes) {
   for (uint32_t i = 0; i < b->nh; i++)
@@ -197,20 +226,12 @@ static void upload_mat(gpu_backend *b, const mat *w, void **w0, void **w1) {
     *w0 = w->d0, *w1 = w->d1;
     return;
   }
-  if (w->kind == MAT_Q4) {
-    *w0 = upload(b, w->qw, (size_t)w->rows * w->nb * 16);
-    *w1 = upload(b, w->qs, (size_t)w->rows * w->nb * 2);
-  } else if (w->kind == MAT_Q4K) {
-    *w0 = upload(b, w->qw, (size_t)w->rows * w->nb * 16);
-    *w1 = upload(b, w->qs, (size_t)ie_q4k_qs_n(w->rows, w->nb) * 2);
-  } else if (w->kind == MAT_Q6K) {
-    *w0 = upload(b, w->qw, (size_t)ie_q6k_qw_n(w->rows, w->nb) * 4);
-    *w1 = upload(b, w->qs, (size_t)ie_q6k_qs_n(w->rows, w->nb) * 2);
-  } else if (w->kind == MAT_Q8) {
-    *w0 = upload(b, w->qw, (size_t)w->rows * w->nb * 32);
-    *w1 = upload(b, w->qs, (size_t)w->rows * w->nb * 2);
+  const size_t ne = w->n_exp > 1 ? w->n_exp : 1; /* experts: n_exp matrices one after the other */
+  if (w->kind != MAT_F32) {
+    *w0 = upload(b, w->qw, (size_t)mat_qw_words(w->kind, w->rows, w->cols) * 4 * ne);
+    *w1 = upload(b, w->qs, (size_t)mat_qs_n(w->kind, w->rows, w->cols) * 2 * ne);
   } else {
-    *w0 = upload(b, w->f, (size_t)w->rows * w->cols * 4);
+    *w0 = upload(b, w->f, (size_t)w->rows * w->cols * 4 * ne);
     *w1 = NULL;
   }
 }
@@ -270,17 +291,14 @@ static void *sdev_put(void *host, size_t bytes) {
 }
 static void gpu_sink(mat *w) {
   if (!w->rows || w->d0) return;
+  const size_t ne = w->n_exp > 1 ? w->n_exp : 1; /* experts: n_exp matrices one after the other */
   if (w->kind == MAT_F32) {
     if (!w->f) return;
-    w->d0 = sdev_put(w->f, (size_t)w->rows * w->cols * 4), w->f = NULL;
+    w->d0 = sdev_put(w->f, (size_t)w->rows * w->cols * 4 * ne), w->f = NULL;
   } else {
     if (!w->qw) return;
-    const size_t words = w->kind == MAT_Q4 || w->kind == MAT_Q4K ? 16 : w->kind == MAT_Q6K ? 24 : 32;
-    const size_t qsn = w->kind == MAT_Q4K   ? (size_t)ie_q4k_qs_n(w->rows, w->nb)
-                       : w->kind == MAT_Q6K ? (size_t)ie_q6k_qs_n(w->rows, w->nb)
-                                            : (size_t)w->rows * w->nb;
-    w->d0 = sdev_put(w->qw, (size_t)w->rows * w->nb * words), w->qw = NULL;
-    w->d1 = sdev_put(w->qs, qsn * 2), w->qs = NULL;
+    w->d0 = sdev_put(w->qw, (size_t)mat_qw_words(w->kind, w->rows, w->cols) * 4 * ne), w->qw = NULL;
+    w->d1 = sdev_put(w->qs, (size_t)mat_qs_n(w->kind, w->rows, w->cols) * 2 * ne), w->qs = NULL;
   }
 }
 void gpu_stream_init(void) {
@@ -388,7 +406,7 @@ static int mk_gemv_rng(u32 i, mk_rng *g) {
   uint64_t p[8];
   u32 rows, n2, t[4];
   memset(g, 0, sizeof *g);
-  if (k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8) {
+  if (k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8 || k == K_GEMV_Q5K || k == K_GEMV_IQ4XS) {
     /* qw qs xq y rows nb bias res nw ... */
     memcpy(p, c, 32), memcpy(&rows, c + 32, 4), memcpy(&n2, c + 36, 4), memcpy(p + 4, c + 40, 24);
     if (p[6]) return 0;
@@ -405,6 +423,13 @@ static int mk_gemv_rng(u32 i, mk_rng *g) {
     memcpy(p, c, 32), memcpy(&rows, c + 32, 4), memcpy(&n2, c + 36, 4), memcpy(p + 4, c + 40, 16), memcpy(t, c + 56, 16);
     g->r = mk_sr1(p[2], (uint64_t)n2 * 40u, t[1], t[0]), g->w = mk_sr1(p[3], (uint64_t)rows * 4u, t[2] * 4ull, t[0]);
     g->s = mk_sr1(p[5], (uint64_t)rows * 4u, t[3] * 4ull, t[0]);
+  } else if (k == K_GEXP) {
+    /* qw qs xq y rows nb route qwn qsn astr bstr kind; grid y: the K slots (xq: astr apart, or one input; y: bstr apart) */
+    u32 gy, as, bs;
+    memcpy(p, c, 32), memcpy(&rows, c + 32, 4), memcpy(&n2, c + 36, 4), memcpy(&as, c + 56, 4), memcpy(&bs, c + 60, 4);
+    memcpy(&gy, c - 8, 4);
+    g->r = mk_sr1(p[2], (uint64_t)n2 * 40u, as, as ? gy : 1u), g->w = mk_sr1(p[3], (uint64_t)rows * 4u, bs, gy);
+    return 1; /* no bias, no residual; the route is read (a GEMV phase does not write it) */
   } else if (k == K_GEMV_F32_T) {
     /* w x y rows cols bias res xs ys rs (bytes); grid y: the tokens */
     u32 gy;
@@ -431,6 +456,12 @@ static void mk_join(void) {
       else if (mk_ovl(&gi.w, &gj.r) || mk_ovl(&gi.w, &gj.w) || mk_ovl(&gi.w, &gj.b) || mk_ovl(&gi.w, &gj.s) ||
                mk_ovl(&gj.w, &gi.r) || mk_ovl(&gj.w, &gi.b) || mk_ovl(&gj.w, &gi.s))
         ok = 0;
+    }
+    static int jd = -1;
+    if (jd < 0) jd = getenv("IE_MK_JDEBUG") != NULL;
+    if (jd && mk.launches == 2) {
+      mk_rng gx;
+      fprintf(stderr, "join %u %s: %s (gemv %d, phase from %u)\n", i, kname[mk.kof[i]], ok ? "joined" : "barrier", mk_gemv_rng(i, &gx), ph);
     }
     u32 f;
     memcpy(&f, c + 12, 4);
@@ -486,6 +517,14 @@ static void mk_check(u32 pos) {
  * wave (ie_gemv_q4kq8_tr, ie_gemv_q6kq8_tr; bitwise equal to the others):
  * the 8-row ones (ts2, tr8) need about 192 VGPRs alone, and with them the
  * megakernel spills (IE_MK_LIGHT=0: keep them, launched apart). */
+/* the builds (the sets of tools/mk_gen.py, in order), next to the kernels */
+static const char *const mk_file[MK_NSETS] = {"ie_mk.hsaco", "ie_mk_mtp.hsaco", "ie_mk_flint.hsaco", "ie_mk_flintl.hsaco"};
+static const char *const mk_setname[MK_NSETS] = {"decode", "verify", "flint decode", "flint decode (long)"};
+/* the builds a model uses: flint its two, the others decode and MTP (the
+ * others are not loaded: off) */
+static int mk_need(const model *m, int st) {
+  return m->arch == ARCH_FLINT ? st == MKSET_FLINT || st == MKSET_FLINTL : st == MKSET_DECODE || st == MKSET_MTP;
+}
 static int mk_light(void) { return mk.rec && mk.set == MKSET_MTP && mk.light; }
 /* 1: the launch went to the list */
 static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **args) {
@@ -494,7 +533,7 @@ static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **ar
     /* a kernel the build does not have: the runs of this kind go back to
      * launches (a list cut at every such kernel is slower than launches) */
     if (!mk.off[mk.set])
-      fprintf(stderr, "gpu: megakernel off for %s runs (%s is not in it)\n", mk.set == MKSET_DECODE ? "decode" : "verify",
+      fprintf(stderr, "gpu: megakernel off for %s runs (%s is not in it)\n", mk_setname[mk.set],
               kname[k]);
     mk.off[mk.set] = 1;
     mk_flush();
@@ -508,9 +547,10 @@ static int mk_put(int k, unsigned gx, unsigned gy, unsigned lds_bytes, void **ar
   /* bit 1: the waves need not meet between workgroup bodies (no LDS, no
    * workgroup barrier): the GEMVs without the fused norm, the multi-token
    * GEMVs, the element-wise kernels */
-  const int fk = k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8 || k == K_GEMV_Q4;
+  const int fk = k == K_GEMV_Q4K || k == K_GEMV_Q6K || k == K_GEMV_Q8 || k == K_GEMV_Q4 || k == K_GEMV_Q5K || k == K_GEMV_IQ4XS;
   const int fr = (fk && !*(void **)args[8]) || k == K_GEMV_Q4K_TR || k == K_GEMV_Q6K_TR || k == K_GEMV_Q8_TR ||
-                 k == K_SWIGLU || k == K_EMBED_Q8 || k == K_EMBED_Q4 || k == K_EMBED_F32 || k == K_ROPE_KV || k == K_QUANT;
+                 k == K_SWIGLU || k == K_EMBED_Q8 || k == K_EMBED_Q4 || k == K_EMBED_F32 || k == K_ROPE_KV || k == K_QUANT ||
+                 k == K_GEXP || k == K_MOE_SUM || k == K_MOE_ROUTE; /* flint: no LDS, no workgroup barrier */
   const u32 h[4] = {(u32)id, gx, gy, fr && mk.free ? 2u : 0u};
   memcpy(c, h, sizeof h);
   size_t off = 16;
@@ -571,11 +611,11 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   if (mkon) {
     const char *sl = strrchr(hsaco, '/');
     const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
-    static const char *const mkf0[2] = {"ie_mk.hsaco", "ie_mk_mtp.hsaco"};
-    for (int st = 0; st < 2 && mkon; st++) {
+    for (int st = 0; st < MK_NSETS && mkon; st++) {
+      if (!mk_need(m, st)) continue;
       char *path = malloc(dl + 32);
       memcpy(path, hsaco, dl);
-      strcpy(path + dl, mkf0[st]);
+      strcpy(path + dl, mk_file[st]);
       FILE *mf = fopen(path, "rb");
       if (!mf) fprintf(stderr, "gpu: megakernel off (no %s; IE_MK=0 to turn it off quietly)\n", path), mkon = 0;
       else fclose(mf);
@@ -585,11 +625,14 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   if (mkon) {
     const char *sl = strrchr(hsaco, '/');
     const size_t dl = sl ? (size_t)(sl - hsaco + 1) : 0;
-    static const char *const mkf[MK_NSETS] = {"ie_mk.hsaco", "ie_mk_mtp.hsaco"};
     for (int st = 0; st < MK_NSETS; st++) {
+      if (!mk_need(m, st)) {
+        mk.off[st] = 1;
+        continue;
+      }
       char *path = malloc(dl + 32);
       memcpy(path, hsaco, dl);
-      strcpy(path + dl, mkf[st]);
+      strcpy(path + dl, mk_file[st]);
       FILE *mf = fopen(path, "rb");
       if (!mf) ie_die("IE_MK: cannot open %s (make %s)", path, path);
       fseek(mf, 0, SEEK_END);
@@ -615,6 +658,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     }
     mk.np[MKSET_DECODE] = getenv("IE_MK_NP") ? (u32)atoi(getenv("IE_MK_NP")) : 128u;
     mk.np[MKSET_MTP] = getenv("IE_MK_NP_MTP") ? (u32)atoi(getenv("IE_MK_NP_MTP")) : 128u;
+    mk.np[MKSET_FLINT] = mk.np[MKSET_FLINTL] = mk.np[MKSET_DECODE];
     /* IE_MK_MTP: 3 (default) verify runs only, 1 verify runs and drafts, 2 drafts only, 0 neither
      * (measured, MTP code 7 drafts: launches 94.2, 3: 99.2, 1: 98.4 tokens/s; a draft has
      * few launches, and a cooperative launch costs more than an ordinary one) */
@@ -644,13 +688,14 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     /* the cooperative launch fails (720) when the workgroups cannot all be
      * resident: try an empty list; halve np down to 32, else off */
     for (int st = 0; st < MK_NSETS; st++) {
+      if (!mk_need(m, st)) continue;
       for (;;) {
         u32 zero = 0;
         void *nul = NULL;
         void *a0[] = {&mk.dring[0], &zero, &mk.ws, &mk.base, &mk.dprof, &nul};
         if (H.ModuleLaunchCooperativeKernel(mk.f[st], mk.np[st], 1, 1, 256, 1, 1, 0, cur_stream, a0) == 0) break;
         if (mk.np[st] <= 32u) {
-          fprintf(stderr, "gpu: megakernel off for %s runs (no cooperative launch)\n", st == MKSET_DECODE ? "decode" : "verify");
+          fprintf(stderr, "gpu: megakernel off for %s runs (no cooperative launch)\n", mk_setname[st]);
           mk.off[st] = 1;
           break;
         }
@@ -659,10 +704,12 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     }
     HIP(H.DeviceSynchronize());
     if ((mk.trace_file = getenv("IE_MK_TRACE")) && mk.trace_file[0]) {
-      const u32 nmax = mk.np[0] > mk.np[1] ? mk.np[0] : mk.np[1];
+      u32 nmax = 0;
+      for (int st = 0; st < MK_NSETS; st++) nmax = mk.np[st] > nmax ? mk.np[st] : nmax;
       mk.trace_at = getenv("IE_MK_TRACE_AT") ? (uint64_t)atoll(getenv("IE_MK_TRACE_AT")) : 10u;
       if ((mk.trace = smp_create(nmax, 1, 16384, 1))) {
-        for (int j = 0; j < MK_N; j++) smp_register_event(mk.trace, (uint32_t)j, mk_names[j] + 3);
+        for (int j = 0; j < MK_N && j < 30; j++) smp_register_event(mk.trace, (uint32_t)j, mk_names[j] + 3);
+        if (MK_N > 30) smp_register_event(mk.trace, 30, "other");
         smp_register_event(mk.trace, 31, "grid barrier");
       }
     }
@@ -675,6 +722,10 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   HIP(H.Malloc((void **)&b->arena, g->arena));
   HIP(H.Memset(b->arena, 0, g->arena));
   HIP(H.Malloc((void **)&b->am_part, ARGMAX_GROUPS * 12u));
+  if (m->arch == ARCH_FLINT && m->n_exp) {
+    HIP(H.Malloc((void **)&b->ms_offs, (m->n_exp + 1u) * 4u));
+    HIP(H.Malloc((void **)&b->ms_list, IE_MS_MAXP * 4u));
+  }
   /* a verify run of up to 8 tokens (7 MTP drafts) needs 8 states; with the
    * prompt lookup (src/gen.c, up to 15 drafts) 16 */
   b->ns = g->T > 4u && g->mtp_h >= 0 ? (g->T >= 16u && spec_verify_max() > 8u ? 16u : 8u) : 4u;
@@ -691,6 +742,14 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
   const char *ae = getenv("IE_ATTN");
   b->attn_split = m->hd <= IE_ATT_MAX_HD && ie_att_max_split(g->n_ctx) <= IE_ATT_MAX_SPLIT && !(ae && !strcmp(ae, "old"));
   b->attn_check = b->attn_split && ae && !strcmp(ae, "check");
+  b->attn_gq = !(getenv("IE_ATTN_SW") && atoi(getenv("IE_ATTN_SW")));
+  b->flint = m->arch == ARCH_FLINT;
+  b->gq_min = getenv("IE_ATTN_GQ_MIN") ? (uint32_t)atoi(getenv("IE_ATTN_GQ_MIN")) : IE_GQ_MIN;
+  b->gq_ch = getenv("IE_ATTN_GQ_CH") ? (uint32_t)atoi(getenv("IE_ATTN_GQ_CH")) : 256u;
+  b->gq_ch_fixed = getenv("IE_ATTN_GQ_CH") != NULL;
+  if (b->gq_ch < 1u) ie_die("IE_ATTN_GQ_CH: >= 1");
+  b->gq_s = getenv("IE_ATTN_GQ_S") ? (uint32_t)atoi(getenv("IE_ATTN_GQ_S")) : 32u;
+  if (b->gq_s < 1u) ie_die("IE_ATTN_GQ_S: >= 1");
   b->attn_kv = b->attn_split && !(ae && (!strcmp(ae, "split") || !strcmp(ae, "check"))) && ie_att_ch(0) % 8u == 0u &&
                IE_ATT_MAX_SPLIT <= 4096u && m->hd % 4u == 0u; /* ie_attn_kv: the merge weights in its LDS buffer, float4 loads */
   if (b->attn_check) {
@@ -714,7 +773,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
       HIP(H.Malloc(&b->xh, b->xh_bytes));
     }
   }
-  const size_t kv = (size_t)m->n_kvl * g->n_ctx * m->n_kv * m->hd * b->kvb + 4;
+  const size_t kv = (size_t)g->kv_total * m->n_kv * m->hd * b->kvb + 4;
   HIP(H.Malloc((void **)&b->kc, kv));
   HIP(H.Malloc((void **)&b->vc, kv));
   /* 16 linear attention states (verify runs of up to 16 tokens) only if they
@@ -762,6 +821,7 @@ backend *gpu_open(const model *m, const graph *g, const char *hsaco) {
     if (o->v && o->w) b->d[i].bias = upload(b, o->v->f, o->v->n * 4); /* GEMV bias */
     else if (o->v) b->d[i].w0 = upload(b, o->v->f, o->v->n * 4);
     if (o->nv) b->d[i].nw = upload(b, o->nv->f, o->nv->n * 4);
+    if (o->kind == OP_ATTN && o->sk) b->d[i].w1 = upload(b, o->sk->f, o->sk->n * 4); /* flint: the sinks */
     if (o->kind == OP_GDN) { /* conv weights, dt bias, A, norm weight */
       const layer *L = &m->l[o->layer];
       b->d[i].w0 = upload(b, L->conv.f, L->conv.n * 4);
@@ -817,6 +877,8 @@ static unsigned gemv_groups(u32 rows) {
 /* Launch op i for token t of a run: tok is its token id, pos its position.
  * For OP_GDN and, when T > 1, OP_GEMV_Q8, one launch does all T tokens (t
  * = 0). slot: the linear attention state slot to read (ie_gdn). */
+/* The row of position p in the KV cache: entry kv_off of attention layer kvi, slot p % kv_len. */
+#define KVROW(kvi, p) ((size_t)g->kv_off[(kvi)] + (p) % g->kv_len[(kvi)])
 static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T, u32 slot, u32 wfrom) {
   const model *m = b->m;
   const graph *g = b->g;
@@ -983,7 +1045,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           const u32 grows = gk == K_GEMM_Q8R ? 256u : 128u;
           if ((int)T >= gmin) { /* many tokens: the matrix instruction (WMMA) */
             launch(b, gk, ((rows + grows - 1u) / grows) * ((T + 63u) / 64u), args);
-            if (getenv("IE_GEMM_CHECK")) { /* debug: compare with ie_gemv_q8q8_t, 16 tokens at a time, no bias/residual */
+            if (getenv("IE_GEMM_CHECK") && !bias && !R) { /* debug: compare with ie_gemv_q8q8_t, 16 tokens at a time (not with bias/residual) */
               static float *dev = NULL;
               static size_t cap = 0;
               const size_t need = (size_t)T * ys * 4;
@@ -1012,7 +1074,6 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
                 }
               fprintf(stderr, "gemm check %ux%u T=%u: max |gemm - gemv| / max |gemv| = %.2e\n", rows, o->w->cols, T, mx > 0 ? d / mx : 0);
               free(y1), free(y2);
-              if (bias || R) ie_die("IE_GEMM_CHECK: stop at the first GEMV with bias or residual (the check overwrote its output)");
             }
           } else if ((int)T >= trmin) {
             static unsigned rpw = 0; /* rows per wave of ie_gemv_q8q8_tr (GEMV_R) */
@@ -1048,6 +1109,113 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         }
         void *args[] = {&w0, &A, &B, &rows, &cols, &bias, &R, &NW, &NY, &NQ, &eps, &b->gm_count};
         launch(b, K_GEMV_F32, rows >= 253u && rows <= 256u ? 257u : rows, args); /* one row per workgroup */
+        break;
+      }
+      case OP_GEMV_Q5K:
+      case OP_GEMV_IQ4XS: {
+        u32 rows = o->w->rows, nb = o->w->nb;
+        if (T > 1u) { /* all tokens: ie_gexp_t, one group (the weights from the cache, 8 tokens at a time) */
+          if (NW || bias) ie_die("Q5_K / IQ4_XS GEMV of several tokens: no fused norm, no bias");
+          void *nul = NULL;
+          u32 zero = 0u, one = 1u, kind = (u32)o->w->kind, xs = g->bufs[o->a].stride, ys = g->bufs[o->b].stride,
+              rs = o->res >= 0 ? g->bufs[o->res].stride : 0u;
+          void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &nul, &nul, &T, &zero, &zero, &xs, &ys, &one, &kind, &R, &rs};
+          if (gx_wmma(b, T, nb, kind) && !getenv("IE_GEMM_KX_NOD")) launch(b, K_GEMM_KX, (rows + 127u) / 128u, args); /* WMMA, GK_R rows per workgroup */
+          else {
+            if (nb > 128u) ie_die("Q5_K / IQ4_XS GEMV of several tokens: %u blocks per row (at most 128)", nb);
+            launch(b, K_GEXP_T, (rows + 63u) / 64u, args); /* GXT_RB rows per workgroup */
+          }
+          break;
+        }
+        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &bias, &R, &NW, &NY, &NQ, &eps, &b->gm_count};
+        launch(b, o->kind == OP_GEMV_Q5K ? K_GEMV_Q5K : K_GEMV_IQ4XS, gemv_groups(rows), args);
+        break;
+      }
+      case OP_MOE_ROUTE: {
+        u32 K = o->nh;
+        float sc = m->escale;
+        void *EB = b->d[i].w0; /* the router bias (o->v), or NULL */
+        u32 ls = g->bufs[o->a].stride, ost = g->bufs[o->b].stride;
+        void *args[] = {&A, &n, &K, &EB, &sc, &B, &ls, &ost};
+        launch_t(b, K_MOE_ROUTE, 1, T, args);
+        if (T > 1u) { /* the pairs by expert for ie_gexp_t */
+          u32 ne = m->n_exp;
+          if (T * K > IE_MS_MAXP || ne > 1024u) ie_die("flint chunk: %u pairs (at most %u), %u experts (at most 1024)", T * K, IE_MS_MAXP, ne);
+          void *sa[] = {&B, &ost, &T, &K, &ne, &b->ms_offs, &b->ms_list};
+          launch(b, K_MOE_SORT, 1, sa);
+        }
+        break;
+      }
+      case OP_GEMV_EXP: {
+        const mat *w = o->w;
+        if (w->kind != MAT_Q8 && w->kind != MAT_Q4K && w->kind != MAT_Q6K && w->kind != MAT_Q5K && w->kind != MAT_IQ4XS)
+          ie_die("expert GEMV: kind %d has no GPU kernel", w->kind);
+        u32 rows = w->rows, nb = w->nb, as = o->astr, bs = o->bstr, kind = (u32)w->kind;
+        u32 qwn = (u32)mat_qw_words(w->kind, w->rows, w->cols), qsn = (u32)mat_qs_n(w->kind, w->rows, w->cols);
+        /* IE_GEXP_TWO=1: the gate/up experts (nb 64) two rows per wave too. Off by
+         * default: measured slower (flint UD-Q4_K_XL: 1.45 vs 1.26 ms per token in ie_gexp) */
+        static int two_env = -1;
+        if (two_env < 0) two_env = getenv("IE_GEXP_TWO") && getenv("IE_GEXP_TWO")[0] == '1';
+        u32 two_off = !two_env;
+        if (T > 1u) { /* a prompt chunk: by expert (ie_moe_sort in OP_MOE_ROUTE), ie_gexp_t */
+          const u32 K = o->nh, at = g->bufs[o->a].stride, bt = g->bufs[o->b].stride;
+          if (bt != K * bs || (as && at != K * as)) ie_die("expert GEMV of a chunk: token strides %u, %u (slots %u, %u)", at, bt, as, bs);
+          u32 xs = as ? as : at, xdiv = as ? 1u : K, zero = 0u;
+          void *nul = NULL;
+          void *ta[] = {&w0, &w1, &A, &B, &rows, &nb, &b->ms_list, &b->ms_offs, &zero, &qwn, &qsn, &xs, &bs, &xdiv, &kind, &nul, &zero};
+          if (gx_wmma(b, T, nb, kind) && !getenv("IE_GEMM_KX_NOE")) {
+            launch_t(b, K_GEMM_KX, (rows + 127u) / 128u, m->n_exp, ta); /* WMMA, GK_R rows per workgroup */
+            if (getenv("IE_KX_CHECK")) { /* debug: against ie_gexp_t (into a copy), the worst pair and row */
+              const size_t need = (size_t)T * K * bs;
+              float *y1 = malloc(need), *y2 = malloc(need);
+              void *dev;
+              HIP(H.Malloc(&dev, need));
+              HIP(H.Memcpy(dev, B, need, hipMemcpyDeviceToDevice));
+              void *t2[] = {&w0, &w1, &A, &dev, &rows, &nb, &b->ms_list, &b->ms_offs, &zero, &qwn, &qsn, &xs, &bs, &xdiv, &kind, &nul, &zero};
+              HIP(H.Memcpy(y1, B, need, hipMemcpyDeviceToHost));
+              launch_t(b, K_GEXP_T, (rows + 63u) / 64u, m->n_exp, t2);
+              HIP(H.Memcpy(y2, dev, need, hipMemcpyDeviceToHost));
+              double mx = 0, d = 0;
+              size_t wi = 0;
+              int nn = 0;
+              for (size_t p = 0; p < (size_t)T * K; p++)
+                for (u32 r = 0; r < rows; r++) {
+                  const double u = y1[p * (bs / 4) + r], v = y2[p * (bs / 4) + r];
+                  if (u != u) nn++;
+                  if (fabs(v) > mx) mx = fabs(v);
+                  if (!(fabs(u - v) <= d)) d = fabs(u - v), wi = p * 100000 + r;
+                }
+              fprintf(stderr, "kx check layer %d %ux%u kind %u: max |kx - gexp_t| %.3e of %.3e (pair %zu row %zu), %d nan\n", o->layer, rows, w->cols,
+                      kind, d, mx, wi / 100000, wi % 100000, nn);
+              H.Free(dev), free(y1), free(y2);
+            }
+          }
+          else {
+            if (nb > 128u) ie_die("expert GEMV of a chunk: %u blocks per row (at most 128)", nb);
+            launch_t(b, K_GEXP_T, (rows + 63u) / 64u, m->n_exp, ta); /* GXT_RB rows per workgroup */
+          }
+          break;
+        }
+        void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &C, &qwn, &qsn, &as, &bs, &kind, &two_off};
+        /* nb <= 64: two rows per wave, 16 per workgroup (ie_gexp) */
+        const unsigned gx = nb <= 16u || (nb <= 64u && !two_off) ? (rows + 15u) / 16u : gemv_groups(rows);
+        launch_t(b, K_GEXP, gx, o->nh, args);
+        break;
+      }
+      case OP_MOE_SWIGLU: { /* per slot: ie_swiglu with the slot strides (grid y = slot) */
+        void *Bu = (char *)A + (size_t)n * 4u;
+        u32 as = o->astr, qs = o->bstr; /* the slot strides */
+        void *args[] = {&A, &Bu, &n, &Q, &as, &qs};
+        if (T > 1u && (g->bufs[o->a].stride != o->nh * as || g->bufs[o->qo].stride != o->nh * qs))
+          ie_die("expert SwiGLU of a chunk: token strides %u, %u (slots %u, %u)", g->bufs[o->a].stride, g->bufs[o->qo].stride, as, qs);
+        launch_t(b, K_SWIGLU, elem_groups, o->nh * T, args); /* the pairs t K + k: grid y */
+        break;
+      }
+      case OP_MOE_SUM: {
+        u32 K = o->nh;
+        u32 ys = g->bufs[o->a].stride, os = g->bufs[o->b].stride, rts = g->bufs[o->c].stride, rs = o->res >= 0 ? g->bufs[o->res].stride : 0u;
+        void *args[] = {&A, &B, &C, &R, &n, &K, &ys, &os, &rts, &rs};
+        launch_t(b, K_MOE_SUM, elem_groups, T, args);
         break;
       }
       case OP_BIAS: {
@@ -1110,7 +1278,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
       }
       case OP_ROPE_KV: {
         float *cs = b->rcos + (size_t)pos * h2, *sn = b->rsin + (size_t)pos * h2;
-        const size_t base = ((size_t)m->l[o->layer].kvi * nctx + pos) * kvd;
+        const size_t base = KVROW(m->l[o->layer].kvi, pos) * kvd;
         void *kc = (char *)b->kc + base * b->kvb, *vc = (char *)b->vc + base * b->kvb;
         u32 nq = o->nh, neox = m->rope == ROPE_NEOX;
         void *args[] = {&A, &B, &C, &kc, &vc, &cs, &sn, &nq, (void *)&nkv, (void *)&hd, &neox};
@@ -1119,8 +1287,18 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
       }
       case OP_QKN_ROPE_KV: {
         float *cs = b->rcos + (size_t)pos * h2, *sn = b->rsin + (size_t)pos * h2;
-        const size_t base = ((size_t)m->l[o->layer].kvi * nctx + pos) * kvd;
+        const size_t base = KVROW(m->l[o->layer].kvi, pos) * kvd;
         void *kc = (char *)b->kc + base * b->kvb, *vc = (char *)b->vc + base * b->kvb;
+        if (m->arch == ARCH_FLINT) { /* q heads of qstr floats, no RoPE for a norope layer; T tokens (grid y) */
+          const u32 kvi = m->l[o->layer].kvi;
+          void *kl = (char *)b->kc + (size_t)g->kv_off[kvi] * kvd * b->kvb, *vl = (char *)b->vc + (size_t)g->kv_off[kvi] * kvd * b->kvb;
+          u32 nq = o->nh, nrot = o->norope ? 0u : m->n_rot, qstr = o->qstr, ins = g->bufs[o->a].stride, qos = g->bufs[o->b].stride,
+              len = g->kv_len[kvi], h2r = h2;
+          void *args[] = {&A, &B, &kl, &vl, &w0, &NW, &b->rcos, &b->rsin, &nq, (void *)&nkv, (void *)&hd, &nrot, &eps, &qstr,
+                          &ins, &qos, &pos, &len, &h2r};
+          launch_t(b, K_QKN_ROPE_KV2, nq + 2u * nkv, T, args);
+          break;
+        }
         u32 nq = o->nh, nrot = m->n_rot;
         u32 ins = g->bufs[o->a].stride, qos = g->bufs[o->b].stride;
         void *args[] = {&A, &B, &kc, &vc, &w0, &NW, &cs, &sn, &nq, (void *)&nkv, (void *)&hd, &nrot, &eps, &ins, &qos};
@@ -1206,15 +1384,47 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
         break;
       }
       case OP_KV: {
-        const size_t base = ((size_t)m->l[o->layer].kvi * nctx + pos) * kvd;
+        const size_t base = KVROW(m->l[o->layer].kvi, pos) * kvd;
         void *kc = (char *)b->kc + base * b->kvb, *vc = (char *)b->vc + base * b->kvb;
         void *args[] = {&A, &B, &kc, &vc, &n};
         launch(b, K_KV, elem_groups, args);
         break;
       }
       case OP_ATTN: {
-        const size_t base = (size_t)m->l[o->layer].kvi * nctx * kvd;
+        const size_t base = (size_t)g->kv_off[m->l[o->layer].kvi] * kvd;
         void *kc = (char *)b->kc + base * b->kvb, *vc = (char *)b->vc + base * b->kvb;
+        if (m->arch == ARCH_FLINT) { /* one token: window, ring, sinks (ie_attn_sw) */
+          if (T > 1u) { /* a prompt chunk: ie_attn_fa_sw (window, ring, sinks), then the Q8 copy */
+            u32 len = g->kv_len[m->l[o->layer].kvi], win = o->win, qs = g->bufs[o->a].stride, os = g->bufs[o->b].stride;
+            void *SK = b->d[i].w1;
+            if (hd > 128u || hd % 32u) ie_die("flint chunk attention: hd %u", hd);
+            void *fa[] = {&A, &kc, &vc, &B, &pos, (void *)&hd, (void *)&nhd, (void *)&nkv, &qs, &os, &T, &win, &len, &SK};
+            launch(b, K_ATTN_FA_SW, nkv * ((T + 15u) / 16u), fa);
+            if (Q) {
+              u32 nb = nhd * hd / 32u, qst = g->bufs[o->qo].stride;
+              void *qa[] = {&B, &Q, &nb, &os, &qst};
+              launch_t(b, K_QUANT, (nb + 7u) / 8u, T, qa);
+            }
+            break;
+          }
+          u32 len = g->kv_len[m->l[o->layer].kvi], p0 = o->win && pos + 1u > o->win ? pos + 1u - o->win : 0u, np = pos + 1u - p0;
+          /* ie_attn_gq (the q heads of a kv head together, chunks of 256
+           * positions) when it can; IE_ATTN_SW=1: ie_attn_sw */
+          const int gq = gq_use(b, pos) && nhd / nkv <= 8u && hd <= 128u && hd % 8u == 0u;
+          /* ie_attn_gq: passes of 256 positions; at most gq_s splits per kv head
+           * (long positions: fewer, longer splits, a cheap merge) */
+          u32 ch = gq ? b->gq_ch : ie_att_ch(pos);
+          if (gq && !b->gq_ch_fixed) {
+            const u32 per = (np + b->gq_s - 1u) / b->gq_s;
+            ch = per <= 256u ? 256u : (per + 255u) & ~255u;
+          }
+          u32 nsplit = (np + ch - 1u) / ch;
+          void *SK = b->d[i].w1; /* the sinks (gpu_open), or NULL */
+          void *args[] = {&A, &kc, &vc, &C, &B, &p0, &np, &len, (void *)&hd, (void *)&nhd, (void *)&nkv, &nsplit, &ch,
+                          &b->at_count, &Q, &SK};
+          launch(b, gq ? K_ATTN_GQ : K_ATTN_SW, (gq ? nkv : nhd) * nsplit, args);
+          break;
+        }
         void *GT = o->gt >= 0 ? b->arena + g->bufs[o->gt].off + o->gtoff + (size_t)t * g->bufs[o->gt].stride : NULL;
         u32 gs = o->gstride;
         static int agmin = -1;
@@ -1362,7 +1572,15 @@ static void run_ops(gpu_backend *b, uint32_t i0, uint32_t i1, const u32 *toks, u
      * read once), and the per-token kernels with a token grid dimension */
     static int gmin = -1;
     if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
-    const int all = k == OP_GDN || ((k == OP_GEMV_Q8 || k == OP_GEMV_Q4K || k == OP_GEMV_Q6K || k == OP_GEMV_F32) && !nobatch) || k == OP_RMSNORM || k == OP_QUANT || k == OP_SWIGLU ||
+    static int fpf = -1; /* IE_FLINT_PF=0: flint prompt chunks one token at a time (debug) */
+    if (fpf < 0) fpf = !(getenv("IE_FLINT_PF") && getenv("IE_FLINT_PF")[0] == '0');
+    const int all = b->m->arch == ARCH_FLINT
+                        ? fpf && (k == OP_RMSNORM || k == OP_QUANT || k == OP_SWIGLU || k == OP_COPY || k == OP_GEMV_Q8 ||
+                                  k == OP_GEMV_Q4K || k == OP_GEMV_Q6K || k == OP_GEMV_F32 || k == OP_GEMV_Q5K ||
+                                  k == OP_GEMV_IQ4XS || k == OP_QKN_ROPE_KV || k == OP_ATTN || k == OP_MOE_ROUTE ||
+                                  k == OP_GEMV_EXP || k == OP_MOE_SWIGLU || k == OP_MOE_SUM)
+                        :
+                    k == OP_GDN || ((k == OP_GEMV_Q8 || k == OP_GEMV_Q4K || k == OP_GEMV_Q6K || k == OP_GEMV_F32) && !nobatch) || k == OP_RMSNORM || k == OP_QUANT || k == OP_SWIGLU ||
                     k == OP_QKN_ROPE_KV || k == OP_COPY || k == OP_DF_CONV || k == OP_DF_QKV || k == OP_DF_ATTN || (k == OP_ATTN && (int)T >= gmin) /* the fast (not bitwise) prefill path */
                     || (k == OP_ATTN && b->attn_split && T <= b->at_tmax && b->at_part); /* verify: ie_attn_split_t (bitwise) */
     if (all) launch_op(b, i, 0, toks[0], pos, T, slot, wfrom);
@@ -1408,7 +1626,8 @@ static uint32_t gpu_step(backend *bk, uint32_t tok, uint32_t pos, float *logits,
   struct timespec h0, h1;
   clock_gettime(CLOCK_MONOTONIC, &h0);
   tr_run("decode", pos, 1);
-  mk.rec = mk.on && !mk.off[MKSET_DECODE], mk.set = MKSET_DECODE;
+  mk.set = b->flint ? (gq_use(b, pos) ? MKSET_FLINTL : MKSET_FLINT) : MKSET_DECODE;
+  mk.rec = mk.on && !mk.off[mk.set];
   run_ops(b, 0, g->n_main, &tok, 1, pos, 0); /* state: slot -> slot */
   mk.rec = 0;
   mk_flush();
@@ -1508,6 +1727,23 @@ static void gpu_snap(backend *bk, int save, int k, int hbuf) {
     char *row = b->arena + b->g->bufs[hbuf].off;
     HIP(H.Memcpy(save ? snap_h : row, save ? row : snap_h, hb, hipMemcpyDeviceToDevice));
   }
+  /* a ring slot is reused by a later position: keep the rings (K and V) */
+  const graph *g = b->g;
+  const size_t kvb = (size_t)m->n_kv * m->hd * b->kvb;
+  size_t nr = 0;
+  for (uint32_t i = 0; i < m->n_kvl; i++)
+    if (g->kv_len[i] < g->n_ctx) nr += g->kv_len[i];
+  if (!nr) return;
+  if (!b->snap_kv[k]) HIP(H.Malloc((void **)&b->snap_kv[k], 2 * nr * kvb));
+  char *sp = b->snap_kv[k];
+  for (uint32_t i = 0; i < m->n_kvl; i++) {
+    if (g->kv_len[i] >= g->n_ctx) continue;
+    const size_t n = g->kv_len[i] * kvb, o = g->kv_off[i] * kvb;
+    HIP(H.Memcpy(save ? (void *)sp : (char *)b->kc + o, save ? (char *)b->kc + o : (void *)sp, n, hipMemcpyDeviceToDevice));
+    sp += n;
+    HIP(H.Memcpy(save ? (void *)sp : (char *)b->vc + o, save ? (char *)b->vc + o : (void *)sp, n, hipMemcpyDeviceToDevice));
+    sp += n;
+  }
 }
 
 static void gpu_accept(backend *bk, uint32_t k) {
@@ -1579,7 +1815,13 @@ static int op_kernel(const gpu_backend *b, const op *o) {
     case OP_ROPE: return K_ROPE;
     case OP_KV: return K_KV;
     case OP_ROPE_KV: return K_ROPE_KV;
-    case OP_ATTN: return b->attn_kv ? K_ATTN_KV : b->attn_split ? K_ATTN_SPLIT : K_ATTN;
+    case OP_ATTN: return m->arch == ARCH_FLINT ? (b->attn_gq && b->gq_min <= 1u ? K_ATTN_GQ : K_ATTN_SW) : b->attn_kv ? K_ATTN_KV : b->attn_split ? K_ATTN_SPLIT : K_ATTN;
+    case OP_GEMV_Q5K: return K_GEMV_Q5K;
+    case OP_GEMV_IQ4XS: return K_GEMV_IQ4XS;
+    case OP_MOE_ROUTE: return K_MOE_ROUTE;
+    case OP_MOE_SUM: return K_MOE_SUM;
+    case OP_MOE_SWIGLU: return K_SWIGLU;
+    case OP_GEMV_EXP: return K_GEXP;
     default: return K_ARGMAX;
   }
 }
@@ -1590,6 +1832,13 @@ static double op_wbytes(const op *o) {
   if (o->kind == OP_GEMV_Q6K) return (double)o->w->rows * o->w->nb * 26.25;
   if (o->kind == OP_GEMV_Q8) return (double)o->w->rows * o->w->nb * 34.0;
   if (o->kind == OP_GEMV_F32) return (double)o->w->rows * o->w->cols * 4.0;
+  if (o->kind == OP_GEMV_Q5K) return (double)o->w->rows * o->w->nb * 22.0;
+  if (o->kind == OP_GEMV_IQ4XS) return (double)o->w->rows * o->w->nb * 17.0;
+  if (o->kind == OP_GEMV_EXP) {
+    const int k = o->w->kind;
+    const double per = k == MAT_Q8 ? 34.0 : k == MAT_Q5K ? 22.0 : k == MAT_IQ4XS ? 17.0 : k == MAT_Q6K ? 26.25 : 18.0;
+    return (double)o->w->rows * o->w->nb * per * o->nh;
+  }
   return 0;
 }
 
@@ -1727,8 +1976,10 @@ static void gpu_close(backend *bk) {
   for (uint32_t i = 0; i < n_sdev; i++) H.Free(sdev[i]);
   free(sdev), sdev = NULL, n_sdev = cap_sdev = 0;
   H.Free(b->arena), H.Free(b->kc), H.Free(b->vc), H.Free(b->ring), H.Free(b->st);
-  for (int k = 0; k < 2; k++)
+  for (int k = 0; k < 2; k++) {
     if (b->snap_ring[k]) H.Free(b->snap_ring[k]), H.Free(b->snap_st[k]), H.Free(b->snap_h[k]);
+    if (b->snap_kv[k]) H.Free(b->snap_kv[k]);
+  }
   H.Free(b->am_part), H.Free(b->am_count), H.Free(b->at_count), H.Free(b->at_part), H.Free(b->tk_buf), H.Free(b->gm_count);
   if (b->prof) {
     for (uint32_t i = 0; i < b->g->n_ops; i++) H.EventDestroy(b->pev[i]);

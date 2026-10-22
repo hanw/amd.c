@@ -23,14 +23,14 @@ static void usage(void) {
           "             --draft-pmin P: stop drafting when the MTP probability of a draft is below P (default 0.6);\n"
           "             --mtp FILE: the MTP head from FILE (default: the model file)\n"
           "  --dflash FILE: with --draft, the drafts from a DFlash 2 drafter (GGUF) instead of the MTP head\n"
-          "  --chunk N: GPU, the prompt in chunks of up to N tokens (1 to 512, default 256)\n"
+          "  --chunk N: GPU, the prompt in chunks of up to N tokens (1 to 512, default 256; flint 512)\n"
           "  --temp T [--top-k K] [--top-p P] [--seed S]: sampling (default: greedy)\n");
   exit(2);
 }
 
 int main(int argc, char **argv) {
   const char *mtp_path = NULL, *df_path = NULL;
-  uint32_t draft = 0, chunk = 256, top_k = 0;
+  uint32_t draft = 0, chunk = 0, top_k = 0; /* chunk 0: by the model (flint 512, else 256) */
   float temp = 0.0f, top_p = 1.0f, pmin = 0.6f;
   uint64_t seed = 1;
   const char *path = NULL, *be = "cpu", *toks = "1", *dump = NULL, *hsaco = "build/ie_kernels.hsaco", *tfile = NULL;
@@ -122,9 +122,13 @@ int main(int argc, char **argv) {
   if (n_ctx == 0) n_ctx = need;
   if (n_ctx < need) ie_die("--ctx %u is smaller than prompt + n = %u", n_ctx, need);
   fprintf(stderr, "model: %s, %u layers, dim %u, ffn %u, heads %u/%u (hd %u), vocab %u, rope %s, weights %.2f MB\n",
-          m.arch == ARCH_QWEN35 ? "qwen35" : m.arch == ARCH_QWEN2 ? "qwen2" : "llama", m.n_layer, m.dim, m.ffn, m.n_head, m.n_kv, m.hd, m.vocab,
-          m.rope == ROPE_NEOX ? "neox" : "norm", m.weight_bytes / 1e6);
+          m.arch == ARCH_FLINT ? "flint" : m.arch == ARCH_QWEN35 ? "qwen35" : m.arch == ARCH_QWEN2 ? "qwen2" : "llama", m.n_layer, m.dim,
+          m.ffn, m.n_head, m.n_kv, m.hd, m.vocab, m.rope == ROPE_NEOX ? "neox" : "norm", m.weight_bytes / 1e6);
+  if (m.n_exp)
+    fprintf(stderr, "moe: %u experts, %u per token, expert ffn %u, shared ffn %u (weights above: the bytes read per token)\n", m.n_exp,
+            m.n_used, m.eff, m.sff);
 
+  if (!chunk) chunk = m.arch == ARCH_FLINT ? 512u : 256u; /* flint: twice the tokens per expert weight read */
   if (chunk < 1 || chunk > 512) ie_die("--chunk: 1 to 512");
   const int gpu = !strcmp(be, "gpu"), use_pf = gpu && !dump;
   if (!use_pf) chunk = 1;

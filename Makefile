@@ -18,10 +18,10 @@ GPU_CFLAGS = -x c -std=c11 -Wall -Wextra --target=amdgcn-amd-amdhsa -mcpu=$(GPU_
 B = build
 ENGINE_SRC = src/common.c src/gguf.c src/model.c src/plan.c src/cpu.c src/hip.c src/gen.c prof/sm_profiler.c
 SRC = $(ENGINE_SRC) src/main.c
-HDR = src/common.h src/gguf.h src/model.h src/backend.h src/gen.h core/ie_core.h $(B)/ie_mk_gen.h prof/sm_profiler.h
+HDR = src/common.h src/gguf.h src/model.h src/backend.h src/gen.h core/ie_core.h core/ie_ext.h src/iq3s_grid.h $(B)/ie_mk_gen.h prof/sm_profiler.h
 CFLAGS += -I$(B)
 
-all: $(B)/ie-run $(B)/ie-serve $(B)/smp_demo $(B)/smp_demo.hsaco $(B)/ie_kernels.hsaco $(B)/ie_mk.hsaco $(B)/ie_mk_mtp.hsaco
+all: $(B)/ie-run $(B)/ie-serve $(B)/smp_demo $(B)/smp_demo.hsaco $(B)/ie_kernels.hsaco $(B)/ie_mk.hsaco $(B)/ie_mk_mtp.hsaco $(B)/ie_mk_flint.hsaco $(B)/ie_mk_flintl.hsaco
 
 $(B):
 	mkdir -p $(B)
@@ -48,6 +48,11 @@ $(B)/chat_render: tools/chat_render.c src/chat.c src/json.c src/chat.h src/json.
 LLAMA_CPP ?= ../llama.cpp
 $(B)/tok_check: tools/tok_check.c src/tok.c src/gguf.c src/common.c src/tok.h src/tok_unicode.h | $(B)
 	$(CC) $(CFLAGS) -o $@ tools/tok_check.c src/tok.c src/gguf.c src/common.c $(LDLIBS)
+# flint (tests/tok-flint.*: llama.cpp's test texts and more, the ids from
+# Hugging Face tokenizers with the model's tokenizer.json):
+#   make tokcheck-flint FLINT=path/to/flint.gguf (the model file, or a vocabulary-only GGUF)
+tokcheck-flint: $(B)/tok_check
+	./$(B)/tok_check $(FLINT) tests/tok-flint.inp tests/tok-flint.out
 tokcheck: $(B)/tok_check
 	./$(B)/tok_check $(LLAMA_CPP)/models/ggml-vocab-qwen2.gguf $(LLAMA_CPP)/models/ggml-vocab-qwen2.gguf.inp $(LLAMA_CPP)/models/ggml-vocab-qwen2.gguf.out
 	./$(B)/tok_check $(LLAMA_CPP)/models/ggml-vocab-qwen35.gguf $(LLAMA_CPP)/models/ggml-vocab-qwen35.gguf.inp $(LLAMA_CPP)/models/ggml-vocab-qwen35.gguf.out
@@ -73,9 +78,14 @@ $(B)/ie_kernels.hsaco: $(B)/ie_kernels.o
 # At most 192 VGPRs and 16 KB of LDS: two workgroups per CU (128). tools/mk_gen.py writes the table of all these kernels (their
 # argument layout) for kernels/ie_mk.c and src/hip.c.
 MK_DECODE = ie_embed_q8,ie_embed_q4,ie_embed_f32,ie_rope_kv,ie_gemv_q4q8,ie_rmsnorm,ie_gemv_q4kq8,ie_gemv_q6kq8,ie_gemv_q8q8,ie_gemv_f32,ie_swiglu,ie_gdn1,ie_qkn_rope_kv,ie_attn_split,ie_attn_kv,ie_argmax,ie_copy_rows
+# flint decode: ie_mk_flint.hsaco; ie_mk_flintl.hsaco with ie_attn_gq too, for
+# long positions (a call in the megakernel: about 0.4 ms per token slower
+# for all the other kernels, measured, so only where it pays)
+MK_FLINT = ie_embed_q8,ie_embed_q4,ie_embed_f32,ie_rmsnorm,ie_gemv_q4kq8,ie_gemv_q6kq8,ie_gemv_q8q8,ie_gemv_f32,ie_swiglu,ie_argmax,ie_copy_rows,ie_gemv_q5kq8,ie_gemv_iq4xsq8,ie_gexp,ie_moe_route,ie_moe_sum,ie_qkn_rope_kv2,ie_attn_sw
+MK_FLINTL = $(MK_FLINT),ie_attn_gq
 MK_MTP = ie_embed_q8,ie_rmsnorm,ie_rmsnorm_t,ie_quant_q8,ie_swiglu,ie_gdn1,ie_qkn_rope_kv,ie_attn_split,ie_attn_split_t,ie_attn_kv,ie_argmax,ie_gemv_q4q8,ie_gemv_q4kq8,ie_gemv_q6kq8,ie_gemv_q8q8,ie_gemv_f32,ie_gemv_f32_t,ie_gemv_q4kq8_tr,ie_gemv_q6kq8_tr,ie_gemv_q8q8_tr,ie_copy_rows
 $(B)/ie_mk_gen.h: tools/mk_gen.py kernels/ie_kernels.c Makefile | $(B)
-	$(PYTHON) tools/mk_gen.py kernels/ie_kernels.c $@ DECODE=$(MK_DECODE) MTP=$(MK_MTP)
+	$(PYTHON) tools/mk_gen.py kernels/ie_kernels.c $@ DECODE=$(MK_DECODE) MTP=$(MK_MTP) FLINT=$(MK_FLINT) FLINTL=$(MK_FLINTL)
 # (clang 21 at -O3 writes "amdgpu-waves-per-eu"="8,16": at most 192 VGPRs,
 # so two workgroups per CU; the host checks the count with a launch at load)
 $(B)/ie_mk.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h prof/sm_profiler.h | $(B)
@@ -86,9 +96,17 @@ $(B)/ie_mk_mtp.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_m
 	$(GPU_CC) $(GPU_CFLAGS) -I$(B) -DMKS_MTP -S -emit-llvm -o $@.tmp $<
 	sed -E -e '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="256,256" "target-cpu"/' $@.tmp > $@
 	rm -f $@.tmp
-$(B)/ie_mk.o $(B)/ie_mk_mtp.o: $(B)/%.o: $(B)/%.ll
+$(B)/ie_mk_flint.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h prof/sm_profiler.h | $(B)
+	$(GPU_CC) $(GPU_CFLAGS) -I$(B) -DMKS_FLINT -S -emit-llvm -o $@.tmp $<
+	sed -E -e '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="256,256" "target-cpu"/' $@.tmp > $@
+	rm -f $@.tmp
+$(B)/ie_mk_flintl.ll: kernels/ie_mk.c kernels/ie_kernels.c core/ie_core.h $(B)/ie_mk_gen.h prof/sm_profiler.h | $(B)
+	$(GPU_CC) $(GPU_CFLAGS) -I$(B) -DMKS_FLINTL -S -emit-llvm -o $@.tmp $<
+	sed -E -e '/^attributes #[0-9]+ = \{.*"target-cpu"/ s/"target-cpu"/"amdgpu-flat-work-group-size"="256,256" "target-cpu"/' $@.tmp > $@
+	rm -f $@.tmp
+$(B)/ie_mk.o $(B)/ie_mk_mtp.o $(B)/ie_mk_flint.o $(B)/ie_mk_flintl.o: $(B)/%.o: $(B)/%.ll
 	$(GPU_CC) -nogpulib --target=amdgcn-amd-amdhsa -mcpu=$(GPU_ARCH) -O3 -c -o $@ $<
-$(B)/ie_mk.hsaco $(B)/ie_mk_mtp.hsaco: $(B)/%.hsaco: $(B)/%.o
+$(B)/ie_mk.hsaco $(B)/ie_mk_mtp.hsaco $(B)/ie_mk_flint.hsaco $(B)/ie_mk_flintl.hsaco: $(B)/%.hsaco: $(B)/%.o
 	$(GPU_LD) -shared -o $@ $<
 
 $(B)/laws_test: tests/laws_test.cpp laws/ie_laws.cpp core/ie_core.h core/lean_mem.h | $(B)
@@ -97,16 +115,20 @@ $(B)/laws_test: tests/laws_test.cpp laws/ie_laws.cpp core/ie_core.h core/lean_me
 TEST_SRC = src/common.c src/gguf.c src/model.c src/cpu.c
 $(B)/kernel_test: tests/kernel_test.c $(TEST_SRC) $(HDR) | $(B)
 	$(CC) $(CFLAGS) -o $@ tests/kernel_test.c $(TEST_SRC) $(LDLIBS)
+$(B)/ext_test: tests/ext_test.c core/ie_ext.h $(TEST_SRC) $(HDR) | $(B)
+	$(CC) $(CFLAGS) -o $@ tests/ext_test.c $(TEST_SRC) $(LDLIBS)
 
-MODELS = $(B)/tiny-qwen2.gguf $(B)/tiny-llama.gguf $(B)/tiny-llama-k.gguf
+MODELS = $(B)/tiny-qwen2.gguf $(B)/tiny-llama.gguf $(B)/tiny-llama-k.gguf $(B)/tiny-flint.gguf
 $(MODELS) &: tools/make_tiny_gguf.py | $(B)
 	$(PYTHON) tools/make_tiny_gguf.py $(B)
 
-test: all $(B)/laws_test $(B)/kernel_test $(B)/cache_check $(MODELS)
+test: all $(B)/laws_test $(B)/kernel_test $(B)/ext_test $(B)/cache_check $(MODELS)
 	@echo "== laws_test (the laws of laws/ie_laws.cpp on random inputs)"
 	./$(B)/laws_test
 	@echo "== kernel_test (CPU GEMV vs plain dot products, repack vs GGUF)"
 	./$(B)/kernel_test
+	@echo "== ext_test (Q5_K, IQ4_XS: core/ie_ext.h, tested, not proved)"
+	./$(B)/ext_test
 	@echo "== tiny qwen2: CPU backend vs numpy reference"
 	./$(B)/ie-run $(B)/tiny-qwen2.gguf --tokens 5,200,17,42,299,256 --n 10 --dump-logits $(B)/qwen2.logits
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-qwen2.gguf $(B)/qwen2.logits --mode q8 --tol-median 1e-5 --tol 2e-3
@@ -119,9 +141,15 @@ test: all $(B)/laws_test $(B)/kernel_test $(B)/cache_check $(MODELS)
 	./$(B)/ie-run $(B)/tiny-llama-k.gguf --tokens 1,300,77,259,3 --n 10 --dump-logits $(B)/llamak.logits
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-llama-k.gguf $(B)/llamak.logits --mode q8 --tol-median 1e-5 --tol 2e-3
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-llama-k.gguf $(B)/llamak.logits --mode float --tol 5e-2
+	@echo "== tiny flint (MoE, sinks, sliding window ring, Q5_K, IQ4_XS, IQ3_S): CPU backend vs numpy reference"
+	@echo "   (5 layers: a rounding-boundary flip of one Q8 activation stays in the KV cache, so a looser q8 median)"
+	./$(B)/ie-run $(B)/tiny-flint.gguf --tokens 5,200,17,42,299,256 --n 30 --dump-logits $(B)/flint.logits
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-flint.gguf $(B)/flint.logits --mode q8 --tol-median 1e-4 --tol 5e-3
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/ref_forward.py $(B)/tiny-flint.gguf $(B)/flint.logits --mode float --tol 5e-2
 	@echo "== prompt cache (gen_run): with and without the cache, the same answers (CPU)"
 	./$(B)/cache_check $(B)/tiny-qwen2.gguf
 	./$(B)/cache_check $(B)/tiny-llama-k.gguf
+	./$(B)/cache_check $(B)/tiny-flint.gguf
 	@echo "== GPU backend without a GPU: must fail with a clear message"
 	! ./$(B)/ie-run $(B)/tiny-qwen2.gguf --backend gpu --hsaco $(B)/ie_kernels.hsaco --n 1 2> $(B)/gpu.err
 	cat $(B)/gpu.err
@@ -135,7 +163,7 @@ proofs:
 clean:
 	rm -rf $(B) tools/__pycache__
 
-.PHONY: all test proofs clean tokcheck
+.PHONY: all test proofs clean tokcheck tokcheck-flint
 
 # prof/: the per-wave event profiler (sm_profiler.h, after leepoly/sm-profiler)
 # and its demo: build/smp_demo build/smp_demo.hsaco -> demo_trace.json

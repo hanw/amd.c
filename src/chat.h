@@ -22,6 +22,16 @@ typedef struct {
   size_t n_seg, cap;
 } chat_prompt;
 
+/* flint (Recursive): its chat template (tokenizer.chat_template of the
+ * model; reasoning effort and enable_thinking do not exist there: the model
+ * decides whether it reasons). One SEG_TEXT part: the whole text is
+ * tokenized WITH the control tokens (as Hugging Face tokenizes the rendered
+ * string; the template escapes them in user, system and tool texts). */
+int chat_render_flint(const jval *messages, const jval *tools, chat_prompt *p, char *err, size_t errn);
+/* flint's tool calls: <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>
+ * (otherwise as chat_tool_calls) */
+int chat_tool_calls_flint(const char *s, size_t n, const jval *tools, const char *id_prefix, sbuf *out);
+
 /* messages: the request's array; tools: its "tools" array or NULL. think:
  * enable_thinking; effort: reasoning_effort (xhigh, medium, low). 0 and a
  * message in err if the request is not valid. */

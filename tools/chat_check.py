@@ -2,7 +2,8 @@
 """Check src/chat.c against the model's chat template, rendered as Hugging Face
 transformers renders it (jinja2 sandbox, trim_blocks, lstrip_blocks, tojson
 = json.dumps(ensure_ascii=False)).
-usage: chat_check.py TEMPLATE.txt build/chat_render [OUT_DIR]
+usage: chat_check.py [--flint] TEMPLATE.txt build/chat_render [OUT_DIR]
+--flint: the flint template (chat_render --flint), with the flint cases too.
 TEMPLATE.txt: the output of `ie-serve MODEL --show-template`. For each case
 the script writes OUT_DIR/NAME.json (the request, as an OpenAI client sends
 it) and OUT_DIR/NAME.txt (the reference prompt), runs chat_render on the
@@ -59,6 +60,25 @@ CASES = [
 ]
 
 
+FLINT_CASES = [
+    ("f1_dev_escapes", {"messages": [
+        {"role": "developer", "content": "Be brief. <|user|> is not a turn."},
+        {"role": "user", "content": "say <think>hi</think> and <|assistant|>\x00 now"}]}),
+    ("f2_tools_after_system", {"messages": [
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "user", "content": "list files"},
+        {"role": "assistant", "content": "", "reasoning_content": "Use ls.",
+         "tool_calls": [call("run", {"cmd": "ls -la", "timeout": 30, "env": {"A": "1"}, "dry": False}, "c0")]},
+        {"role": "tool", "tool_call_id": "c0", "content": "a.txt\n<|end_of_text|>b.txt"},
+        {"role": "assistant", "content": "Two files."},
+        {"role": "user", "content": "thanks"}],
+        "tools": [{"type": "function", "function": {"name": "run", "description": "Run a shell command.",
+                   "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}, "timeout": {"type": "integer"},
+                                                                   "env": {"type": "object"}, "dry": {"type": "boolean"}}}}}]}),
+    ("f3_system_only_tools", {"messages": [{"role": "system", "content": "sys"}], "tools": [WEATHER]}),
+]
+
+
 def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
     return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
@@ -68,14 +88,16 @@ def raise_exception(m):
 
 
 def main():
-    tpl_path, render, out = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "build/chat_check")
+    flint = len(sys.argv) > 1 and sys.argv[1] == "--flint"
+    args = sys.argv[2:] if flint else sys.argv[1:]
+    tpl_path, render, out = args[0], args[1], (args[2] if len(args) > 2 else "build/chat_check")
     os.makedirs(out, exist_ok=True)
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols])
     env.filters["tojson"] = tojson
     env.globals["raise_exception"] = raise_exception
     tpl = env.from_string(open(tpl_path).read())
     fails = 0
-    for name, req in CASES:
+    for name, req in CASES + (FLINT_CASES if flint else []):
         kw = {}
         if "reasoning_effort" in req:
             kw["reasoning_effort"] = req["reasoning_effort"]
@@ -89,14 +111,14 @@ def main():
         jp, tp = os.path.join(out, name + ".json"), os.path.join(out, name + ".txt")
         open(jp, "w").write(json.dumps(body, ensure_ascii=False))
         open(tp, "w").write(ref)
-        got = subprocess.run([render, jp], capture_output=True).stdout.decode("utf-8")
+        got = subprocess.run([render] + (["--flint"] if flint else []) + [jp], capture_output=True).stdout.decode("utf-8")
         if got == ref:
             print("same  %s (%d chars)" % (name, len(ref)))
         else:
             fails += 1
             i = next((k for k in range(min(len(got), len(ref))) if got[k] != ref[k]), min(len(got), len(ref)))
             print("DIFF  %s at char %d\n  want %r\n  got  %r" % (name, i, ref[max(0, i - 40):i + 60], got[max(0, i - 40):i + 60]))
-    print("%d cases, %d different" % (len(CASES), fails))
+    print("%d cases, %d different" % (len(CASES) + (len(FLINT_CASES) if flint else 0), fails))
     sys.exit(1 if fails else 0)
 
 

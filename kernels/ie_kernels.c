@@ -12,6 +12,7 @@
  * flat work group size 256 is written into the IR by the Makefile (clang 18
  * does not accept amdgpu_flat_work_group_size in C). */
 #include "../core/ie_core.h"
+#include "../core/ie_ext.h"
 
 #define G __attribute__((address_space(1))) /* global memory */
 #define LDS __attribute__((address_space(3), loader_uninitialized))
@@ -631,11 +632,10 @@ KERNEL_HEAVY ie_gemv_q4kq8_tr8(const G u32 *qw, const G u16 *qs, const G u8 *xq,
  * dot products d0, d1 (ie_q6k_dots, law q6k_dots: the q - 32 bytes, signed dot4), then
  *   acc = fma(fma(d sc1, d1, (d sc0) d0), da, acc)
  * (explicit fma: the same in ie_gemv_q6kq8_tr and the CPU). */
-KERNEL ie_gemv_q6kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
-                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
-                     G u32 *count) {
+static inline void gemv_q6kq8_rows(u32 g, const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                                   const G float *bias, const G float *res) {
 #pragma clang fp contract(off)
-  const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
+  const u32 r = ie_gemv_row(g, tid() >> 5), l = lane();
   if (r < rows) {
     const G u32 *aw = (const G u32 *)xq;
     const G float *da = (const G float *)(xq + 32u * nb);
@@ -671,6 +671,11 @@ KERNEL ie_gemv_q6kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *
     acc = wave_tree_f(acc);
     if (l == 0u) y[r] = epilogue(acc, r, bias, res);
   }
+}
+KERNEL ie_gemv_q6kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                     G u32 *count) {
+  gemv_q6kq8_rows(wgid(), qw, qs, xq, y, rows, nb, bias, res);
   if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
 }
 
@@ -795,10 +800,9 @@ KERNEL_HEAVY ie_gemv_q6kq8_ts2(const G u32 *qw, const G u16 *qs, const G u8 *xq,
 /* y = W x: W is Q8_0 (GPU layout: 8 int8 words per block in qw, f16 scales
  * qs), x is Q8. The same grid, lane split and reduction as ie_gemv_q4q8;
  * the block dot product is ie_q8q8_block (8 v_dot4_i32_iu8, both signed). */
-KERNEL ie_gemv_q8q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
-                  const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
-                  G u32 *count) {
-  const u32 r = ie_gemv_row(wgid(), tid() >> 5), l = lane();
+static inline void gemv_q8q8_rows(u32 g, const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                                   const G float *bias, const G float *res) {
+  const u32 r = ie_gemv_row(g, tid() >> 5), l = lane();
   if (r < rows) {
     const G u32 *aw = (const G u32 *)xq;
     const G float *da = (const G float *)(xq + 32u * nb);
@@ -829,6 +833,11 @@ KERNEL ie_gemv_q8q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y
     acc = wave_tree_f(acc);
     if (l == 0u) y[r] = epilogue(acc, r, bias, res);
   }
+}
+KERNEL ie_gemv_q8q8(const G u32 *qw, const G f16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                     G u32 *count) {
+  gemv_q8q8_rows(wgid(), qw, qs, xq, y, rows, nb, bias, res);
   if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
 }
 
@@ -1450,6 +1459,189 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
         if (r < rows) y[t * ys + r] = epilogue(acc[i][j][v], r, bias, res ? res + t * rs : res);
       }
     }
+#undef GK_FETCH_W
+#undef GK_FETCH_X
+#undef GK_STORE_X
+}
+
+static LDS float kx_sa[2][GK_T * GK_KB] __attribute__((aligned(32))); /* ie_gemm_kx: da asum per (token, block) */
+/* ie_gemm_q4kr for MAT_Q4K (kind 3), MAT_Q5K (5: the high bit added to the
+ * nibble bytes) and MAT_IQ4XS (6: the nibbles mapped to the int8 table, the
+ * scale d (ls - 32), no min term), by groups like ie_gexp_t: group e = grid
+ * y (the pairs list[offs[e] .. offs[e + 1]), or 0 .. np - 1), workgroup =
+ * GK_R rows, the pairs GK_T at a time (pair p: Q8 row X + (p / xdiv) xs,
+ * output row Y + p ys, residual res + p rs, bytes). The min term in f32
+ * (not the fp16 WMMA of ie_gemm_q4kr: da asum overflows fp16 for the large
+ * activations of some flint layers). Not bitwise equal to decode (another
+ * order of the float sums). */
+KERNEL ie_gemm_kx(const G u32 *qw0, const G u16 *qs0, const G u8 *X, G u8 *Y, u32 rows, u32 nb, const G u32 *list,
+                  const G u32 *offs, u32 np, u32 qwn, u32 qsn, u32 xs, u32 ys, u32 xdiv, u32 kind, const G u8 *res, u32 rs) {
+  /* nb % GK_KB == 0 (src/hip.c checks): no partial K chunk */
+  const u32 e = tokid(), p0 = list ? offs[e] : 0u, p1 = list ? offs[e + 1u] : np, T = p1 - p0;
+  const u32 rt = wgid(), t0 = tid(), w = t0 >> 5, l = lane();
+  const u32 rbase = rt * GK_R, h = l >> 4, wr = 16u * GK_WI * w;
+  if (T == 0u || rbase >= rows) return; /* the whole workgroup */
+  const G u32 *qw = qw0 + (unsigned long)e * qwn;
+  const G u16 *qs = qs0 + (unsigned long)e * qsn;
+  for (u32 tbase = 0; tbase < T; tbase += GK_T) {
+  /* the pair of token slot tk of this tile: its Q8 row and its output row */
+#define KX_PID(tk_) (list ? list[p0 + (tk_)] : p0 + (tk_))
+  f8 acc[GK_WI][GK_WJ];
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++)
+#pragma unroll
+    for (u32 j = 0; j < GK_WJ; j++) acc[i][j] = (f8)(0.0f);
+  /* the addresses of chunk 0 (rows and tokens past the end are clamped:
+   * computed, not stored); chunk kb0 adds kb0 * 32 bytes (scales: kb0) */
+  const G u8 *wp[GK_WI];
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++) {
+    const u32 r = rbase + wr + 16u * i + (l & 15u);
+    wp[i] = (const G u8 *)qw + (unsigned long)(r < rows ? r : rows - 1u) * nb * 16u; /* the whole 16-byte nibble block */
+  }
+  const G u32 *hwp[GK_WI]; /* Q5_K: the high-bit word of each block of the lane's row */
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++) {
+    const u32 r = rbase + wr + 16u * i + (l & 15u);
+    hwp[i] = qw + ie_q5k_hw(rows, r < rows ? r : rows - 1u, 0u, nb);
+  }
+  const G u8 *xp[GK_T * 8u / NT];
+#pragma unroll
+  for (u32 i = 0; i < GK_T * 8u / NT; i++) {
+    const u32 p = t0 + NT * i, tk = p >> 3, gt = tbase + tk < T ? tbase + tk : T - 1u;
+    xp[i] = X + (unsigned long)(KX_PID(gt) / xdiv) * xs + (p & 7u) * 16u;
+  }
+  const u32 sr = rbase + t0 * 1u; /* scale rows of this thread: 1u consecutive (threads t0 * 1u < GK_R) */
+  const u32 srr = sr < rows ? sr : rows - 1u; /* idle threads: a valid row */
+  const G u16 *swp = qs + (unsigned long)srr * nb;
+  const G f16 *ddp = (const G f16 *)qs + (unsigned long)rows * nb + (unsigned long)srr * (nb >> 3) * 2u;
+  const u32 sxt = tbase + t0 / GK_KB;
+  const G u8 *sxr = X + (unsigned long)(KX_PID(sxt < T ? sxt : T - 1u) / xdiv) * xs;
+  const G float *sxp = (const G float *)(sxr + 32u * nb) + t0 % GK_KB;
+  const G int *sap = (const G int *)(sxr + 36u * nb) + t0 % GK_KB;
+  u32x4 wa[GK_KB][GK_WI], wn[GK_KB][GK_WI]; /* weights: current chunk, next chunk */
+  u32 ha[GK_KB][GK_WI], hn[GK_KB][GK_WI];    /* Q5_K high bits: current, next */
+  u32x4 rx[GK_T * 8u / NT];
+  u16 rsw[GK_KB];
+  f16 rdd[2];
+  float rsx;
+  int rsa; /* asum as loaded: converted at the store, so the fetch does not wait for its loads */
+#define GK_FETCH_W(dst_, hdst_, kb0_)                                                                           \
+  _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++)                                                             \
+    _Pragma("unroll") for (u32 i = 0; i < GK_WI; i++) {                                                         \
+      dst_[k][i] = *(const G u32x4 *)(wp[i] + ((kb0_) + k) * 16u);                                              \
+      hdst_[k][i] = kind == 5u ? hwp[i][(kb0_) + k] : 0u;                                                       \
+    }
+#define GK_FETCH_X(kb0_)                                                                                        \
+  do {                                                                                                          \
+    _Pragma("unroll") for (u32 i = 0; i < GK_T * 8u / NT; i++) rx[i] = *(const G u32x4 *)(xp[i] + (kb0_) * 32u); \
+    _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) rsw[k] = swp[(kb0_) + k];                                 \
+    rdd[0] = ddp[((kb0_) >> 3) * 2u], rdd[1] = ddp[((kb0_) >> 3) * 2u + 1u]; /* GK_KB divides 8: one super-block */ \
+    rsa = t0 < GK_T * GK_KB ? sap[(kb0_)] : 0;                                                                 \
+    rsx = t0 < GK_T * GK_KB ? sxp[(kb0_)] : 0.0f;                                                               \
+  } while (0)
+#define GK_STORE_X(bf_)                                                                                         \
+  do {                                                                                                          \
+    _Pragma("unroll") for (u32 i = 0; i < GK_T * 8u / NT; i++) {                                                \
+      const u32 p = t0 + NT * i;                                                                                \
+      *(LDSP u32x4 *)(gk_x[bf_] + (p >> 3) * GK_LS + (p & 7u) * 16u) = rx[i];                                   \
+    }                                                                                                           \
+    if (t0 < GK_R) {                                                                                            \
+      hk4 mh_;                                                                                                  \
+      _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) {                                                       \
+        gk_sw[bf_][k * GK_R + t0] = kind == 6u ? (float)rdd[0] * (float)((int)(rsw[k] & 63u) - 32)             \
+                                               : (float)rdd[0] * (float)(rsw[k] & 63u);                         \
+        gk_mw[bf_][k * GK_R + t0] = kind == 6u ? 0.0f : -((float)rdd[1] * (float)(rsw[k] >> 8));               \
+      }                                                                                                         \
+      (void)mh_;                                                                                                \
+    }                                                                                                           \
+    if (t0 < GK_T * GK_KB) kx_sa[bf_][t0] = (float)rsa * rsx;                                                  \
+    if (t0 < GK_T * GK_KB) gk_sx[bf_][t0] = rsx;                                                                \
+  } while (0)
+  GK_FETCH_W(wa, ha, 0u);
+  GK_FETCH_X(0u);
+  GK_STORE_X(0u);
+  barrier();
+  u32 bf = 0;
+#pragma unroll 1
+  for (u32 kb0 = 0; kb0 < nb; kb0 += GK_KB) {
+    const int more = kb0 + GK_KB < nb;
+    if (more) { /* in flight during the math below */
+      GK_FETCH_W(wn, hn, kb0 + GK_KB);
+      GK_FETCH_X(kb0 + GK_KB);
+    }
+    const LDSP u8 *lx = gk_x[bf];
+    const LDSP float *lsw = gk_sw[bf], *lsx = gk_sx[bf];
+    const u32 nk = nb - kb0 < GK_KB ? nb - kb0 : GK_KB; /* = GK_KB; the branch keeps the blocks apart for the scheduler */
+#pragma unroll
+    for (u32 k = 0; k < GK_KB; k++) {
+      if (k >= nk) break;
+      u32x4 b[GK_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GK_WJ; j++) b[j] = *(const LDSP u32x4 *)(lx + (16u * j + (l & 15u)) * GK_LS + k * 32u + 16u * h);
+      const v8i zm = (v8i)(0x4B400000); /* see ie_gemm_q8 */
+      float dx[GK_WJ];
+#pragma unroll
+      for (u32 j = 0; j < GK_WJ; j++) dx[j] = lsx[(16u * j + (l & 15u)) * GK_KB + k];
+#pragma unroll
+      for (u32 i = 0; i < GK_WI; i++) { /* one row tile at a time (fewer registers) */
+        v8i c[GK_WJ];
+        /* lane half h: weights 16 h .. 16 h + 15 = the low (h = 0) or high nibbles of the 16 bytes */
+        u32x4 nb4 = h ? (wa[k][i] >> 4) & 0x0F0F0F0Fu : wa[k][i] & 0x0F0F0F0Fu;
+        if (kind == 5u) { /* Q5_K: bit 4 of weights 16 h + 4 c .. + 3 */
+          const u32 hb = ha[k][i] >> (16u * h);
+          nb4.x |= ie_spread4(hb) << 4u, nb4.y |= ie_spread4(hb >> 4u) << 4u;
+          nb4.z |= ie_spread4(hb >> 8u) << 4u, nb4.w |= ie_spread4(hb >> 12u) << 4u;
+        } else if (kind == 6u) { /* IQ4_XS: the int8 table values */
+          nb4.x = ie_iq4_map(nb4.x), nb4.y = ie_iq4_map(nb4.y), nb4.z = ie_iq4_map(nb4.z), nb4.w = ie_iq4_map(nb4.w);
+        }
+        const v2i a0 = {(int)nb4.x, (int)nb4.y}, a1 = {(int)nb4.z, (int)nb4.w};
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) {
+          const v2i b0 = {(int)b[j].x, (int)b[j].y};
+          c[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a0, 1, b0, zm, 0);
+        }
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) {
+          const v2i b1 = {(int)b[j].z, (int)b[j].w};
+          c[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(1, a1, 1, b1, c[j], 0);
+        }
+        const f8 sw = *(const LDSP f8 *)(lsw + k * GK_R + wr + 16u * i + 8u * h);
+#pragma unroll
+        for (u32 j = 0; j < GK_WJ; j++) acc[i][j] += (sw * dx[j]) * (__builtin_bit_cast(f8, c[j]) - 12582912.0f); /* (da d sc) dq */
+        if (kind != 6u) { /* the min term in f32: - (dmin mn) (da asum) (fp16 overflows for large activations) */
+          const f8 mw = *(const LDSP f8 *)(gk_mw[bf] + k * GK_R + wr + 16u * i + 8u * h);
+#pragma unroll
+          for (u32 j = 0; j < GK_WJ; j++) acc[i][j] += mw * kx_sa[bf][(16u * j + (l & 15u)) * GK_KB + k];
+        }
+      }
+      __builtin_amdgcn_sched_barrier(0); /* keep the blocks apart: the scheduler otherwise overlaps them and spills */
+    }
+    if (more) GK_STORE_X(bf ^ 1u); /* nobody reads that buffer in this chunk */
+    lbarrier();
+    bf ^= 1u;
+#pragma unroll
+    for (u32 k = 0; k < GK_KB; k++)
+#pragma unroll
+      for (u32 i = 0; i < GK_WI; i++) wa[k][i] = wn[k][i], ha[k][i] = hn[k][i];
+  }
+#pragma unroll
+  for (u32 i = 0; i < GK_WI; i++)
+#pragma unroll
+    for (u32 j = 0; j < GK_WJ; j++) {
+      const u32 t = tbase + 16u * j + (l & 15u);
+      if (t >= T) continue;
+      const u32 pid = KX_PID(t);
+      G float *yr = (G float *)(Y + (unsigned long)pid * ys);
+      const G float *rr = res ? (const G float *)(res + (unsigned long)pid * rs) : 0;
+      for (u32 v = 0; v < 8u; v++) {
+        const u32 r = rbase + wr + 16u * i + 8u * h + v;
+        if (r < rows) yr[r] = epilogue(acc[i][j][v], r, 0, rr);
+      }
+    }
+  barrier(); /* the next token tile reuses the LDS buffers */
+  }
+#undef KX_PID
 #undef GK_FETCH_W
 #undef GK_FETCH_X
 #undef GK_STORE_X
@@ -3377,8 +3569,10 @@ KERNEL ie_attn_pfg(const G float *q, const G kvt *kc, const G kvt *vc, G float *
 static LDS f16 fa_k[FA_NB * FA_KS];
 static LDS f16 fa_vt[FA_DC * FA_VS];
 static LDS f16 fa_p[8u][16u * FA_VS];
-KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
-                  u32 n_kv, const G float *gate, u32 gstride, u32 qs, u32 os, u32 gs, u32 T) {
+static inline __attribute__((always_inline)) void attn_fa_body(const G float *q, const G kvt *kc, const G kvt *vc, G float *out,
+                                                              u32 pos0, u32 hd, u32 n_head, u32 n_kv, const G float *gate,
+                                                              u32 gstride, u32 qs, u32 os, u32 gs, u32 T, const int sw, u32 win,
+                                                              u32 len, const G float *sinks) {
   const u32 ntile = (T + 15u) / 16u, nparts = (hd + FA_DC - 1u) / FA_DC;
   const u32 tile = wgid() % ntile, part = (wgid() / ntile) % nparts, kh = wgid() / (ntile * nparts), t0 = 16u * tile;
   const u32 ga = n_head / n_kv, kvd = n_kv * hd, w = tid() >> 5, l = lane(), hl = l >> 4, rl = l & 15u;
@@ -3401,19 +3595,21 @@ KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *o
   for (u32 nt = 0; nt < FA_DC / 16u; nt++) o[nt] = zero;
   for (u32 v = 0; v < 8u; v++) m[v] = -__builtin_inff(), ls[v] = 0.0f;
   const u32 h4 = hd >> 2, n4 = FA_NB * h4, c4 = nc >> 2; /* float4 per key row, per block; of the part */
-  for (u32 kb = 0; kb < kend; kb += FA_NB) {
+  /* sw (flint): a window of win keys (win 0: all), key p in row p % len, sinks */
+  const u32 kbeg = sw && win && pos0 + t0 + 1u > win ? pos0 + t0 + 1u - win : 0u;
+  for (u32 kb = kbeg; kb < kend; kb += FA_NB) {
     /* K (all of hd) and V (the part's columns) of keys kb .. kb + 31 to LDS (fp16); keys >= kend as zeros */
     for (u32 i4 = tid(); i4 < n4; i4 += NT) {
       const u32 r = i4 / h4, e4 = i4 - r * h4, p = kb + r;
       f32x4 kv = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};
-      if (p < kend) kv = KV4(kc, ((unsigned long)p * kvd + kh * hd) / 4u + e4);
+      if (p < kend) kv = KV4(kc, ((unsigned long)(sw ? p % len : p) * kvd + kh * hd) / 4u + e4);
       LDSP f16 *kd = fa_k + r * FA_KS + 4u * e4;
       kd[0] = (f16)kv.x, kd[1] = (f16)kv.y, kd[2] = (f16)kv.z, kd[3] = (f16)kv.w;
     }
     for (u32 i4 = tid(); i4 < FA_NB * c4; i4 += NT) {
       const u32 r = i4 / c4, e4 = i4 - r * c4, p = kb + r;
       f32x4 vv = (f32x4){0.0f, 0.0f, 0.0f, 0.0f};
-      if (p < kend) vv = KV4(vc, ((unsigned long)p * kvd + kh * hd + c0) / 4u + e4);
+      if (p < kend) vv = KV4(vc, ((unsigned long)(sw ? p % len : p) * kvd + kh * hd + c0) / 4u + e4);
       fa_vt[(4u * e4 + 0u) * FA_VS + r] = (f16)vv.x;
       fa_vt[(4u * e4 + 1u) * FA_VS + r] = (f16)vv.y;
       fa_vt[(4u * e4 + 2u) * FA_VS + r] = (f16)vv.z;
@@ -3439,12 +3635,15 @@ KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *o
       for (u32 v = 0; v < 8u; v++) {
         const u32 tp = pos0 + t0 + 8u * hl + v; /* this row's position */
         const u32 k0 = kb + rl, k1 = kb + 16u + rl;
-        const float s0 = k0 <= tp ? s[0][v] : -__builtin_inff(), s1 = k1 <= tp ? s[1][v] : -__builtin_inff();
+        const int v0 = k0 <= tp && (!sw || !win || k0 + win > tp), v1 = k1 <= tp && (!sw || !win || k1 + win > tp);
+        const float s0 = v0 ? s[0][v] : -__builtin_inff(), s1 = v1 ? s[1][v] : -__builtin_inff();
         float rm = __builtin_fmaxf(s0, s1);
         for (u32 x = 1u; x < 16u; x <<= 1) rm = __builtin_fmaxf(rm, shfl_xor_f(rm, x)); /* the 16 lanes of the row */
         const float mn = __builtin_fmaxf(m[v], rm);
-        c[v] = __builtin_expf(m[v] - mn);
-        const float p0 = __builtin_expf(s0 - mn), p1 = __builtin_expf(s1 - mn);
+        /* sw: a row may have no key yet (its window starts later): then 0, not exp(-inf + inf) */
+        const float mz = sw && mn == -__builtin_inff() ? 0.0f : mn;
+        c[v] = __builtin_expf(m[v] - mz);
+        const float p0 = __builtin_expf(s0 - mz), p1 = __builtin_expf(s1 - mz);
         ls[v] = ls[v] * c[v] + p0 + p1;
         m[v] = mn;
         LDSP f16 *pr = fa_p[w] + (8u * hl + v) * FA_VS;
@@ -3472,6 +3671,7 @@ KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *o
     for (u32 v = 0; v < 8u; v++) {
       float x = ls[v];
       for (u32 s = 1u; s < 16u; s <<= 1) x += shfl_xor_f(x, s);
+      if (sw && sinks) x += __builtin_expf(sinks[h] - m[v]); /* the sink: in the denominator only */
       inv[v] = 1.0f / x;
     }
 #pragma unroll
@@ -3486,6 +3686,16 @@ KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *o
       }
     }
   }
+}
+KERNEL ie_attn_fa(const G float *q, const G kvt *kc, const G kvt *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
+                  u32 n_kv, const G float *gate, u32 gstride, u32 qs, u32 os, u32 gs, u32 T) {
+  attn_fa_body(q, kc, vc, out, pos0, hd, n_head, n_kv, gate, gstride, qs, os, gs, T, 0, 0u, 1u, 0);
+}
+/* ie_attn_fa for flint prompt chunks: keys in a window of win (0: all), key
+ * p in row p % len of kc, vc (a ring), sinks[h] in the denominator (or NULL). */
+KERNEL ie_attn_fa_sw(const G float *q, const G kvt *kc, const G kvt *vc, G float *out, u32 pos0, u32 hd, u32 n_head,
+                     u32 n_kv, u32 qs, u32 os, u32 T, u32 win, u32 len, const G float *sinks) {
+  attn_fa_body(q, kc, vc, out, pos0, hd, n_head, n_kv, 0, 0u, qs, os, 0u, T, 1, win, len, sinks);
 }
 
 /* ie_attn_fa with S computed once (hd == 256): workgroup (kh, tile) = KV
@@ -3822,4 +4032,833 @@ KERNEL ie_topk_merge(const G float *cv, const G u32 *ci, u32 nc, u32 K, G float 
   for (u32 p = tid(); p < nc; p += NT) tk_v[p] = cv[(unsigned long)r * nc + p], tk_i[p] = ci[(unsigned long)r * nc + p];
   lbarrier();
   tk_select(nc, K, ov + (unsigned long)r * K, oi + (unsigned long)r * K);
+}
+
+/* ------------------------------------------------------------------ flint */
+/* Recursive flint (src/model.h ARCH_FLINT): the weight kinds MAT_Q5K and
+ * MAT_IQ4XS (core/ie_ext.h: tested, not proved), the MoE ops, and attention
+ * with a sliding window (a KV ring) and learned sinks. One token per launch
+ * (decode); the CPU backend (cpu.c) does the same arithmetic in the same
+ * order (expf and the reductions round differently on the two). */
+
+/* MAT_Q5K: as gemv_q4kq8_rows, with dq = ie_q5k_dot (q = 0..31). */
+static inline void gemv_q5kq8_rows(u32 g, const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows,
+                                   u32 nb, const G float *bias, const G float *res) {
+#pragma clang fp contract(off)
+  const u32 r = ie_gemv_row(g, tid() >> 5), l = lane();
+  if (r < rows) {
+    const G u32 *aw = (const G u32 *)xq;
+    const G float *da = (const G float *)(xq + 32u * nb);
+    const G u32 *asum = (const G u32 *)(xq + 36u * nb);
+    const G u16 *smr = qs + ie_q4k_sm(r, 0u, nb);
+    const G f16 *ddr = (const G f16 *)qs + ie_q4k_dd(rows, r, 0u, nb);
+    const G u32 *hwr = qw + ie_q5k_hw(rows, r, 0u, nb);
+    float acc = 0.0f;
+    for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
+      u32x4 w4[GEMV_U], a0[GEMV_U], a1[GEMV_U];
+      u32 hb[GEMV_U], sm[GEMV_U], as[GEMV_U];
+      float dv[GEMV_U], mv[GEMV_U], dav[GEMV_U];
+      int ok[GEMV_U];
+      for (u32 k = 0; k < GEMV_U; k++) {
+        ok[k] = ie_lane_blk(l, t + k) < nb;
+        const u32 b = ok[k] ? ie_lane_blk(l, t + k) : ie_lane_blk(l, t);
+        w4[k] = *(const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb));
+        hb[k] = hwr[b];
+        a0[k] = *(const G u32x4 *)(aw + b * 8u);
+        a1[k] = *(const G u32x4 *)(aw + b * 8u + 4u);
+        sm[k] = smr[b];
+        dv[k] = (float)ddr[(b >> 3) * 2u], mv[k] = (float)ddr[(b >> 3) * 2u + 1u];
+        as[k] = asum[b], dav[k] = da[b];
+      }
+      for (u32 k = 0; k < GEMV_U; k++) {
+        const u32 wq[4] = {w4[k].x, w4[k].y, w4[k].z, w4[k].w};
+        const u32 av[8] = {a0[k].x, a0[k].y, a0[k].z, a0[k].w, a1[k].x, a1[k].y, a1[k].z, a1[k].w};
+        const Mem qm = {wq}, am = {av};
+        const int dq = (int)ie_q5k_dot(qm, 0u, hb[k], am, 0u);
+        const float sc = dv[k] * (float)(sm[k] & 63u), mm = mv[k] * (float)(sm[k] >> 8);
+        const float x = dav[k] * (float)(int)as[k];
+        const float a1v = __builtin_fmaf(sc * (float)dq, dav[k], acc), a2 = __builtin_fmaf(-mm, x, a1v);
+        acc = ok[k] ? a2 : acc;
+      }
+    }
+    acc = wave_tree_f(acc);
+    if (l == 0u) y[r] = epilogue(acc, r, bias, res);
+  }
+}
+KERNEL ie_gemv_q5kq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                     const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                     G u32 *count) {
+  gemv_q5kq8_rows(wgid(), qw, qs, xq, y, rows, nb, bias, res);
+  if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
+}
+
+/* MAT_IQ4XS: dq = ie_iq4_dot (the table values), acc = fma(d (ls - 32) dq, da, acc). */
+static inline void gemv_iq4xsq8_rows(u32 g, const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows,
+                                     u32 nb, const G float *bias, const G float *res) {
+#pragma clang fp contract(off)
+  const u32 r = ie_gemv_row(g, tid() >> 5), l = lane();
+  if (r < rows) {
+    const G u32 *aw = (const G u32 *)xq;
+    const G float *da = (const G float *)(xq + 32u * nb);
+    const G u16 *smr = qs + ie_q4k_sm(r, 0u, nb);
+    const G f16 *ddr = (const G f16 *)qs + ie_q4k_dd(rows, r, 0u, nb);
+    float acc = 0.0f;
+    for (u32 t = 0; ie_lane_blk(l, t) < nb; t += GEMV_U) {
+      u32x4 w4[GEMV_U], a0[GEMV_U], a1[GEMV_U];
+      u32 sm[GEMV_U];
+      float dv[GEMV_U], dav[GEMV_U];
+      int ok[GEMV_U];
+      for (u32 k = 0; k < GEMV_U; k++) {
+        ok[k] = ie_lane_blk(l, t + k) < nb;
+        const u32 b = ok[k] ? ie_lane_blk(l, t + k) : ie_lane_blk(l, t);
+        w4[k] = *(const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb));
+        a0[k] = *(const G u32x4 *)(aw + b * 8u);
+        a1[k] = *(const G u32x4 *)(aw + b * 8u + 4u);
+        sm[k] = smr[b];
+        dv[k] = (float)ddr[(b >> 3) * 2u];
+        dav[k] = da[b];
+      }
+      for (u32 k = 0; k < GEMV_U; k++) {
+        const u32 wq[4] = {w4[k].x, w4[k].y, w4[k].z, w4[k].w};
+        const u32 av[8] = {a0[k].x, a0[k].y, a0[k].z, a0[k].w, a1[k].x, a1[k].y, a1[k].z, a1[k].w};
+        const Mem qm = {wq}, am = {av};
+        const int dq = (int)ie_iq4_dot(qm, 0u, am, 0u);
+        const float sc = dv[k] * (float)((int)(sm[k] & 63u) - 32);
+        const float a1v = __builtin_fmaf(sc * (float)dq, dav[k], acc);
+        acc = ok[k] ? a1v : acc;
+      }
+    }
+    acc = wave_tree_f(acc);
+    if (l == 0u) y[r] = epilogue(acc, r, bias, res);
+  }
+}
+KERNEL ie_gemv_iq4xsq8(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb,
+                       const G float *bias, const G float *res, const G float *nw, G float *ny, G u8 *nq, float eps,
+                       G u32 *count) {
+  gemv_iq4xsq8_rows(wgid(), qw, qs, xq, y, rows, nb, bias, res);
+  if (nw) gemv_norm_tail(y, rows, nw, ny, nq, eps, count);
+}
+
+/* The GEMVs of the chosen experts, one launch: grid x = the row groups of
+ * one expert, grid y = slot s < K. Expert e = route[s]; its arrays start at
+ * e qwn words, e qsn entries; input xq + s astr, output y + s bstr (bytes).
+ * kind: MAT_Q8 (2), MAT_Q4K (3), MAT_Q6K (4), MAT_Q5K (5), MAT_IQ4XS (6) (src/model.h). */
+/* The sum of the 16 lanes of each half of a wave (lanes 0 and 16 hold it):
+ * the steps 2 to 5 of wave_tree_f (shuffle down 8, 4, 2, 1 inside each row
+ * of 16). With the other half zero, wave_tree_f gives the same value. */
+static inline float half_tree_f(float v) {
+  v += I2F(shl_i(F2I(v), 8));
+  v += I2F(shl_i(F2I(v), 4));
+  v += I2F(shl_i(F2I(v), 2));
+  v += I2F(shl_i(F2I(v), 1));
+  return v;
+}
+/* gexp_block's arithmetic with the activation words av, scale da and sum asb of block b */
+static inline float gexp_dot(float acc, u32 kind, const G u32 *qw, const G u16 *qs, u32 rows, u32 nb, u32 r, u32 b,
+                             const u32 av[8], float da, u32 asb) {
+#pragma clang fp contract(off)
+  const Mem am = {av};
+  if (kind == 2u) {
+    const G u32 *wp = qw + ie_q8_dst_word(r, b, 0u, nb);
+    const u32x4 w0 = *(const G u32x4 *)wp, w1 = *(const G u32x4 *)(wp + 4u);
+    const u32 wq[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+    const Mem qm = {wq};
+    const float sc = (float)((const G f16 *)qs)[ie_q8_dst_scale(r, b, nb)] * da;
+    return acc + sc * (float)(int)ie_q8q8_block(qm, 0u, am, 0u);
+  }
+  const u32x4 w4 = *(const G u32x4 *)(qw + ie_q4_dst_word(r, b, 0u, nb));
+  const u32 wq[4] = {w4.x, w4.y, w4.z, w4.w};
+  const Mem qm = {wq};
+  if (kind == 4u) {
+    const u32 hb = ie_q6k_hw(rows, r, b, 0u, nb), hq[2] = {qw[hb], qw[hb + 1u]};
+    const Mem hm = {hq};
+    const int d0 = (int)ie_q6k_dots(qm, 0u, hm, 0u, am, 0u, 0u), d1 = (int)ie_q6k_dots(qm, 0u, hm, 1u, am, 0u, 1u);
+    const u32 sc = qs[ie_q6k_sc(r, b, nb)];
+    const float dv = (float)((const G f16 *)qs)[ie_q6k_d(rows, r, b, nb)];
+    const float s0 = dv * (float)(int)(signed char)(sc & 255u), s1 = dv * (float)(int)(signed char)(sc >> 8);
+    return __builtin_fmaf(__builtin_fmaf(s1, (float)d1, s0 * (float)d0), da, acc);
+  }
+  const u32 sm = qs[ie_q4k_sm(r, b, nb)];
+  const float dv = (float)((const G f16 *)qs)[ie_q4k_dd(rows, r, b, nb)];
+  if (kind == 6u) { /* IQ4_XS */
+    const int dq = (int)ie_iq4_dot(qm, 0u, am, 0u);
+    const float sc = dv * (float)((int)(sm & 63u) - 32);
+    return __builtin_fmaf(sc * (float)dq, da, acc);
+  }
+  /* Q4_K (3), Q5_K (5) */
+  const int dq = kind == 5u ? (int)ie_q5k_dot(qm, 0u, qw[ie_q5k_hw(rows, r, b, nb)], am, 0u) : (int)ie_q4k_dot(qm, 0u, am, 0u);
+  const float mv = (float)((const G f16 *)qs)[ie_q4k_dd(rows, r, b, nb) + 1u];
+  const float sc = dv * (float)(sm & 63u), mm = mv * (float)(sm >> 8);
+  const float xa = da * (float)(int)asb;
+  return __builtin_fmaf(-mm, xa, __builtin_fmaf(sc * (float)dq, da, acc));
+}
+/* acc after block b of row r of an expert matrix of the given kind against
+ * the Q8 activations x, in the arithmetic and order of the row functions. */
+static inline float gexp_block(float acc, u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, u32 rows, u32 nb, u32 r, u32 b) {
+  const G u32 *aw = (const G u32 *)x;
+  const float da = ((const G float *)(x + 32u * nb))[b];
+  const u32x4 a0 = *(const G u32x4 *)(aw + b * 8u), a1 = *(const G u32x4 *)(aw + b * 8u + 4u);
+  const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+  const u32 asb = kind == 3u || kind == 5u ? ((const G u32 *)(x + 36u * nb))[b] : 0u;
+  return gexp_dot(acc, kind, qw, qs, rows, nb, r, b, av, da, asb);
+}
+/* the same, the activations in LDS */
+static inline float gexp_block_l(float acc, u32 kind, const G u32 *qw, const G u16 *qs, const LDSP u8 *x, u32 rows, u32 nb, u32 r, u32 b) {
+  const LDSP u32 *aw = (const LDSP u32 *)x;
+  const float da = ((const LDSP float *)(x + 32u * nb))[b];
+  const u32x4 a0 = *(const LDSP u32x4 *)(aw + b * 8u), a1 = *(const LDSP u32x4 *)(aw + b * 8u + 4u);
+  const u32 av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+  const u32 asb = kind == 3u || kind == 5u ? ((const LDSP u32 *)(x + 36u * nb))[b] : 0u;
+  return gexp_dot(acc, kind, qw, qs, rows, nb, r, b, av, da, asb);
+}
+
+/* nb <= 16 (the expert down matrices: 512 columns): two rows per wave, one
+ * per half (lane & 15: the block); 16 rows per workgroup. Each row's value
+ * is that of the row functions (one block per lane, the same tree). */
+static inline void gexp_half_rows(u32 g, u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, G float *y, u32 rows, u32 nb) {
+  const u32 l = lane(), r = (g * 8u + (tid() >> 5)) * 2u + (l >> 4), b = l & 15u;
+  float v = 0.0f;
+  if (r < rows && b < nb) v = gexp_block(0.0f, kind, qw, qs, x, rows, nb, r, b);
+  v = half_tree_f(v);
+  if ((l & 15u) == 0u && r < rows) y[r] = v;
+}
+
+/* 16 < nb <= 64 (the expert gate/up matrices: 2048 columns): two rows per
+ * wave (16 per workgroup), lane l the blocks l, l + 32 of both; each row's
+ * value as the row functions (the same terms, order and tree). */
+static inline void gexp_two_rows(u32 g, u32 kind, const G u32 *qw, const G u16 *qs, const G u8 *x, G float *y, u32 rows, u32 nb) {
+  const u32 l = lane(), r0 = (g * 8u + (tid() >> 5)) * 2u;
+  if (r0 >= rows) return;
+  const u32 r1 = r0 + 1u < rows ? r0 + 1u : r0;
+  float a0 = 0.0f, a1 = 0.0f;
+  for (u32 t = 0; t < 2u; t++) {
+    const u32 b = ie_lane_blk(l, t);
+    if (b < nb) {
+      a0 = gexp_block(a0, kind, qw, qs, x, rows, nb, r0, b);
+      a1 = gexp_block(a1, kind, qw, qs, x, rows, nb, r1, b);
+    }
+  }
+  a0 = wave_tree_f(a0), a1 = wave_tree_f(a1);
+  if (l == 0u) {
+    y[r0] = a0;
+    if (r0 + 1u < rows) y[r0 + 1u] = a1;
+  }
+}
+
+KERNEL ie_gexp(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y, u32 rows, u32 nb, const G u32 *route, u32 qwn,
+               u32 qsn, u32 astr, u32 bstr, u32 kind, u32 two_off) {
+  const u32 s = tokid(), e = route[s];
+  const G u32 *w = qw + (unsigned long)e * qwn;
+  const G u16 *q = qs + (unsigned long)e * qsn;
+  const G u8 *x = xq + (unsigned long)s * astr;
+  G float *o = (G float *)((G u8 *)y + (unsigned long)s * bstr);
+  if (nb <= 16u) gexp_half_rows(wgid(), kind, w, q, x, o, rows, nb);
+  else if (nb <= 64u && !two_off) gexp_two_rows(wgid(), kind, w, q, x, o, rows, nb);
+  else if (kind == 2u) gemv_q8q8_rows(wgid(), w, (const G f16 *)q, x, o, rows, nb, 0, 0);
+  else if (kind == 3u) gemv_q4kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
+  else if (kind == 4u) gemv_q6kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
+  else if (kind == 5u) gemv_q5kq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
+  else gemv_iq4xsq8_rows(wgid(), w, q, x, o, rows, nb, 0, 0);
+}
+
+/* Prompt chunks: Y = W X for many tokens, by groups (the experts) or one
+ * matrix. Group e = grid y: the pairs list[offs[e] .. offs[e + 1]) (list
+ * NULL: one group, the pairs 0 .. np - 1); pair p reads the Q8 row
+ * X + (p / xdiv) xs and writes the row Y + p ys (bytes), plus the row
+ * res + p rs when res. Workgroup (grid x): GXT_RB rows; the pairs GXT_P at a
+ * time, their Q8 rows copied to LDS once (each row of the workgroup reads
+ * them from there). Per (row, pair) the arithmetic and order of ie_gexp
+ * (nb <= 16: the half-wave rows) or of the row functions (else: one row per
+ * wave, blocks l + 32 t): the values of decode. nb <= GXT_NBMAX. */
+#define GXT_P 8u
+#define GXT_RB 64u
+#ifndef GXT_W
+#define GXT_W 4u /* rows of a wave at a time */
+#endif
+#define GXT_NBMAX 128u
+static LDS u8 gxt_x[GXT_P * GXT_NBMAX * 40u];
+KERNEL ie_gexp_t(const G u32 *qw, const G u16 *qs, const G u8 *X, G u8 *Y, u32 rows, u32 nb, const G u32 *list,
+                 const G u32 *offs, u32 np, u32 qwn, u32 qsn, u32 xs, u32 ys, u32 xdiv, u32 kind, const G u8 *res, u32 rs) {
+  const u32 e = tokid(), l = lane(), wv = tid() >> 5, half = nb <= 16u, xb = 40u * nb, rb = wgid() * GXT_RB;
+  const u32 p0 = list ? offs[e] : 0u, p1 = list ? offs[e + 1u] : np;
+  if (p0 >= p1 || rb >= rows) return; /* the whole workgroup */
+  const G u32 *w = qw + (unsigned long)e * qwn;
+  const G u16 *q = qs + (unsigned long)e * qsn;
+  for (u32 pb = p0; pb < p1; pb += GXT_P) {
+    const u32 nj = p1 - pb < GXT_P ? p1 - pb : GXT_P;
+    u32 pid[GXT_P];
+#pragma unroll
+    for (u32 j = 0; j < GXT_P; j++) {
+      const u32 pj = pb + (j < nj ? j : 0u);
+      pid[j] = list ? list[pj] : pj;
+    }
+    barrier(); /* the previous pairs are done with gxt_x */
+    for (u32 i = tid() * 16u; i < nj * xb; i += NT * 16u) {
+      const u32 j = i / xb, o = i - j * xb;
+      u32 pj = pid[0];
+#pragma unroll
+      for (u32 k = 1; k < GXT_P; k++) pj = j == k ? pid[k] : pj;
+      *(LDSP u32x4 *)(gxt_x + i) = *(const G u32x4 *)(X + (unsigned long)(pj / xdiv) * xs + o);
+    }
+    barrier();
+    /* GXT_W rows of a wave at a time (their weight loads in flight together) */
+    const u32 nit = half ? GXT_RB / 16u : GXT_RB / 8u;
+    for (u32 it = 0; it < nit; it += GXT_W) {
+      u32 r[GXT_W];
+#pragma unroll
+      for (u32 k = 0; k < GXT_W; k++)
+        r[k] = half ? rb + (wv + 8u * (it + k)) * 2u + (l >> 4) : rb + wv + 8u * (it + k);
+      if ((half ? r[0] & ~1u : r[0]) >= rows) break; /* the whole wave */
+      float acc[GXT_W][GXT_P];
+#pragma unroll
+      for (u32 k = 0; k < GXT_W; k++)
+#pragma unroll
+        for (u32 j = 0; j < GXT_P; j++) acc[k][j] = 0.0f;
+      if (half) {
+        const u32 b = l & 15u;
+        if (b < nb)
+#pragma unroll
+          for (u32 k = 0; k < GXT_W; k++)
+            if (r[k] < rows)
+#pragma unroll
+              for (u32 j = 0; j < GXT_P; j++)
+                if (j < nj) acc[k][j] = gexp_block_l(0.0f, kind, w, q, gxt_x + j * xb, rows, nb, r[k], b);
+#pragma unroll
+        for (u32 k = 0; k < GXT_W; k++)
+#pragma unroll
+          for (u32 j = 0; j < GXT_P; j++) acc[k][j] = half_tree_f(acc[k][j]);
+      } else {
+        for (u32 t = 0; ie_lane_blk(l, t) < nb; t++)
+#pragma unroll
+          for (u32 k = 0; k < GXT_W; k++)
+            if (r[k] < rows)
+#pragma unroll
+              for (u32 j = 0; j < GXT_P; j++)
+                if (j < nj) acc[k][j] = gexp_block_l(acc[k][j], kind, w, q, gxt_x + j * xb, rows, nb, r[k], ie_lane_blk(l, t));
+#pragma unroll
+        for (u32 k = 0; k < GXT_W; k++)
+#pragma unroll
+          for (u32 j = 0; j < GXT_P; j++) acc[k][j] = wave_tree_f(acc[k][j]);
+      }
+#pragma unroll
+      for (u32 k = 0; k < GXT_W; k++)
+        if ((l & (half ? 15u : 31u)) == 0u && r[k] < rows)
+#pragma unroll
+          for (u32 j = 0; j < GXT_P; j++)
+            if (j < nj) {
+              const G float *rr = res ? (const G float *)(res + (unsigned long)pid[j] * rs) : 0;
+              ((G float *)(Y + (unsigned long)pid[j] * ys))[r[k]] = epilogue(acc[k][j], r[k], 0, rr);
+            }
+    }
+  }
+}
+
+/* The pairs of a prompt chunk by expert: pair p = t K + k (token t, choice
+ * k) with expert route_t[k] (route_t = route + t rst bytes). offs[e] .. offs[e
+ * + 1]: the list entries of expert e, in pair order (one workgroup: the
+ * counts in LDS, then thread 0 places the pairs in order from LDS). */
+#define MS_MAXP 4096u /* pairs per chunk (src/hip.c checks) */
+static LDS u32 ms_cnt[1024];
+static LDS unsigned short ms_id[MS_MAXP];
+KERNEL ie_moe_sort(const G u32 *route, u32 rst, u32 T, u32 K, u32 n_exp, G u32 *offs, G u32 *list) {
+  const u32 t = tid(), np = T * K;
+  for (u32 e = t; e < n_exp; e += NT) ms_cnt[e] = 0u;
+  barrier();
+  for (u32 p = t; p < np; p += NT) {
+    const u32 e = ((const G u32 *)((const G u8 *)route + (unsigned long)(p / K) * rst))[p % K];
+    ms_id[p] = (unsigned short)e;
+    __atomic_fetch_add(&ms_cnt[e], 1u, __ATOMIC_RELAXED);
+  }
+  barrier();
+  if (t == 0u) { /* exclusive prefix sum, then the pairs in order (stable), from LDS */
+    u32 a = 0u;
+    for (u32 e = 0; e < n_exp; e++) {
+      const u32 c = ms_cnt[e];
+      offs[e] = a, ms_cnt[e] = a, a += c;
+    }
+    offs[n_exp] = a;
+    for (u32 p = 0; p < np; p++) list[ms_cnt[ms_id[p]]++] = p;
+  }
+}
+
+/* Routing (wave 0 alone, no LDS, few registers: the megakernel; n <= 1024
+ * experts, K <= 16 <= 32): s = sigmoid(logit); the K largest s + bias, one
+ * at a time (ties: the smaller index); out = [K ids | K weights], weight k =
+ * s_k / (sum of the K s + 1e-20) * scale, the sum in the order of the choice
+ * (as moe_route in cpu.c). Lane l owns the experts l + 32 j (bit j of its
+ * used mask); each round computes their sigmoids again; lane k keeps choice k. */
+/* The wave maximum (any sign; v of every lane), in every lane: DPP inside
+ * each row of 16 (a lane past the row keeps its own value), then the two rows. */
+static inline float wave_max_any(float v) {
+  v = __builtin_fmaxf(v, I2F(__builtin_amdgcn_update_dpp(F2I(v), F2I(v), 0x108, 0xF, 0xF, false)));
+  v = __builtin_fmaxf(v, I2F(__builtin_amdgcn_update_dpp(F2I(v), F2I(v), 0x104, 0xF, 0xF, false)));
+  v = __builtin_fmaxf(v, I2F(__builtin_amdgcn_update_dpp(F2I(v), F2I(v), 0x102, 0xF, 0xF, false)));
+  v = __builtin_fmaxf(v, I2F(__builtin_amdgcn_update_dpp(F2I(v), F2I(v), 0x101, 0xF, 0xF, false)));
+  return __builtin_fmaxf(I2F(__builtin_amdgcn_readlane(F2I(v), 0)), I2F(__builtin_amdgcn_readlane(F2I(v), 16)));
+}
+static inline u32 wave_min_u(u32 v) {
+  u32 t;
+  t = (u32)__builtin_amdgcn_update_dpp((int)v, (int)v, 0x108, 0xF, 0xF, false), v = t < v ? t : v;
+  t = (u32)__builtin_amdgcn_update_dpp((int)v, (int)v, 0x104, 0xF, 0xF, false), v = t < v ? t : v;
+  t = (u32)__builtin_amdgcn_update_dpp((int)v, (int)v, 0x102, 0xF, 0xF, false), v = t < v ? t : v;
+  t = (u32)__builtin_amdgcn_update_dpp((int)v, (int)v, 0x101, 0xF, 0xF, false), v = t < v ? t : v;
+  const u32 a = (u32)__builtin_amdgcn_readlane((int)v, 0), b = (u32)__builtin_amdgcn_readlane((int)v, 16);
+  return a < b ? a : b;
+}
+/* ie_moe_route for n <= 256: lane l keeps the sigmoids (and choice values) of
+ * its 8 experts l + 32 j; per round the largest choice value (wave_max_any),
+ * then the smallest index that has it (wave_min_u): the same choice and the
+ * same sum order as the general form. */
+static inline void moe_route8(const G float *lg, u32 n, u32 K, const G float *bias, float scale, G u32 *out) {
+  const u32 l = lane();
+  float sg[8], c[8];
+  for (u32 j = 0; j < 8u; j++) {
+    const u32 i = l + 32u * j;
+    sg[j] = i < n ? 1.0f / (1.0f + __builtin_expf(-lg[i])) : 0.0f;
+    c[j] = i < n ? (bias ? sg[j] + bias[i] : sg[j]) : -__builtin_inff();
+  }
+  u32 myid = 0u;
+  float myw = 0.0f, sum = 0.0f;
+  for (u32 k = 0; k < K; k++) {
+    float bv = -__builtin_inff();
+    for (u32 j = 0; j < 8u; j++) bv = __builtin_fmaxf(bv, c[j]);
+    const float M = wave_max_any(bv);
+    u32 bi = 0xFFFFFFFFu;
+    for (u32 j = 8u; j-- > 0u;) /* the smallest index of this lane with the maximum */
+      if (c[j] == M) bi = l + 32u * j;
+    bi = wave_min_u(bi);
+    const u32 own = bi & 31u, jj = bi >> 5;
+    float sb = 0.0f;
+    for (u32 j = 0; j < 8u; j++)
+      if (j == jj) {
+        sb = sg[j];
+        if (l == own) c[j] = -__builtin_inff();
+      }
+    sb = I2F(__builtin_amdgcn_readlane(F2I(sb), __builtin_amdgcn_readfirstlane(own)));
+    if (l == k) myid = bi, myw = sb;
+    sum += sb;
+  }
+  const float inv = 1.0f / (sum + 1e-20f);
+  if (l < K) out[l] = myid, ((G float *)out)[K + l] = myw * inv * scale;
+}
+KERNEL ie_moe_route(const G float *lg, u32 n, u32 K, const G float *bias, float scale, G u32 *out, u32 ls, u32 ost) {
+  if (tid() >= 32u) return;
+  lg = TOKC(lg, ls), out = TOK(out, ost); /* token tokid() (grid y) */
+  if (n <= 256u) {
+    moe_route8(lg, n, K, bias, scale, out);
+    return;
+  }
+  const u32 l = lane(), nj = (n + 31u) >> 5;
+  u32 used = 0u, myid = 0u;
+  float myw = 0.0f, sum = 0.0f;
+  for (u32 k = 0; k < K; k++) {
+    float bv = -__builtin_inff(), bs = 0.0f;
+    u32 bi = 0xFFFFFFFFu;
+    for (u32 j = 0; j < nj; j++) { /* the lane's best: its smallest index first */
+      const u32 i = l + 32u * j;
+      if (i < n && !((used >> j) & 1u)) {
+        const float sg = 1.0f / (1.0f + __builtin_expf(-lg[i])), c = bias ? sg + bias[i] : sg;
+        if (better(c, i, bv, bi)) bv = c, bi = i, bs = sg;
+      }
+    }
+    for (u32 m = 16u; m >= 1u; m >>= 1) { /* the wave's best (ties: the smaller index) */
+      const float ov = shfl_xor_f(bv, m), os = shfl_xor_f(bs, m);
+      const u32 oi = (u32)__builtin_amdgcn_ds_bpermute((int)((l ^ m) << 2), (int)bi);
+      if (better(ov, oi, bv, bi)) bv = ov, bi = oi, bs = os;
+    }
+    if ((bi & 31u) == l) used |= 1u << (bi >> 5);
+    if (l == k) myid = bi, myw = bs;
+    sum += bs;
+  }
+  const float inv = 1.0f / (sum + 1e-20f);
+  if (l < K) out[l] = myid, ((G float *)out)[K + l] = myw * inv * scale;
+}
+
+/* out = res + sum over slots k of weight_k y_k (fma, slot order). */
+/* Decode attention, grouped (flint): workgroup kh * nsplit + s does the
+ * G = n_head / n_kv q heads of kv head kh (G <= 8, hd <= 128, hd % 8 == 0)
+ * over the positions p0 + s ch .. (n <= ch <= 256 of them; K/V of position p
+ * in row p % len). One thread per position for the scores (its K row read
+ * once for the G heads, 64 dims of loads together), one wave per head for
+ * the softmax; P V: one thread per dim and position parity, all G heads. One split: the output directly (sinks as ie_attn_sw);
+ * else partial results (M, L, o) per q head and the last workgroup of kv
+ * head kh merges, with the arithmetic of the ie_attn_sw merge. */
+static LDS float ag_q[8][128]; /* q, then the P V sums of the odd positions */
+static LDS float ag_c[8];      /* per pass: the rescale of each head's O and sum */
+typedef kvt ag_kv8 __attribute__((ext_vector_type(8)));
+/* The value of v in a register here: the loads before it, one wait for all
+ * of them (the compiler would wait for each load before its use). */
+#define AG_HOLD(v) __asm__ volatile("" : "+v"(v))
+#define AG_QH (*(LDSP f16(*)[8][128]) & ag_q[0][0])       /* q in f16: hi (fp16 KV) */
+#define AG_QL (*(LDSP f16(*)[8][128]) & ag_q[4][0])       /* and lo */
+_Static_assert(NT * 4u == 8u * 128u, "ie_attn_gq: 4 q values per thread");
+#define AG_SC at_o /* the scores, then the weights: [head][position] */
+KERNEL_CALL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
+                  u32 len, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *sinks) {
+  const u32 kh = wgid() / nsplit, s = wgid() % nsplit, ng = n_head / n_kv, kvd = n_kv * hd, t = tid();
+  const float scale = 1.0f / __builtin_sqrtf((float)hd);
+#ifndef IE_KV_F32
+  /* the scores with WMMA (f16 x f16 -> f32): S^T = Q K^T, Q rows = the heads
+   * (q = hi + lo, two f16, so the products are those of q in f32 to about
+   * 2^-22), K columns = 16 positions. Lane layout as ie_attn_fa: A lane l
+   * head l % 16, dims 8 (l / 16) .. + 7 of the 16 of a step; B lane l the
+   * position l % 16, the same dims; D lane l, v: head 8 (l / 16) + v. */
+#pragma unroll
+  for (u32 x = 0; x < 4u; x++) {
+    const u32 i = t + NT * x, ok = (i >> 7) < ng && (i & 127u) < hd;
+    const float qv = q[ok ? (kh * ng + (i >> 7)) * hd + (i & 127u) : 0u];
+    const f16 hi = ok ? (f16)qv : (f16)0.0f;
+    AG_QH[i >> 7][i & 127u] = hi, AG_QL[i >> 7][i & 127u] = ok ? (f16)(qv - (float)hi) : (f16)0.0f;
+  }
+  barrier();
+  /* the chunk of this split (na <= ch positions) in passes of 256: the
+   * running maximum and sum per head (wave w < ng), O rescaled per pass */
+  const u32 a0 = s * ch, na = a0 + ch < np ? ch : np - a0;
+  float o[8], Mr = -__builtin_inff(), Lr = 0.0f;
+  for (u32 g = 0; g < 8u; g++) o[g] = 0.0f;
+  for (u32 sb = 0; sb < na; sb += 256u) {
+  const u32 n = na - sb < 256u ? na - sb : 256u, r0 = (p0 + a0 + sb) % len;
+  {
+    const u32 l = lane(), rl = l & 15u, hl = l >> 4;
+    const v8f zero = (v8f){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const h8 hz = (h8){0, 0, 0, 0, 0, 0, 0, 0};
+    for (u32 tb = 16u * (t >> 5); tb < n; tb += 128u) { /* 16 positions per wave */
+      const u32 pi = tb + rl < n ? tb + rl : 0u, r = r0 + pi, slot = r < len ? r : r - len;
+      const G kvt *k = kc + (unsigned long)slot * kvd + kh * hd;
+      h8 kb[8];
+#pragma unroll
+      for (u32 st = 0; st < 8u; st++) { /* past hd: dim 0 (q is 0 there) */
+        const u32 c = 16u * st + 8u * hl;
+        kb[st] = *(const G h8 *)(k + (c < hd ? c : 0u));
+      }
+#pragma unroll
+      for (u32 st = 0; st < 8u; st++) AG_HOLD(kb[st]);
+      v8f acc = zero;
+#pragma unroll
+      for (u32 st = 0; st < 8u; st++) {
+        if (16u * st >= hd) break;
+        const u32 c = 16u * st + 8u * hl;
+        const h8 ah = rl < 8u ? *(const LDSP h8 *)(&AG_QH[rl & 7u][c & 127u]) : hz;
+        const h8 al = rl < 8u ? *(const LDSP h8 *)(&AG_QL[rl & 7u][c & 127u]) : hz;
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ah, kb[st], acc);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(al, kb[st], acc);
+      }
+      if (hl == 0u && tb + rl < n)
+#pragma unroll
+        for (u32 v = 0; v < 8u; v++)
+          if (v < ng) AG_SC[v][tb + rl] = acc[v] * scale;
+    }
+  }
+#else
+  { /* zero past the heads and dims: the score loop has constant bounds */
+    float qq[4];
+#pragma unroll
+    for (u32 x = 0; x < 4u; x++) {
+      const u32 i = t + NT * x, ok = (i >> 7) < ng && (i & 127u) < hd;
+      qq[x] = q[ok ? (kh * ng + (i >> 7)) * hd + (i & 127u) : 0u];
+    }
+#pragma unroll
+    for (u32 x = 0; x < 4u; x++) AG_HOLD(qq[x]);
+#pragma unroll
+    for (u32 x = 0; x < 4u; x++) {
+      const u32 i = t + NT * x;
+      ag_q[i >> 7][i & 127u] = (i >> 7) < ng && (i & 127u) < hd ? qq[x] : 0.0f;
+    }
+  }
+  barrier();
+  /* the chunk of this split (na <= ch positions) in passes of 256: the
+   * running maximum and sum per head (wave w < ng), O rescaled per pass */
+  const u32 a0 = s * ch, na = a0 + ch < np ? ch : np - a0;
+  float o[8], Mr = -__builtin_inff(), Lr = 0.0f;
+  for (u32 g = 0; g < 8u; g++) o[g] = 0.0f;
+  for (u32 sb = 0; sb < na; sb += 256u) {
+  const u32 n = na - sb < 256u ? na - sb : 256u, r0 = (p0 + a0 + sb) % len;
+  if (t < n) {
+    const u32 slot = r0 + t < len ? r0 + t : r0 + t - len;
+    const G kvt *k = kc + (unsigned long)slot * kvd + kh * hd;
+    float d[8];
+    for (u32 g = 0; g < 8u; g++) d[g] = 0.0f;
+    for (u32 c0 = 0; c0 < 128u; c0 += 64u) { /* 64 dims of the K row in registers: the loads together */
+      ag_kv8 kk[8];
+#pragma unroll
+      for (u32 x = 0; x < 8u; x++) /* past hd: a valid row (dim 0), q is 0 there */
+        kk[x] = *(const G ag_kv8 *)(k + (c0 + 8u * x < hd ? c0 + 8u * x : 0u));
+#pragma unroll
+      for (u32 x = 0; x < 8u; x++) AG_HOLD(kk[x]);
+#pragma unroll
+      for (u32 x = 0; x < 8u; x++)
+#pragma unroll
+        for (u32 g = 0; g < 8u; g++)
+#pragma unroll
+          for (u32 e = 0; e < 8u; e++) d[g] += ag_q[g][c0 + 8u * x + e] * (float)kk[x][e];
+      if (c0 + 64u >= hd) break;
+    }
+    for (u32 g = 0; g < 8u; g++)
+      if (g < ng) AG_SC[g][t] = d[g] * scale;
+  }
+#endif
+  barrier();
+  const u32 w = t >> 5, l = lane();
+  if (w < ng) { /* one pass (na <= 256): M = the maximum, c = 0, Lr = the sum, as before */
+    float mx = -__builtin_inff();
+    for (u32 i = l; i < n; i += 32u) mx = __builtin_fmaxf(mx, AG_SC[w][i]);
+    mx = wave_max_any(mx);
+    const float M = __builtin_fmaxf(Mr, mx), c = __builtin_expf(Mr - M);
+    float sm = 0.0f;
+    for (u32 i = l; i < n; i += 32u) {
+      const float e = __builtin_expf(AG_SC[w][i] - M);
+      AG_SC[w][i] = e;
+      sm += e;
+    }
+    sm = wave_sum_all(sm);
+    Lr = Lr * c + sm, Mr = M;
+    if (l == 0u) ag_c[w] = c;
+  }
+  barrier();
+  /* P V: thread t the dim t & 127 of all heads, positions of parity t >> 7,
+   * 16 V loads together; then the odd sums through ag_q */
+  const u32 dd = t & 127u, par = t >> 7;
+  if (sb)
+    for (u32 g = 0; g < 8u; g++)
+      if (g < ng) o[g] *= ag_c[g];
+  if (dd < hd) {
+    const G kvt *v = vc + kh * hd + dd;
+    for (u32 i0 = par; i0 < n; i0 += 32u) {
+      kvt vh[16];
+#pragma unroll
+      for (u32 x = 0; x < 16u; x++) { /* past n: a valid row (r0), weight 0 */
+        const u32 i = i0 + 2u * x, r = r0 + (i < n ? i : 0u), slot = r < len ? r : r - len;
+        vh[x] = v[(unsigned long)slot * kvd];
+      }
+#pragma unroll
+      for (u32 x = 0; x < 16u; x++) AG_HOLD(vh[x]);
+#pragma unroll
+      for (u32 x = 0; x < 16u; x++) {
+        const u32 i = i0 + 2u * x, ic = i < n ? i : 0u;
+        const float vv = i < n ? (float)vh[x] : 0.0f;
+#pragma unroll
+        for (u32 g = 0; g < 8u; g++)
+          if (g < ng) o[g] += AG_SC[g][ic] * vv;
+      }
+    }
+  }
+  if (sb + 256u < na) barrier(); /* AG_SC and ag_c: the next pass (the last: the barrier below) */
+  }
+  if (t < 8u * 32u && (t >> 5) < ng && lane() == 0u) at_m[t >> 5] = Mr, at_l[t >> 5] = Lr;
+  const u32 dd = t & 127u, par = t >> 7;
+  barrier(); /* every thread is done with ag_q (the scores) */
+  if (par == 1u && dd < hd)
+    for (u32 g = 0; g < 8u; g++)
+      if (g < ng) ag_q[g][dd] = o[g];
+  barrier();
+  if (par == 1u) { /* the merge below: every thread meets at its barriers */
+    if (nsplit == 1u) return;
+  } else if (dd < hd)
+    for (u32 g = 0; g < 8u; g++)
+      if (g < ng) o[g] += ag_q[g][dd];
+  if (nsplit == 1u) {
+    for (u32 g = 0; g < 8u; g++) { /* constant bounds: o in registers */
+      if (g >= ng) break;
+      const u32 h = kh * ng + g;
+      const float M = at_m[g], sk = sinks ? sinks[h] : -__builtin_inff(), M2 = __builtin_fmaxf(sk, M);
+      const float wt = __builtin_expf(M - M2);
+      float L2 = 0.0f + at_l[g] * wt;
+      if (sinks) L2 += __builtin_expf(sk - M2);
+      if (dd < hd) {
+        const float r = (0.0f + o[g] * wt) / L2;
+        out[h * hd + dd] = r;
+        if (oq) quant_wave(r, (h * hd + dd) >> 5, oq, (n_head * hd) >> 5);
+      }
+    }
+    return;
+  }
+  if (par == 0u)
+    for (u32 g = 0; g < 8u; g++) { /* constant bounds: o in registers */
+      if (g >= ng) break;
+      const u32 h = kh * ng + g;
+      G float *pp = part + (unsigned long)(h * nsplit + s) * (hd + 2u);
+      if (dd < hd) pp[2u + dd] = o[g];
+      if (dd == 0u) pp[0] = at_m[g], pp[1] = at_l[g];
+    }
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  barrier();
+  if (t == 0u) at_last = __atomic_fetch_add(&count[kh], 1u, __ATOMIC_ACQ_REL) == nsplit - 1u;
+  barrier();
+  if (!at_last) return;
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  for (u32 g = 0; g < ng; g++) {
+    const u32 h = kh * ng + g;
+    G float *ph = part + (unsigned long)h * nsplit * (hd + 2u);
+    const float sk = sinks ? sinks[h] : -__builtin_inff();
+    float mv = sk;
+    for (u32 x = t; x < nsplit; x += NT) mv = __builtin_fmaxf(mv, ph[x * (hd + 2u)]);
+    const float M2 = wg_max(mv);
+    float lv = 0.0f;
+    for (u32 x = t; x < nsplit; x += NT) {
+      const float wt = __builtin_expf(ph[x * (hd + 2u)] - M2);
+      ph[x * (hd + 2u)] = wt;
+      lv += ph[x * (hd + 2u) + 1u] * wt;
+    }
+    float L2 = wg_sum(lv);
+    if (sinks) L2 += __builtin_expf(sk - M2);
+    if (t < hd) {
+      float r = 0.0f;
+      for (u32 x = 0; x < nsplit; x++) r += ph[x * (hd + 2u) + 2u + t] * ph[x * (hd + 2u)];
+      r = r / L2;
+      out[h * hd + t] = r;
+      if (oq) quant_wave(r, (h * hd + t) >> 5, oq, (n_head * hd) >> 5);
+    }
+  }
+  if (t == 0u) count[kh] = 0u;
+}
+
+KERNEL ie_moe_sum(const G float *y, G float *out, const G u32 *route, const G float *res, u32 n, u32 K, u32 ys, u32 os,
+                  u32 rts, u32 rs) {
+  const u32 j = wgid() * NT + tid();
+  if (j >= n) return;
+  /* token tokid(): the strides in bytes (grid y; decode: one token) */
+  y = TOKC(y, ys), out = TOK(out, os), route = TOKC(route, rts), res = res ? TOKC(res, rs) : res;
+  const G float *w = (const G float *)(route + K);
+  float acc = 0.0f;
+  for (u32 k = 0; k < K; k++) acc = __builtin_fmaf(w[k], y[(unsigned long)k * n + j], acc);
+  out[j] = res[j] + acc;
+}
+
+/* As ie_qkn_rope_kv, for heads of qstr floats (flint: q heads of hd, no
+ * gate): q head h at qkv + h qstr, key head h at qkv + nq qstr + h hd, value
+ * head h at qkv + nq qstr + nkv hd + h hd. nrot = 0: no RoPE. kc, vc: the
+ * cache rows of this position. One token. */
+KERNEL ie_qkn_rope_kv2(const G float *qkv, G float *qo, G kvt *kc, G kvt *vc, const G float *qw, const G float *kw,
+                       const G float *cs, const G float *sn, u32 nq, u32 nkv, u32 hd, u32 nrot, float eps, u32 qstr,
+                       u32 ins, u32 qos, u32 pos0, u32 len, u32 h2r) {
+  /* token tokid() of a chunk (grid y): position pos0 + tokid(); kc, vc: row 0
+   * of the layer (its K/V in row p % len); cs, sn: the tables (h2r per position) */
+  const u32 g = wgid(), t = tid(), pp = pos0 + tokid();
+  qkv = TOKC(qkv, ins), qo = TOK(qo, qos);
+  kc += (unsigned long)(pp % len) * nkv * hd, vc += (unsigned long)(pp % len) * nkv * hd;
+  cs += (unsigned long)pp * h2r, sn += (unsigned long)pp * h2r;
+  const G float *kb = qkv + nq * qstr;
+  if (g >= nq + nkv) { /* value head */
+    const u32 h = g - nq - nkv;
+    if (t < hd) vc[h * hd + t] = kb[nkv * hd + h * hd + t];
+    return;
+  }
+  const int is_k = g >= nq;
+  const u32 h = is_k ? g - nq : g;
+  const G float *src = is_k ? kb + h * hd : qkv + h * qstr;
+  const G float *w = is_k ? kw : qw;
+  const float x = t < hd ? src[t] : 0.0f;
+  const float ss = wg_sum(x * x);
+  const float y = x * (1.0f / __builtin_sqrtf(ss / (float)hd + eps)) * (t < hd ? w[t] : 0.0f);
+  if (t < hd) qk_buf[t] = y;
+  barrier();
+  float r = y;
+  const u32 h2 = nrot >> 1;
+  if (t < nrot) {
+    const u32 i = t < h2 ? t : t - h2;
+    const float a = qk_buf[i], b = qk_buf[i + h2];
+    r = t < h2 ? a * cs[i] - b * sn[i] : a * sn[i] + b * cs[i];
+  }
+  if (t < hd) {
+    if (is_k) kc[h * hd + t] = (kvt)r;
+    else qo[h * hd + t] = r;
+  }
+}
+
+/* Decode attention over the np positions p0 .. p0 + np - 1 (a window), the
+ * K/V of position p in row p % len of kc, vc (a ring, or len >= all
+ * positions). As ie_attn_split: workgroup h * nsplit + s does the positions
+ * p0 + s ch .. (ch of them) with 8 waves, the last workgroup of head h
+ * merges. sinks (or NULL): logit sinks[h] in the softmax denominator only. */
+KERNEL ie_attn_sw(const G float *q, const G kvt *kc, const G kvt *vc, G float *part, G float *out, u32 p0, u32 np,
+                  u32 len, u32 hd, u32 n_head, u32 n_kv, u32 nsplit, u32 ch, G u32 *count, G u8 *oq, const G float *sinks) {
+  const u32 h = wgid() / nsplit, s = wgid() % nsplit;
+  const u32 kh = h / (n_head / n_kv), kvd = n_kv * hd;
+  const u32 w = tid() >> 5, l = lane();
+  const float scale = 1.0f / __builtin_sqrtf((float)hd);
+  float qv[8], acc[8];
+  for (u32 j = 0; j < 8u; j++) {
+    const u32 i = l + 32u * j;
+    qv[j] = i < hd ? q[h * hd + i] : 0.0f;
+    acc[j] = 0.0f;
+  }
+  float m = -__builtin_inff(), sum = 0.0f;
+  const u32 a0 = s * ch, a1 = a0 + ch < np ? a0 + ch : np;
+  for (u32 a = a0 + w; a < a1; a += 8u) {
+    const u32 slot = (p0 + a) % len;
+    const G kvt *k = kc + (unsigned long)slot * kvd + kh * hd;
+    const G kvt *v = vc + (unsigned long)slot * kvd + kh * hd;
+    float d = 0.0f;
+    for (u32 j = 0; j < 8u; j++)
+      if (l + 32u * j < hd) d += qv[j] * (float)k[l + 32u * j];
+    d = wave_sum_all(d);
+    d *= scale;
+    const float mn = __builtin_fmaxf(m, d), c = __builtin_expf(m - mn), e = __builtin_expf(d - mn);
+    sum = sum * c + e;
+    for (u32 j = 0; j < 8u; j++)
+      if (l + 32u * j < hd) acc[j] = acc[j] * c + e * (float)v[l + 32u * j];
+    m = mn;
+  }
+  if (l == 0u) at_m[w] = m, at_l[w] = sum;
+  for (u32 j = 0; j < 8u; j++)
+    if (l + 32u * j < hd) at_o[w][l + 32u * j] = acc[j];
+  barrier();
+  float M = at_m[0];
+  for (u32 x = 1; x < 8u; x++) M = __builtin_fmaxf(M, at_m[x]);
+  if (nsplit == 1u) { /* one split: the output directly (no partial results,
+                       * no count), with the same arithmetic as the merge below */
+    const float sk = sinks ? sinks[h] : -__builtin_inff(), M2 = __builtin_fmaxf(sk, M);
+    const float wt = __builtin_expf(M - M2);
+    float L = 0.0f;
+    for (u32 x = 0; x < 8u; x++) L += at_m[x] == -__builtin_inff() ? 0.0f : at_l[x] * __builtin_expf(at_m[x] - M);
+    float L2 = 0.0f + L * wt;
+    if (sinks) L2 += __builtin_expf(sk - M2);
+    if (tid() < hd) {
+      float o = 0.0f;
+      for (u32 x = 0; x < 8u; x++) o += at_m[x] == -__builtin_inff() ? 0.0f : at_o[x][tid()] * __builtin_expf(at_m[x] - M);
+      o = (0.0f + o * wt) / L2;
+      out[h * hd + tid()] = o;
+      if (oq) quant_wave(o, (h * hd + tid()) >> 5, oq, (n_head * hd) >> 5);
+    }
+    return;
+  }
+  G float *pp = part + (unsigned long)(h * nsplit + s) * (hd + 2u);
+  if (tid() < hd) {
+    float o = 0.0f;
+    for (u32 x = 0; x < 8u; x++) o += at_m[x] == -__builtin_inff() ? 0.0f : at_o[x][tid()] * __builtin_expf(at_m[x] - M);
+    pp[2u + tid()] = o;
+  }
+  if (tid() == 0u) {
+    float L = 0.0f;
+    for (u32 x = 0; x < 8u; x++) L += at_m[x] == -__builtin_inff() ? 0.0f : at_l[x] * __builtin_expf(at_m[x] - M);
+    pp[0] = M;
+    pp[1] = L;
+  }
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  barrier();
+  if (tid() == 0u) at_last = __atomic_fetch_add(&count[h], 1u, __ATOMIC_ACQ_REL) == nsplit - 1u;
+  barrier();
+  if (!at_last) return;
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  G float *ph = part + (unsigned long)h * nsplit * (hd + 2u);
+  const float sk = sinks ? sinks[h] : -__builtin_inff();
+  float mv = sk;
+  for (u32 t = tid(); t < nsplit; t += NT) mv = __builtin_fmaxf(mv, ph[t * (hd + 2u)]);
+  const float M2 = wg_max(mv);
+  float lv = 0.0f;
+  for (u32 t = tid(); t < nsplit; t += NT) {
+    const float wt = __builtin_expf(ph[t * (hd + 2u)] - M2);
+    ph[t * (hd + 2u)] = wt;
+    lv += ph[t * (hd + 2u) + 1u] * wt;
+  }
+  float L2 = wg_sum(lv);
+  if (sinks) L2 += __builtin_expf(sk - M2);
+  if (tid() < hd) {
+    float o = 0.0f;
+    for (u32 t = 0; t < nsplit; t++) o += ph[t * (hd + 2u) + 2u + tid()] * ph[t * (hd + 2u)];
+    o = o / L2;
+    out[h * hd + tid()] = o;
+    if (oq) quant_wave(o, (h * hd + tid()) >> 5, oq, (n_head * hd) >> 5);
+  }
+  if (tid() == 0u) count[h] = 0u;
 }
