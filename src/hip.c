@@ -1029,7 +1029,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           const u32 grows = gk == K_GEMM_Q8R ? 256u : 128u;
           if ((int)T >= gmin) { /* many tokens: the matrix instruction (WMMA) */
             launch(b, gk, ((rows + grows - 1u) / grows) * ((T + 63u) / 64u), args);
-            if (getenv("IE_GEMM_CHECK")) { /* debug: compare with ie_gemv_q8q8_t, 16 tokens at a time, no bias/residual */
+            if (getenv("IE_GEMM_CHECK") && !bias && !R) { /* debug: compare with ie_gemv_q8q8_t, 16 tokens at a time (not with bias/residual) */
               static float *dev = NULL;
               static size_t cap = 0;
               const size_t need = (size_t)T * ys * 4;
@@ -1058,7 +1058,6 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
                 }
               fprintf(stderr, "gemm check %ux%u T=%u: max |gemm - gemv| / max |gemv| = %.2e\n", rows, o->w->cols, T, mx > 0 ? d / mx : 0);
               free(y1), free(y2);
-              if (bias || R) ie_die("IE_GEMM_CHECK: stop at the first GEMV with bias or residual (the check overwrote its output)");
             }
           } else if ((int)T >= trmin) {
             static unsigned rpw = 0; /* rows per wave of ie_gemv_q8q8_tr (GEMV_R) */
