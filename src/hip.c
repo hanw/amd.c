@@ -194,12 +194,13 @@ typedef struct {
 /* flint chunks: ie_gemm_kx (WMMA) for Q4_K / Q5_K / IQ4_XS when T >= IE_GEMM_MIN
  * (default 17) and nb % 4 == 0; else ie_gexp_t (the arithmetic of decode).
  * IE_GEMM_KX=0: always ie_gexp_t. */
-static int gx_wmma(const gpu_backend *b, u32 T, u32 nb) {
+static int gx_wmma(const gpu_backend *b, u32 T, u32 nb, u32 kind) {
   (void)b;
   static int on = -1, gmin = -1;
-  if (on < 0) on = !(getenv("IE_GEMM_KX") && getenv("IE_GEMM_KX")[0] == '0');
+  if (on < 0) on = getenv("IE_GEMM_KX") ? atoi(getenv("IE_GEMM_KX")) : 1; /* debug: a kind number = only that kind */
   if (gmin < 0) gmin = getenv("IE_GEMM_MIN") ? atoi(getenv("IE_GEMM_MIN")) : 17;
-  return on && (int)T >= gmin && nb % 4u == 0u;
+  return on && (on == 1 || (u32)on == kind) && (int)T >= gmin && nb % 4u == 0u &&
+         (kind == (u32)MAT_Q4K || kind == (u32)MAT_Q5K || kind == (u32)MAT_IQ4XS);
 }
 #define IE_MS_MAXP 4096u /* the pairs (token, choice) of a chunk: kernels/ie_kernels.c MS_MAXP */
 static int gq_use(const gpu_backend *b, uint32_t pos) { return b->attn_gq && pos + 1u >= b->gq_min; }
@@ -1119,7 +1120,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           u32 zero = 0u, one = 1u, kind = (u32)o->w->kind, xs = g->bufs[o->a].stride, ys = g->bufs[o->b].stride,
               rs = o->res >= 0 ? g->bufs[o->res].stride : 0u;
           void *args[] = {&w0, &w1, &A, &B, &rows, &nb, &nul, &nul, &T, &zero, &zero, &xs, &ys, &one, &kind, &R, &rs};
-          if (gx_wmma(b, T, nb)) launch(b, K_GEMM_KX, (rows + 127u) / 128u, args); /* WMMA, GK_R rows per workgroup */
+          if (gx_wmma(b, T, nb, kind) && !getenv("IE_GEMM_KX_NOD")) launch(b, K_GEMM_KX, (rows + 127u) / 128u, args); /* WMMA, GK_R rows per workgroup */
           else {
             if (nb > 128u) ie_die("Q5_K / IQ4_XS GEMV of several tokens: %u blocks per row (at most 128)", nb);
             launch(b, K_GEXP_T, (rows + 63u) / 64u, args); /* GXT_RB rows per workgroup */
@@ -1162,7 +1163,7 @@ static void launch_op(gpu_backend *b, uint32_t i, u32 t, u32 tok, u32 pos, u32 T
           u32 xs = as ? as : at, xdiv = as ? 1u : K, zero = 0u;
           void *nul = NULL;
           void *ta[] = {&w0, &w1, &A, &B, &rows, &nb, &b->ms_list, &b->ms_offs, &zero, &qwn, &qsn, &xs, &bs, &xdiv, &kind, &nul, &zero};
-          if (gx_wmma(b, T, nb) && kind != (u32)MAT_Q8 && kind != (u32)MAT_Q6K)
+          if (gx_wmma(b, T, nb, kind) && !getenv("IE_GEMM_KX_NOE"))
             launch_t(b, K_GEMM_KX, (rows + 127u) / 128u, m->n_exp, ta); /* WMMA, GK_R rows per workgroup */
           else {
             if (nb > 128u) ie_die("expert GEMV of a chunk: %u blocks per row (at most 128)", nb);
