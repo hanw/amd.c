@@ -891,7 +891,7 @@ Q6_K（`MAT_Q6K`）：地址在数组内（`q6k_addr`）、高位打包和解包
 
 **没有测试**：长于 4020 个位置的上下文、Qwen2.5-0.5B 和 1.5B 以外的真实模型、头的大小超过 256 的模型（会走旧的注意力核函数）。
 
-### Flint（Recursive，flint 架构，2026-10-21，GPU 上还没有运行）
+### Flint（Recursive，flint 架构，2026-10-21 起）
 
 模型：[RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint)，混合专家（MoE），共 398 亿参数，每个 token 约 25 亿参数参与计算。
 文件：unsloth/flint-GGUF 的 `flint-preview-UD-Q4_K_XL.gguf`（25.05 GB）。
@@ -916,14 +916,35 @@ Q6_K（`MAT_Q6K`）：地址在数组内（`q6k_addr`）、高位打包和解包
 - 分词器：`make tokcheck-flint FLINT=模型文件`。64 段文本（llama.cpp 的测试文本，加代码、多种文字、表情、数字）与 Hugging Face tokenizers 的结果逐个 token 相同。
 - 聊天模板：`tools/chat_check.py --flint 模板文件 build/chat_render`。8 个请求与 transformers 渲染的文本相同；渲染后的 token 与 Hugging Face 相同。
 
-GPU（`ie_kernels.c` 末尾 flint 部分）：每次一个 token。专家 GEMV 一次启动做 6 个专家（grid y = 专家槽）。
-目前每个算子逐 token 运行（预填充也是），不用大核函数。
+GPU（`ie_kernels.c` 末尾 flint 部分）：
+
+- 解码走 flint 自己的大核函数（`ie_mk_flint.hsaco`、`ie_mk_flintl.hsaco`；只加载模型用到的那一组）。
+  专家 GEMV 一次启动做 6 个专家（`ie_gexp`）；路由在一个 wave 的寄存器里完成（`ie_moe_route`）。
+- 解码注意力 `ie_attn_gq`：一个工作组算一个 KV 头的全部 q 头，K/V 只读一次；分数用 WMMA（q 拆成两个 f16）；
+  一个分段可以有多轮，每轮 256 个位置（在线 softmax），每个 KV 头最多 32 段（`IE_ATTN_GQ_S`）。
+- 预填充按块（默认 512 个 token）：`ie_moe_sort` 把 (token, 专家) 对按专家排序；
+  Q4_K / Q5_K / IQ4_XS 的专家和普通矩阵用分组 WMMA GEMM `ie_gemm_kx`（最小值项用 f32：f16 在第 46 到 48 层溢出）；
+  注意力 `ie_attn_fa_sw`（窗口、环形缓存、sink）。`IE_FLINT_PF=0`：逐 token（调试）。
+
+结果（R9700，UD-Q4_K_XL，wikitext-2 测试集）：
+
+| 项目 | 结果 |
+|---|---|
+| 解码，位置约 16（每秒 token 数） | 170.4（5.87 毫秒/token） |
+| 解码，位置 65436 | 86.1（11.6 毫秒/token） |
+| 解码，位置 130972（`--ctx 131072`） | 65.4（15.3 毫秒/token） |
+| 预填充 4096 个 token | 3718 个/秒 |
+| 预填充 65436 / 130972 个 token | 1775 / 1151 个/秒 |
+| 困惑度，256 个 token：CPU / GPU 逐 token / GPU 按块 | 24.31 / 23.87 / 24.14 |
+| 困惑度，8192 / 65536 / 131000 个 token | 19.63 / 16.05 / 14.35 |
+| 显存（`--ctx 131072`） | 权重 26.57 GB + KV 3.90 GB + 工作区 0.40 GB |
+
+不同算法之间困惑度相差 1% 到 2%（256 个 token 时）。推测原因：路由在接近相等时选了别的专家，误差被放大；评测越长差别越小（8192 个 token 时 0.8%）。
 
 `ie-serve`：flint 用自己的模板（`chat_render_flint`）；遇到 `tokenizer.ggml.eog_token_ids` 中的 token 停止；
 回答以 `<think>` 开始时，`</think>` 之前的文本是 reasoning_content；工具调用格式是
 `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`。
 
-显存估计（引擎的格式 26.3 GB，加 KV 缓存）：上下文 65536 时 28.3 GB，131072 时 30.1 GB。
 
 ## 信任边界
 
