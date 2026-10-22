@@ -4380,8 +4380,9 @@ KERNEL_CALL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G flo
   /* P V: thread t the dim t & 127 of all heads, positions of parity t >> 7,
    * 16 V loads together; then the odd sums through ag_q */
   const u32 dd = t & 127u, par = t >> 7;
-  for (u32 g = 0; g < 8u; g++)
-    if (g < ng) o[g] *= ag_c[g];
+  if (sb)
+    for (u32 g = 0; g < 8u; g++)
+      if (g < ng) o[g] *= ag_c[g];
   if (dd < hd) {
     const G kvt *v = vc + kh * hd + dd;
     for (u32 i0 = par; i0 < n; i0 += 32u) {
@@ -4403,7 +4404,7 @@ KERNEL_CALL ie_attn_gq(const G float *q, const G kvt *kc, const G kvt *vc, G flo
       }
     }
   }
-  barrier(); /* AG_SC and ag_c: the next pass */
+  if (sb + 256u < na) barrier(); /* AG_SC and ag_c: the next pass (the last: the barrier below) */
   }
   if (t < 8u * 32u && (t >> 5) < ng && lane() == 0u) at_m[t >> 5] = Mr, at_l[t >> 5] = Lr;
   const u32 dd = t & 127u, par = t >> 7;
