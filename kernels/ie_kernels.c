@@ -1464,13 +1464,16 @@ KERNEL ie_gemm_q4kr(const G u32 *qw, const G u16 *qs, const G u8 *xq, G float *y
 #undef GK_STORE_X
 }
 
+static LDS float kx_sa[2][GK_T * GK_KB] __attribute__((aligned(32))); /* ie_gemm_kx: da asum per (token, block) */
 /* ie_gemm_q4kr for MAT_Q4K (kind 3), MAT_Q5K (5: the high bit added to the
  * nibble bytes) and MAT_IQ4XS (6: the nibbles mapped to the int8 table, the
  * scale d (ls - 32), no min term), by groups like ie_gexp_t: group e = grid
  * y (the pairs list[offs[e] .. offs[e + 1]), or 0 .. np - 1), workgroup =
  * GK_R rows, the pairs GK_T at a time (pair p: Q8 row X + (p / xdiv) xs,
- * output row Y + p ys, residual res + p rs, bytes). Not bitwise equal to
- * decode (another order of the float sums). */
+ * output row Y + p ys, residual res + p rs, bytes). The min term in f32
+ * (not the fp16 WMMA of ie_gemm_q4kr: da asum overflows fp16 for the large
+ * activations of some flint layers). Not bitwise equal to decode (another
+ * order of the float sums). */
 KERNEL ie_gemm_kx(const G u32 *qw0, const G u16 *qs0, const G u8 *X, G u8 *Y, u32 rows, u32 nb, const G u32 *list,
                   const G u32 *offs, u32 np, u32 qwn, u32 qsn, u32 xs, u32 ys, u32 xdiv, u32 kind, const G u8 *res, u32 rs) {
   /* nb % GK_KB == 0 (src/hip.c checks): no partial K chunk */
@@ -1548,11 +1551,11 @@ KERNEL ie_gemm_kx(const G u32 *qw0, const G u16 *qs0, const G u8 *X, G u8 *Y, u3
       _Pragma("unroll") for (u32 k = 0; k < GK_KB; k++) {                                                       \
         gk_sw[bf_][k * GK_R + t0] = kind == 6u ? (float)rdd[0] * (float)((int)(rsw[k] & 63u) - 32)             \
                                                : (float)rdd[0] * (float)(rsw[k] & 63u);                         \
-        mh_[k] = kind == 6u ? (f16)0.0f : (f16)(-((float)rdd[1] * (float)(rsw[k] >> 8)));                     \
+        gk_mw[bf_][k * GK_R + t0] = kind == 6u ? 0.0f : -((float)rdd[1] * (float)(rsw[k] >> 8));               \
       }                                                                                                         \
-      gk_mh[bf_][t0] = mh_;                                                                                     \
+      (void)mh_;                                                                                                \
     }                                                                                                           \
-    if (t0 < GK_T * GK_KB) ((LDSP f16 *)gk_sh[bf_])[t0] = (f16)((float)rsa * rsx);                                    \
+    if (t0 < GK_T * GK_KB) kx_sa[bf_][t0] = (float)rsa * rsx;                                                  \
     if (t0 < GK_T * GK_KB) gk_sx[bf_][t0] = rsx;                                                                \
   } while (0)
   GK_FETCH_W(wa, ha, 0u);
@@ -1606,24 +1609,13 @@ KERNEL ie_gemm_kx(const G u32 *qw0, const G u16 *qs0, const G u8 *X, G u8 *Y, u3
         const f8 sw = *(const LDSP f8 *)(lsw + k * GK_R + wr + 16u * i + 8u * h);
 #pragma unroll
         for (u32 j = 0; j < GK_WJ; j++) acc[i][j] += (sw * dx[j]) * (__builtin_bit_cast(f8, c[j]) - 12582912.0f); /* (da d sc) dq */
+        if (kind != 6u) { /* the min term in f32: - (dmin mn) (da asum) (fp16 overflows for large activations) */
+          const f8 mw = *(const LDSP f8 *)(gk_mw[bf] + k * GK_R + wr + 16u * i + 8u * h);
+#pragma unroll
+          for (u32 j = 0; j < GK_WJ; j++) acc[i][j] += mw * kx_sa[bf][(16u * j + (l & 15u)) * GK_KB + k];
+        }
       }
       __builtin_amdgcn_sched_barrier(0); /* keep the blocks apart: the scheduler otherwise overlaps them and spills */
-    }
-    { /* the min term of the chunk: lane half 0 holds K = blocks 0 .. GK_KB - 1, half 1 zeros */
-      const hk4 z4 = (hk4)(0.0f);
-      hk8 bm[GK_WJ];
-#pragma unroll
-      for (u32 j = 0; j < GK_WJ; j++) {
-        const hk4 v = h ? z4 : gk_sh[bf][16u * j + (l & 15u)];
-        bm[j] = (hk8){v[0], v[1], v[2], v[3], 0, 0, 0, 0};
-      }
-#pragma unroll
-      for (u32 i = 0; i < GK_WI; i++) {
-        const hk4 v = h ? z4 : gk_mh[bf][wr + 16u * i + (l & 15u)];
-        const hk8 am = {v[0], v[1], v[2], v[3], 0, 0, 0, 0};
-#pragma unroll
-        for (u32 j = 0; j < GK_WJ; j++) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(am, bm[j], acc[i][j]);
-      }
     }
     if (more) GK_STORE_X(bf ^ 1u); /* nobody reads that buffer in this chunk */
     lbarrier();
