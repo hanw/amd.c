@@ -45,7 +45,7 @@ typedef struct {
 
 static options O = {
     .effort = "xhigh", .backend = "gpu", .hsaco = "build/ie_kernels.hsaco", .host = "127.0.0.1", .port = 8000, .think = 1, .cache = 1, .queue_max = 8,
-    .ctx = 8192, .draft = 0, .chunk = 256, .top_k = 20, .max_body = 4u << 20, .pmin = 0.6f, .temp = 0.7f, .top_p = 0.8f,
+    .ctx = 8192, .draft = 0, .chunk = 0, .top_k = 20, .max_body = 4u << 20, .pmin = 0.6f, .temp = 0.7f, .top_p = 0.8f,
 };
 
 static void usage(void) {
@@ -61,7 +61,7 @@ static void usage(void) {
           "  --draft D           MTP drafts per step, 1 to 7 (GPU; default 0: off)\n"
           "  --draft-pmin P      (default 0.6)   --mtp FILE   the MTP head from FILE\n"
           "  --dflash FILE       with --draft: also a DFlash 2 drafter (GGUF); each step uses the faster drafter\n"
-          "  --chunk N           prompt chunk, 1 to 512 (GPU; default 256)\n"
+          "  --chunk N           prompt chunk, 1 to 512 (GPU; default 256, flint 512)\n"
           "  --temp T --top-k K --top-p P   defaults when a request does not set them (0.7, 20, 0.8)\n"
           "  --no-think          end the prompt with an empty <think></think> block (no reasoning text)\n"
           "  --effort E          reasoning effort when thinking: xhigh (default), medium, low\n"
@@ -435,6 +435,7 @@ static void *engine_main(void *arg) {
   int64_t eos = -1;
   if (!gguf_get_int(&G, "tokenizer.ggml.eos_token_id", &eos)) eos = -1;
   FLINT = M.arch == ARCH_FLINT;
+  if (!O.chunk) O.chunk = FLINT ? 512u : 256u; /* flint: twice the tokens per expert weight read */
   if (FLINT) { /* the end-of-generation tokens: <|end_of_text|>, <|user|>, <|observation|>, <|developer|> */
     THINK_ID = tok_find(TK, "<think>");
     const gguf_kv *eg = gguf_find(&G, "tokenizer.ggml.eog_token_ids");
@@ -770,7 +771,7 @@ int main(int argc, char **argv) {
   if (!gpu && strcmp(O.backend, "cpu")) usage();
   if (O.draft > 7 || (O.draft && !gpu)) ie_die("--draft: 1 to 7, GPU only");
   if (O.dflash && !O.draft) ie_die("--dflash needs --draft");
-  if (O.chunk < 1 || O.chunk > 512) ie_die("--chunk: 1 to 512");
+  if (O.chunk > 512) ie_die("--chunk: 1 to 512 (0: by the model)");
   if (O.ctx < 16) ie_die("--ctx: at least 16");
   if (O.queue_max < 1) O.queue_max = 1;
   signal(SIGPIPE, SIG_IGN);
